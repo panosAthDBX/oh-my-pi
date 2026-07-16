@@ -16,6 +16,7 @@ import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
+import type { MemoryBackend, MemoryRuntimeContext } from "../memory-backend";
 import { LspTool } from "../lsp";
 import type { MCPManager } from "../mcp";
 import type { MnemopiSessionState } from "../mnemopi/state";
@@ -196,6 +197,8 @@ export interface ToolSession {
 	prewalkArmed?: boolean;
 	/** Task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
+	/** Effective AgentSession classification; automatic learning is primary-only. */
+	agentKind?: "main" | "sub";
 	/** Get shared eval executor session ID. Subagents inherit this to share JS/Python/Ruby/Julia state. */
 	getEvalSessionId?: () => string | null;
 	/** Get session file */
@@ -212,6 +215,10 @@ export interface ToolSession {
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
 	/** Get Mnemopi runtime state for this agent session. */
 	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
+	/** The backend captured when the owning agent session started. */
+	getMemoryBackend?: () => MemoryBackend | undefined;
+	/** Generic memory operations for the active backend. */
+	getMemoryRuntime?: () => MemoryRuntimeContext | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "Main", "AuthLoader"). */
 	getAgentId?: () => string | null;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
@@ -406,8 +413,14 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	const includeYield = session.requireYieldTool === true;
 	const enableLsp = session.enableLsp ?? true;
 	let requestedTools = toolNames && toolNames.length > 0 ? normalizeToolNames(toolNames) : undefined;
+	// `agentKind` is authoritative when present (`/tan` can be depth zero);
+	// hand-built ToolSession callers retain the historical depth-based fallback.
+	const isPrimaryAutolearnSession = session.agentKind
+		? session.agentKind === "main"
+		: (session.taskDepth ?? 0) === 0;
 	const goalEnabled = session.settings.get("goal.enabled");
 	const goalModeActive = goalEnabled && session.getGoalModeState?.()?.enabled === true;
+	const memoryBackend = session.getMemoryBackend?.()?.id ?? session.settings.get("memory.backend") ?? "";
 	if (goalModeActive && requestedTools && !requestedTools.includes("goal")) {
 		requestedTools = [...requestedTools, "goal"];
 	}
@@ -482,21 +495,19 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		) {
 			requestedTools.push("ast_edit");
 		}
-		if (["hindsight", "mnemopi"].includes(session.settings.get("memory.backend") ?? "")) {
-			for (const name of ["recall", "retain", "reflect"]) {
+		const genericMemoryTools = memoryBackend === "supermemory" ? (["recall", "retain"] as const) : (["recall", "retain", "reflect"] as const);
+		if (["hindsight", "mnemopi", "supermemory"].includes(memoryBackend)) {
+			for (const name of genericMemoryTools) {
 				if (!requestedTools.includes(name)) requestedTools.push(name);
 			}
 		}
-		// Auto-learn tools are gated by `autolearn.enabled` but, like the memory
-		// tools above, must also be force-included into an explicit requestedTools
-		// list so a restricted top-level session whose controller/guidance is
-		// active still exposes the tools the nudge points at. Gated to top-level
-		// (taskDepth 0): the controller only runs there, so a subagent's explicit
-		// tool whitelist must never be silently widened with write-capable tools.
-		if (session.settings.get("autolearn.enabled") && (session.taskDepth ?? 0) === 0) {
+		// Automatic learning follows the effective AgentSession classification.
+		// `/tan` clones run at depth zero but are subagents; direct ToolSession
+		// callers without that classification fall back to task depth.
+		if (session.settings.get("autolearn.enabled") && isPrimaryAutolearnSession) {
 			if (!requestedTools.includes("manage_skill")) requestedTools.push("manage_skill");
 			if (
-				["hindsight", "mnemopi", "local"].includes(session.settings.get("memory.backend") ?? "") &&
+				["hindsight", "mnemopi", "local", "supermemory"].includes(memoryBackend) &&
 				!requestedTools.includes("learn")
 			) {
 				requestedTools.push("learn");
@@ -522,15 +533,18 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "ask") return session.settings.get("ask.enabled");
 		if (name === "browser") return session.settings.get("browser.enabled");
 		if (name === "checkpoint" || name === "rewind") return session.settings.get("checkpoint.enabled");
-		if (name === "retain" || name === "recall" || name === "reflect") {
-			return ["hindsight", "mnemopi"].includes(session.settings.get("memory.backend") ?? "");
+		if (name === "retain" || name === "recall") {
+			return ["hindsight", "mnemopi", "supermemory"].includes(memoryBackend);
 		}
-		if (name === "manage_skill") return session.settings.get("autolearn.enabled") && (session.taskDepth ?? 0) === 0;
+		if (name === "reflect") {
+			return ["hindsight", "mnemopi"].includes(memoryBackend);
+		}
+		if (name === "manage_skill") return session.settings.get("autolearn.enabled") && isPrimaryAutolearnSession;
 		if (name === "learn") {
 			return (
 				session.settings.get("autolearn.enabled") &&
-				(session.taskDepth ?? 0) === 0 &&
-				["hindsight", "mnemopi", "local"].includes(session.settings.get("memory.backend") ?? "")
+				isPrimaryAutolearnSession &&
+				["hindsight", "mnemopi", "local", "supermemory"].includes(memoryBackend)
 			);
 		}
 		if (name === "task") {

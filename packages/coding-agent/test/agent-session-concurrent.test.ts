@@ -71,7 +71,10 @@ describe("AgentSession concurrent prompt guard", () => {
 		AsyncJobManager.resetForTests();
 	});
 
-	async function createSession(settingsOverrides?: Partial<Record<SettingPath, unknown>>) {
+	async function createSession(
+		settingsOverrides?: Partial<Record<SettingPath, unknown>>,
+		extensionRunner?: ExtensionRunner,
+	) {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let abortSignal: AbortSignal | undefined;
 
@@ -114,6 +117,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			extensionRunner,
 		});
 
 		return session;
@@ -143,6 +147,101 @@ describe("AgentSession concurrent prompt guard", () => {
 		// Cleanup
 		await session.abort();
 		await firstPrompt.catch(() => {}); // Ignore abort error
+	});
+
+	it("keeps extension command context idle before local command execution", async () => {
+		const observedIdleStates: boolean[] = [];
+		const extensionRunner = {
+			getCommand: () => ({
+				handler: async (_args: string, ctx: { isIdle: () => boolean }) => {
+					observedIdleStates.push(ctx.isIdle());
+				},
+			}),
+			createCommandContext: () => ({ isIdle: () => !session.isStreaming }),
+		} as unknown as ExtensionRunner;
+		await createSession(undefined, extensionRunner);
+
+		await expect(session.prompt("/local-command")).resolves.toBe(false);
+		expect(observedIdleStates).toEqual([true]);
+	});
+
+	it("restores drained next-turn context after pre-agent cancellation in FIFO order", async () => {
+		let beforeAgentStartCalls = 0;
+		const extensionRunner = {
+			getCommand: () => undefined,
+			emitBeforeAgentStart: async () => {
+				beforeAgentStartCalls++;
+				if (beforeAgentStartCalls === 1) await session.abort();
+			},
+		} as unknown as ExtensionRunner;
+		await createSession(undefined, extensionRunner);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(messages => {
+			session.agent.state.isStreaming = true;
+			return Promise.resolve().finally(() => {
+				session.agent.state.isStreaming = false;
+			});
+		});
+
+		const cancelled = session.prompt("cancelled prompt");
+		await session.sendCustomMessage(
+			{ customType: "first-context", content: "first", display: false, attribution: "agent" },
+			{ deliverAs: "nextTurn" },
+		);
+		await session.sendCustomMessage(
+			{ customType: "second-context", content: "second", display: false, attribution: "agent" },
+			{ deliverAs: "nextTurn" },
+		);
+		await cancelled;
+		await session.prompt("next prompt");
+
+		const forwarded = promptSpy.mock.calls[0]?.[0] as AgentMessage[];
+		expect(forwarded.map(message => ("customType" in message ? message.customType : undefined))).toEqual(
+			expect.arrayContaining(["first-context", "second-context"]),
+		);
+		const customTypes = forwarded
+			.filter((message): message is Extract<AgentMessage, { role: "custom" }> => message.role === "custom")
+			.map(message => message.customType);
+		expect(customTypes.indexOf("first-context")).toBeLessThan(customTypes.indexOf("second-context"));
+	});
+
+	it("reserves same-tick admission without losing queued context or the plan reference", async () => {
+		await createSession();
+		const planPath = path.join(tempDir, "PLAN.md");
+		fs.writeFileSync(planPath, "# Approved plan\n\nKeep this reference.");
+		session.setPlanReferencePath(planPath);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(messages => {
+			session.agent.state.isStreaming = true;
+			return Promise.resolve().finally(() => {
+				session.agent.state.isStreaming = false;
+			});
+		});
+
+		const winner = session.prompt("first prompt");
+		const queued = session.sendCustomMessage(
+			{
+				customType: "queued-context",
+				content: "Preserve this queued context.",
+				display: false,
+				attribution: "agent",
+			},
+			{ deliverAs: "nextTurn" },
+		);
+		const loser = session.prompt("second prompt");
+
+		await expect(loser).rejects.toBeInstanceOf(AgentBusyError);
+		await queued;
+		await winner;
+
+		const forwarded = promptSpy.mock.calls[0]?.[0] as AgentMessage[];
+		expect(
+			forwarded.some(
+				message =>
+					message.role === "user" &&
+					message.content.some(content => content.type === "text" && content.text === "first prompt"),
+			),
+		).toBe(true);
+		expect(forwarded.some(message => message.role === "custom" && message.customType === "queued-context")).toBe(true);
+		expect(forwarded.some(message => message.role === "custom" && message.customType === "plan-mode-reference")).toBe(true);
 	});
 
 	it("should allow steer() while streaming", async () => {

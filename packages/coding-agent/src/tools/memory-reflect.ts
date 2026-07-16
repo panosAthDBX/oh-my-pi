@@ -25,14 +25,14 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): MemoryReflectTool | null {
-		const backend = session.settings.get("memory.backend");
+		const backend = session.getMemoryBackend?.()?.id ?? session.settings.get("memory.backend");
 		if (backend !== "hindsight" && backend !== "mnemopi") return null;
 		return new MemoryReflectTool(session);
 	}
 
 	async execute(_id: string, params: MemoryReflectParams, signal?: AbortSignal): Promise<AgentToolResult> {
 		return untilAborted(signal, async () => {
-			const backend = this.session.settings.get("memory.backend");
+			const backend = this.session.getMemoryBackend?.()?.id ?? this.session.settings.get("memory.backend");
 			if (backend === "mnemopi") {
 				const state = this.session.getMnemopiSessionState?.();
 				if (!state) {

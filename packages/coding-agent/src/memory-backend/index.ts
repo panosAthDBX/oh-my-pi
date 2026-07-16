@@ -4,6 +4,7 @@ export type {
 	MnemopiProviderOptions,
 	MnemopiScoping,
 } from "../mnemopi/config";
+export type { SupermemoryConfig, SupermemoryScoping, SupermemorySearchMode } from "../supermemory/config";
 export type {
 	MnemopiMemoryEditOperation,
 	MnemopiMemoryEditOptions,

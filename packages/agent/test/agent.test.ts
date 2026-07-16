@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Agent, type AgentEvent, type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { Agent, AgentBusyError, type AgentEvent, type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { type SimpleStreamOptions, type ToolResultMessage, z } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
@@ -15,6 +15,29 @@ describe("Agent", () => {
 
 		// The message is queued but not yet in state.messages
 		expect(agent.state.messages).not.toContainEqual(message);
+	});
+
+	it("calls onAccepted synchronously after acquiring prompt admission", async () => {
+		const mock = createMockModel({ responses: [] });
+		const stream = new AssistantMessageEventStream();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: () => stream,
+		});
+		let admittedWhileStreaming = false;
+		let rejectedConcurrentPrompt: Promise<void> | undefined;
+
+		const prompt = agent.prompt("first", {
+			onAccepted: () => {
+				admittedWhileStreaming = agent.state.isStreaming;
+				rejectedConcurrentPrompt = agent.prompt("second");
+			},
+		});
+		const concurrentPrompt = rejectedConcurrentPrompt;
+		if (!concurrentPrompt) throw new Error("Expected concurrent prompt attempt");
+		await expect(concurrentPrompt).rejects.toBeInstanceOf(AgentBusyError);
+		agent.abort();
+		await prompt;
 	});
 
 	it("continue() should process queued follow-up messages after an assistant turn", async () => {

@@ -27,13 +27,37 @@ export class MemoryRetainTool implements AgentTool<typeof memoryRetainSchema> {
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): MemoryRetainTool | null {
-		const backend = session.settings.get("memory.backend");
-		if (backend !== "hindsight" && backend !== "mnemopi") return null;
+		const backend = session.getMemoryBackend?.()?.id ?? session.settings.get("memory.backend");
+		if (backend !== "hindsight" && backend !== "mnemopi" && backend !== "supermemory") return null;
 		return new MemoryRetainTool(session);
 	}
 
 	async execute(_id: string, params: MemoryRetainParams): Promise<AgentToolResult> {
-		const backend = this.session.settings.get("memory.backend");
+		const backend = this.session.getMemoryBackend?.()?.id ?? this.session.settings.get("memory.backend");
+		if (backend === "supermemory") {
+			const memory = this.session.getMemoryRuntime?.();
+			if (!memory) throw new Error("Supermemory backend is not initialised for this session.");
+			const results = await Promise.all(
+				params.items.map(item => memory.save({ content: item.content, context: item.context, source: "coding-agent-retain" })),
+			);
+			const stored = results.reduce((total, result) => total + result.stored, 0);
+			const failures = results
+				.map((result, index) => (result.stored > 0 ? undefined : `item ${index + 1}: ${result.message ?? "not stored"}`))
+				.filter((failure): failure is string => failure !== undefined);
+			if (failures.length > 0) {
+				throw new Error(
+					stored === 0
+						? failures.join("; ")
+						: `Supermemory stored ${stored} of ${params.items.length} memories; failed ${failures.join("; ")}.`,
+				);
+			}
+			const noun = stored === 1 ? "memory" : "memories";
+			return {
+				content: [{ type: "text", text: `${stored} ${noun} stored.` }],
+				details: { count: stored },
+			};
+		}
+
 		if (backend === "mnemopi") {
 			const state = this.session.getMnemopiSessionState?.();
 			if (!state) {

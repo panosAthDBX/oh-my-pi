@@ -1108,9 +1108,12 @@ describe("AgentSession retry delay cap", () => {
 			if (event.type === "auto_retry_start") retryStartEvents.push(event);
 		});
 
+		const abortRetry = vi.spyOn(session, "abortRetry");
+
 		// Enter the disposing window before the empty abort lands. Without the
 		// #isDisposed guard this prompt would hang on an orphaned retry promise.
 		session.beginDispose();
+
 		await session.prompt("Trigger empty aborted turn while disposing");
 		await session.waitForIdle();
 
@@ -1119,6 +1122,8 @@ describe("AgentSession retry delay cap", () => {
 		expect(mock.calls).toHaveLength(1);
 		const last = lastAssistant(session);
 		expect(last.stopReason).toBe("aborted");
+		await session.dispose();
+		expect(abortRetry).toHaveBeenCalledTimes(1);
 	});
 
 	it("defaults 502 auto-retry to ten capped backoff attempts", async () => {
