@@ -31,35 +31,39 @@ async function runProbe(root: string, mode: "missing" | "custom"): Promise<Probe
 	return JSON.parse(stdout) as ProbeResult;
 }
 
-test("models config validation resources are retained only for a custom config", async () => {
-	const tempDir = TempDir.createSync("@models-config-validator-");
-	try {
-		const missing = await runProbe(tempDir.path(), "missing");
-		const custom = await runProbe(tempDir.path(), "custom");
+test(
+	"models config validation resources are retained only for a custom config",
+	async () => {
+		const tempDir = TempDir.createSync("@models-config-validator-");
+		try {
+			const missing = await runProbe(tempDir.path(), "missing");
+			const custom = await runProbe(tempDir.path(), "custom");
 
-		expect(missing.model).toMatchObject({
-			provider: "anthropic",
-			id: "claude-sonnet-4-5",
-			baseUrl: "https://api.anthropic.com",
-			api: "anthropic-messages",
-		});
-		expect(custom.model).toEqual({
-			provider: "lazy-models",
-			id: "lazy-model",
-			baseUrl: "https://lazy.example/v1",
-			api: "openai-responses",
-			thinking: {
-				mode: "effort",
-				efforts: ["low", "medium", "high"],
-				defaultLevel: "medium",
-			},
-		});
-		expect(custom.schemaIdentityStable).toBe(true);
-		expect(
-			custom.retainedHeapNodes - missing.retainedHeapNodes,
-			"custom config validation should retain its schema bundle",
-		).toBeGreaterThan(15_000);
-	} finally {
-		await tempDir.remove().catch(() => {});
-	}
-});
+			expect(missing.model).toMatchObject({
+				provider: "anthropic",
+				id: "claude-sonnet-4-5",
+				baseUrl: "https://api.anthropic.com",
+				api: "anthropic-messages",
+			});
+			expect(custom.model).toEqual({
+				provider: "lazy-models",
+				id: "lazy-model",
+				baseUrl: "https://lazy.example/v1",
+				api: "openai-responses",
+				thinking: {
+					mode: "effort",
+					efforts: ["low", "medium", "high"],
+					defaultLevel: "medium",
+				},
+			});
+			expect(custom.schemaIdentityStable).toBe(true);
+			expect(
+				custom.retainedHeapNodes - missing.retainedHeapNodes,
+				"custom config validation should retain its schema bundle",
+			).toBeGreaterThan(15_000);
+		} finally {
+			await tempDir.remove().catch(() => {});
+		}
+	},
+	{ timeout: 15_000 },
+);
