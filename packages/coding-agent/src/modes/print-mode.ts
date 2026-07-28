@@ -98,6 +98,27 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			process.stdout.write(`${JSON.stringify(header)}\n`);
 		}
 	}
+	let abortAfterPlanProposal = false;
+
+	// Subscribe before extension initialization so session_start handlers are
+	// observable in JSON mode. The header remains the first JSON record, and
+	// text mode retains the subscription used for session persistence.
+	session.subscribe(event => {
+		if (abortAfterPlanProposal && event.type === "tool_execution_end" && !event.isError) {
+			const dispatch = writeDeviceDispatch(event.toolName, event.result);
+			if (dispatch?.tool === PROPOSE_DEVICE_NAME && dispatch.mode === "execute") {
+				abortAfterPlanProposal = false;
+				session.markPlanInternalAbortPending();
+				void session.abort().finally(() => {
+					session.clearPlanInternalAbortPending();
+				});
+			}
+		}
+		if (mode === "json") {
+			process.stdout.write(`${JSON.stringify(printableEvent(event))}\n`);
+		}
+	});
+
 	// Set up extensions for print mode (no UI, no command context)
 	await initializeExtensions(session, {
 		reportSendError: (action, err) => {
@@ -114,7 +135,6 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	// Print mode has no TUI bootstrap, so arm the shared session directly before
 	// the first prompt; persisting the mode_change also lets a later interactive
 	// attachment restore and review the generated plan.
-	let abortAfterPlanProposal = false;
 	const planDefaultArmed =
 		session.settings.get("plan.defaultOnStartup") &&
 		session.settings.get("plan.enabled") &&
@@ -157,24 +177,6 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			}
 		}
 	}
-
-	// Always subscribe to enable session persistence via _handleAgentEvent
-	session.subscribe(event => {
-		if (abortAfterPlanProposal && event.type === "tool_execution_end" && !event.isError) {
-			const dispatch = writeDeviceDispatch(event.toolName, event.result);
-			if (dispatch?.tool === PROPOSE_DEVICE_NAME && dispatch.mode === "execute") {
-				abortAfterPlanProposal = false;
-				session.markPlanInternalAbortPending();
-				void session.abort().finally(() => {
-					session.clearPlanInternalAbortPending();
-				});
-			}
-		}
-		// In JSON mode, output all events
-		if (mode === "json") {
-			process.stdout.write(`${JSON.stringify(printableEvent(event))}\n`);
-		}
-	});
 
 	let wroteTextWorkingIndicator = false;
 	const writeTextWorkingIndicator = (): void => {

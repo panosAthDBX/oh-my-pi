@@ -7,6 +7,7 @@ import {
 	type NativeScrollbackLiveRegion,
 	TUI,
 } from "@oh-my-pi/pi-tui";
+import { StressRenderScheduler } from "./render-stress-scheduler";
 import { VirtualTerminal } from "./virtual-terminal";
 
 // Law-encoding suite for native-scrollback commits.
@@ -208,7 +209,8 @@ describe("streaming scrollback — visual record", () => {
 		if (process.platform === "win32") return;
 		const term = new VirtualTerminal(20, 4);
 		overrideProbe(term, undefined);
-		const tui = new TUI(term);
+		const scheduler = new StressRenderScheduler();
+		const tui = new TUI(term, undefined, { renderScheduler: scheduler });
 		const sealed = new LineList(rows("prior-", 12));
 		const live = new SeamLineList([]);
 
@@ -216,13 +218,13 @@ describe("streaming scrollback — visual record", () => {
 			tui.addChild(sealed);
 			tui.addChild(live);
 			tui.start();
-			await settle(term);
+			await scheduler.drain(term);
 
 			const writes = capture(term);
 
 			live.setLines(rows("think-", 6));
 			tui.requestRender();
-			await settle(term);
+			await scheduler.drain(term);
 
 			// The live block's head scrolls above the 4-row viewport and is
 			// recorded as a frozen snapshot — nothing that was painted vanishes.
@@ -233,14 +235,14 @@ describe("streaming scrollback — visual record", () => {
 			// re-anchors; the new tail just extends.
 			live.setLines(rows("think-", 8));
 			tui.requestRender();
-			await settle(term);
+			await scheduler.drain(term);
 			expect(tape(term)).toEqual([...rows("prior-", 12), ...rows("think-", 8)]);
 
 			// Finalize: the recorded snapshots match the final render, so the
 			// one-time strict verification passes and NOTHING recommits.
 			live.seam = undefined;
 			tui.requestRender();
-			await settle(term);
+			await scheduler.drain(term);
 
 			const buffer = tape(term);
 			expect(eraseScrollbackCount(writes)).toBe(0);

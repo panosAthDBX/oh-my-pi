@@ -45,7 +45,7 @@ interface DelayedSession {
 
 function createDelayedSession(
 	finalMessage: AssistantMessage,
-	options: { defaultPlanMode?: boolean } = {},
+	options: { defaultPlanMode?: boolean; startupProjection?: boolean } = {},
 ): DelayedSession {
 	const messages: AssistantMessage[] = [];
 	const { promise: promptStarted, resolve: markPromptStarted } = Promise.withResolvers<void>();
@@ -58,12 +58,41 @@ function createDelayedSession(
 	let planProposalHandler: PlanProposalHandler | undefined;
 	let subscriber: ((event: AgentSessionEvent) => void) | undefined;
 	let abortCalls = 0;
+	const startupProjectionEvent: Extract<AgentSessionEvent, { type: "todo_projection_changed" }> = {
+		type: "todo_projection_changed",
+		projections: [
+			{
+				namespace: "startup",
+				phases: [
+					{
+						id: "boot",
+						name: "Boot",
+						tasks: [{ id: "observe", content: "Observe JSON startup", status: "in_progress" }],
+					},
+				],
+			},
+		],
+	};
+	let setTodoProjection: ((namespace: string, phases: unknown) => void) | undefined;
+	const extensionRunner = options.startupProjection
+		? {
+				initialize: (actions: { setTodoProjection: (namespace: string, phases: unknown) => void }) => {
+					setTodoProjection = actions.setTodoProjection;
+				},
+				onError: () => {},
+				emit: async (event: { type: string }) => {
+					if (event.type === "session_start") {
+						setTodoProjection?.("startup", startupProjectionEvent.projections[0]!.phases);
+					}
+				},
+			}
+		: undefined;
 
 	const session = {
 		state: { messages },
 		getLastAssistantMessage: () => messages.findLast(message => message.role === "assistant"),
 		sessionManager: {
-			getHeader: () => undefined,
+			getHeader: () => (options.startupProjection ? { type: "session", id: "startup-session" } : undefined),
 			buildSessionContext: () => ({ messages: [] }),
 			getEntries: () => [],
 			appendModeChange: (mode: string, data?: Record<string, unknown>) => {
@@ -99,7 +128,7 @@ function createDelayedSession(
 			thinkingLevel: undefined,
 			explicitThinkingLevel: false,
 		}),
-		extensionRunner: undefined,
+		extensionRunner,
 		markPlanInternalAbortPending: () => {},
 		clearPlanInternalAbortPending: () => {},
 		abort: async () => {
@@ -108,6 +137,9 @@ function createDelayedSession(
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			subscriber = listener;
 			return () => {};
+		},
+		setTodoProjection: () => {
+			subscriber?.(startupProjectionEvent);
 		},
 		prompt: async () => {
 			planModeAtPrompt = planModeState;
@@ -241,6 +273,41 @@ describe("print mode working indicator", () => {
 		await delayed.promptStarted;
 		try {
 			expect(stderrOutput.join("")).toBe("");
+		} finally {
+			delayed.resolvePrompt();
+			await run;
+		}
+	});
+
+	it("prints a session_start projection after the JSON header and before prompting", async () => {
+		const delayed = createDelayedSession(makeAssistantMessage("json answer"), { startupProjection: true });
+		const run = runPrintMode(delayed.session, { mode: "json", initialMessage: "hello" });
+
+		await delayed.promptStarted;
+		try {
+			const records = stdoutOutput
+				.join("")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(records).toEqual([
+				{ type: "session", id: "startup-session" },
+				{
+					type: "todo_projection_changed",
+					projections: [
+						{
+							namespace: "startup",
+							phases: [
+								{
+									id: "boot",
+									name: "Boot",
+									tasks: [{ id: "observe", content: "Observe JSON startup", status: "in_progress" }],
+								},
+							],
+						},
+					],
+				},
+			]);
 		} finally {
 			delayed.resolvePrompt();
 			await run;

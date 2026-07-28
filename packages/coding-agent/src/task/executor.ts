@@ -924,6 +924,8 @@ interface SubagentRunMonitor {
 	takeActiveSession(): AgentSession | null;
 	/** Subscribe the monitor to a session's events. Returns the unsubscribe function. */
 	attach(session: AgentSession): () => void;
+	/** Forward the initialized projection snapshot after attachment without replaying other startup events. */
+	publishTodoProjectionSnapshot(session: AgentSession): void;
 	/** Best-effort capture of the last assistant text for cancelled-run salvage. */
 	captureSalvage(session: AgentSession): void;
 	lastAssistantSalvageText(): string | undefined;
@@ -1668,6 +1670,12 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		});
 	};
 
+	const publishTodoProjectionSnapshot = (session: AgentSession): void => {
+		const projections = session.getTodoProjections();
+		if (projections.length === 0) return;
+		emitSubagentEvent({ type: "todo_projection_changed", projections });
+	};
+
 	const captureSalvage = (session: AgentSession): void => {
 		// Best-effort salvage: capture the last assistant text so
 		// cancelled/aborted children can surface "last activity" instead of
@@ -1739,6 +1747,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			return session;
 		},
 		attach,
+		publishTodoProjectionSnapshot,
 		captureSalvage,
 		lastAssistantSalvageText: () => lastAssistantSalvageText,
 		rawOutput: () => (finalOutputChunks.length > 0 ? finalOutputChunks.join("") : outputChunks.join("")),
@@ -2984,6 +2993,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			unsubscribe = monitor.attach(session);
+			// session_start runs before attachment so extension-generated messages
+			// retain their established ownership and ordering. Replay only the
+			// projection snapshot that the event transport otherwise missed.
+			monitor.publishTodoProjectionSnapshot(session);
 
 			checkAbort();
 			// Autoload skills via sendCustomMessage (same mechanic as /skill:<name>)
