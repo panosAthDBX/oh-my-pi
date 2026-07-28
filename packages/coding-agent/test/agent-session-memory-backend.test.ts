@@ -88,6 +88,8 @@ describe("AgentSession memory backend lifecycle", () => {
 		return session;
 	}
 
+	// Backend activation opens SQLite-backed state and rebuilds the prompt twice;
+	// the complete lifecycle can exceed Bun's 5s default under concurrent CI chunks.
 	it("switches runtime state, memory tools, and prompt in one apply", async () => {
 		const current = createSession(async () =>
 			settings.get("memory.backend") === "mnemopi" ? [createTool("retain"), createTool("memory_edit")] : [],
@@ -107,7 +109,7 @@ describe("AgentSession memory backend lifecycle", () => {
 		expect(current.getActiveToolNames()).toEqual(["read"]);
 		expect(current.getAllToolNames()).toEqual(["read"]);
 		expect(current.systemPrompt).toEqual(["backend:off;tools:read"]);
-	});
+	}, 15_000);
 	it("cancels a displaced local startup generation", async () => {
 		const current = createSession(async () => []);
 		const localStartup = current.beginLocalMemoryStartup();
