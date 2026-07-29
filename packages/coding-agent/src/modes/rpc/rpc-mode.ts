@@ -989,6 +989,10 @@ export async function runRpcMode(
 		void emitAvailableCommandsUpdate();
 	});
 	await emitAvailableCommandsUpdate();
+	// Give an already-buffered v2 negotiation one event-loop turn to run first;
+	// passive/custom v1 hosts still receive the coalesced startup snapshot
+	// without having to send an ordinary command.
+	setTimeout(flushStartupTodoProjection, 0);
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
@@ -1493,10 +1497,6 @@ export async function runRpcMode(
 	// line-by-line and parsed here (not via readJsonl) so a single malformed
 	// line is reported as an error frame and the loop keeps running instead of
 	// throwing out of the generator and killing the whole process (issue #5194).
-	// Give an already-buffered v2 negotiation one event-loop turn to run first;
-	// passive/custom v1 hosts still receive the coalesced startup snapshot
-	// without having to send an ordinary command.
-	setTimeout(flushStartupTodoProjection, 0);
 	const decoder = new TextDecoder();
 	for await (const line of readLines(input ?? Bun.stdin.stream())) {
 		const text = decoder.decode(line).trim();

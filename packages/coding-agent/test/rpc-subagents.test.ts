@@ -504,6 +504,12 @@ export default function (pi) {
 			);
 
 			expect(frames[0]).toMatchObject({ type: "ready", protocolVersion: 1 });
+			const availableCommandsIndex = frames.findIndex(
+				frame => isRecord(frame) && frame.type === "available_commands_update",
+			);
+			const projectionIndex = frames.findIndex(frame => isRecord(frame) && frame.type === "todo_projection_changed");
+			expect(availableCommandsIndex).toBeGreaterThan(0);
+			expect(projectionIndex).toBeGreaterThan(availableCommandsIndex);
 			expect(frames.at(-1)).toMatchObject({
 				type: "todo_projection_changed",
 				projections: [{ namespace: "passive-v1" }],
