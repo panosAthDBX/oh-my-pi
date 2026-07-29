@@ -65,6 +65,85 @@ describe("TodoProjectionStore", () => {
 		expect(snapshot[0]?.phases[0]?.tasks[0]).toEqual({ id: "pending", content: "pending", status: "pending" });
 	});
 
+	it("rejects leading, middle, and trailing holes in phase and task arrays", () => {
+		const store = new TodoProjectionStore();
+		const sparseArray = <T>(length: number, entries: ReadonlyArray<readonly [number, T]>): T[] => {
+			const values = new Array<T>(length);
+			for (const [index, value] of entries) values[index] = value;
+			return values;
+		};
+		const pending = phase("pending");
+		const completed = phase("completed");
+		const sparseArrays = [
+			{ label: "phase", values: sparseArray(2, [[1, pending]]) },
+			{
+				label: "phase",
+				values: sparseArray(3, [
+					[0, pending],
+					[2, completed],
+				]),
+			},
+			{ label: "phase", values: sparseArray(2, [[0, pending]]) },
+			{
+				label: "task",
+				values: [
+					{
+						...pending,
+						tasks: sparseArray(
+							3,
+							pending.tasks.map((task, index) => [index + 1, task]),
+						),
+					},
+				],
+			},
+			{
+				label: "task",
+				values: [
+					{
+						...pending,
+						tasks: sparseArray(3, [
+							[0, pending.tasks[0]!],
+							[2, pending.tasks[1]!],
+						]),
+					},
+				],
+			},
+			{
+				label: "task",
+				values: [
+					{
+						...pending,
+						tasks: sparseArray(
+							3,
+							pending.tasks.map((task, index) => [index, task]),
+						),
+					},
+				],
+			},
+		] as const;
+
+		for (const { label, values } of sparseArrays) {
+			expect(() => store.set("owner", values as unknown as TodoProjectionPhase[])).toThrow(
+				`Todo projection ${label} array must not contain holes`,
+			);
+		}
+		expect(store.snapshot()).toEqual([]);
+	});
+
+	it("defensively clones valid dense phase and task arrays", () => {
+		const store = new TodoProjectionStore();
+		const originalPhase = phase("pending");
+		const source = [originalPhase];
+		expect(store.set("owner", source)).toBe(true);
+
+		source[0] = { id: "replacement", name: "Replacement", tasks: [] };
+		Reflect.set(originalPhase.tasks[0]!, "content", "mutated");
+		const firstSnapshot = store.snapshot();
+		Reflect.set(firstSnapshot[0]!.phases[0]!.tasks[0]!, "content", "snapshot mutation");
+
+		expect(store.snapshot()).toEqual([{ namespace: "owner", phases: [phase("pending")] }]);
+	});
+
 	it("treats identical replacement and repeated removal as no-ops", () => {
 		const store = new TodoProjectionStore();
 		expect(store.set("owner", [phase("pending")])).toBe(true);

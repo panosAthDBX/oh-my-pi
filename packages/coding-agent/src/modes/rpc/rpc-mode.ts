@@ -35,7 +35,12 @@ import type { EventBus } from "../../utils/event-bus";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
-import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
+import {
+	MAX_RPC_FRAME_BYTES,
+	MAX_RPC_REASSEMBLED_BYTES,
+	RPC_PROTOCOL_NEGOTIATION_GRACE_MS,
+	RpcFrameEncoder,
+} from "./rpc-frame";
 import { claimRpcInput } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
@@ -700,7 +705,12 @@ export async function runRpcMode(
 	};
 	let deferredStartupTodoProjection: object | undefined;
 	let deferringStartupTodoProjection = true;
+	let startupProtocolGraceTimer: NodeJS.Timeout | undefined;
 	const flushStartupTodoProjection = () => {
+		if (startupProtocolGraceTimer) {
+			clearTimeout(startupProtocolGraceTimer);
+			startupProtocolGraceTimer = undefined;
+		}
 		deferringStartupTodoProjection = false;
 		if (!deferredStartupTodoProjection) return;
 		writeOutput(deferredStartupTodoProjection);
@@ -989,10 +999,12 @@ export async function runRpcMode(
 		void emitAvailableCommandsUpdate();
 	});
 	await emitAvailableCommandsUpdate();
-	// Give an already-buffered v2 negotiation one event-loop turn to run first;
-	// passive/custom v1 hosts still receive the coalesced startup snapshot
-	// without having to send an ordinary command.
-	setTimeout(flushStartupTodoProjection, 0);
+	// RpcClient negotiates immediately after observing ready, but ready and the
+	// reply cross process boundaries. Keep startup projection encoding undecided
+	// for a short bounded grace instead of racing stdin I/O against a zero-delay
+	// timer. Negotiation or the first ordinary command cancels this timer.
+	startupProtocolGraceTimer = setTimeout(flushStartupTodoProjection, RPC_PROTOCOL_NEGOTIATION_GRACE_MS);
+	startupProtocolGraceTimer.unref();
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {

@@ -43,6 +43,14 @@ export function normalizeTodoProjectionNamespace(namespace: string): string {
 	return normalized;
 }
 
+function assertDenseTodoProjectionArray(values: readonly unknown[], label: "phase" | "task"): void {
+	for (let index = 0; index < values.length; index++) {
+		if (!Object.hasOwn(values, index)) {
+			throw new Error(`Todo projection ${label} array must not contain holes (missing index ${index})`);
+		}
+	}
+}
+
 /**
  * Validate and clone extension-owned data at the public API boundary. The
  * returned value contains only fields the host renders; extra caller metadata
@@ -51,6 +59,8 @@ export function normalizeTodoProjectionNamespace(namespace: string): string {
 export function cloneTodoProjection(phases: readonly TodoProjectionPhase[]): TodoProjectionPhase[] {
 	const phaseIds = new Set<string>();
 	const taskIds = new Set<string>();
+	assertDenseTodoProjectionArray(phases, "phase");
+	for (const phase of phases) assertDenseTodoProjectionArray(phase.tasks, "task");
 	return phases.map(phase => {
 		const id = requireStableId(phase.id, "phase");
 		if (phaseIds.has(id)) throw new Error(`Duplicate todo projection phase id: ${id}`);

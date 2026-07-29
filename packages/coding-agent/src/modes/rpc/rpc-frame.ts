@@ -6,6 +6,15 @@ import type { RpcChunkFrame } from "./rpc-types";
 export const MAX_RPC_FRAME_BYTES = 1024 * 1024;
 /** Maximum UTF-8 size of one logical frame reassembled by protocol v2. */
 export const MAX_RPC_REASSEMBLED_BYTES = 64 * 1024 * 1024;
+/** Outer deadline for the bundled client's ready and protocol-negotiation startup sequence. */
+export const RPC_CLIENT_START_TIMEOUT_MS = 30_000;
+/**
+ * Bounded server grace for a host to react to `ready` before startup events use
+ * the v1 encoder. RpcClient writes negotiation in the ready continuation; 500ms
+ * leaves cross-process scheduling headroom while remaining far below its 30s
+ * startup deadline.
+ */
+export const RPC_PROTOCOL_NEGOTIATION_GRACE_MS = 500;
 
 const RPC_CHUNK_PAYLOAD_BYTES = 256 * 1024;
 

@@ -12,7 +12,13 @@ import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
-import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
+import {
+	MAX_RPC_FRAME_BYTES,
+	MAX_RPC_REASSEMBLED_BYTES,
+	RPC_CLIENT_START_TIMEOUT_MS,
+	RpcFrameDecoder,
+	type RpcProtocolVersion,
+} from "./rpc-frame";
 import {
 	RPC_MESSAGES_PAGE_BUSY_ERROR,
 	RPC_MESSAGES_PAGE_STALE_ERROR,
@@ -398,7 +404,7 @@ export class RpcClient {
 		);
 
 		// Timeout to prevent hanging forever
-		const readyTimeout = this.#startTimeout(30000, () => {
+		const readyTimeout = this.#startTimeout(RPC_CLIENT_START_TIMEOUT_MS, () => {
 			if (readySettled) return;
 			readySettled = true;
 			readyReject(new Error(`Timeout waiting for agent to become ready. Stderr: ${child.peekStderr()}`));
