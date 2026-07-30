@@ -26,6 +26,7 @@ import {
 	DEFAULT_SHAKE_CONFIG,
 	effectiveReserveTokens,
 	estimateTokens,
+	NativeCompactionError,
 	prepareCompaction,
 	resolveBudgetReserveTokens,
 	resolveThresholdTokens,
@@ -34,6 +35,7 @@ import {
 	type SummaryOptions,
 	shouldCompact,
 	shouldUseOpenAiRemoteCompaction,
+	shouldUseProviderNativeCompaction,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import {
 	DEFAULT_PRUNE_CONFIG,
@@ -1373,7 +1375,11 @@ export class SessionMaintenance {
 		}
 	}
 
-	async resolveContextPromotionTarget(currentModel: Model, contextWindow: number): Promise<Model | undefined> {
+	async resolveContextPromotionTarget(
+		currentModel: Model,
+		contextWindow: number,
+		signal?: AbortSignal,
+	): Promise<Model | undefined> {
 		const availableModels = this.#host.modelRegistry.getAvailable();
 		if (availableModels.length === 0) return undefined;
 
@@ -1381,7 +1387,7 @@ export class SessionMaintenance {
 		if (!candidate) return undefined;
 		if (modelsAreEqual(candidate, currentModel)) return undefined;
 		if (candidate.contextWindow == null || candidate.contextWindow <= contextWindow) return undefined;
-		const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+		const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId(), { signal });
 		if (!apiKey) return undefined;
 		return candidate;
 	}
@@ -1454,10 +1460,18 @@ export class SessionMaintenance {
 		const candidates =
 			precomputedCandidates ?? this.#getCompactionModelCandidates(this.#host.modelRegistry.getAvailable());
 		const telemetry = resolveTelemetry(this.#host.agent.telemetry, this.#host.sessionId());
+		let nativeCompactionFailure: { error: NativeCompactionError; provider: string } | undefined;
 
 		for (const candidate of candidates) {
 			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
 			if (!apiKey) continue;
+			if (
+				nativeCompactionFailure &&
+				(candidate.provider !== nativeCompactionFailure.provider ||
+					!shouldUseProviderNativeCompaction(candidate, preparation.settings))
+			) {
+				throw nativeCompactionFailure.error;
+			}
 
 			try {
 				return await compact(
@@ -1495,12 +1509,17 @@ export class SessionMaintenance {
 					},
 				);
 			} catch (error) {
-				if (!AIError.is(AIError.classify(error, candidate.api), AIError.Flag.AuthFailed)) {
-					throw error;
+				const id = AIError.classify(error instanceof NativeCompactionError ? error.cause : error, candidate.api);
+				if (AIError.is(id, AIError.Flag.AuthFailed)) continue;
+				if (error instanceof NativeCompactionError) {
+					nativeCompactionFailure ??= { error, provider: candidate.provider };
+					continue;
 				}
+				throw error;
 			}
 		}
 
+		if (nativeCompactionFailure) throw nativeCompactionFailure.error;
 		throw this.#buildCompactionAuthError();
 	}
 
@@ -2473,6 +2492,7 @@ export class SessionMaintenance {
 				const telemetry = resolveTelemetry(this.#host.agent.telemetry, this.#host.sessionId());
 				let compactResult: CompactionResult | undefined;
 				let lastError: unknown;
+				let nativeCompactionFailure: { error: NativeCompactionError; provider: string } | undefined;
 				codexCompaction = createCodexCompactionContext({
 					trigger: "auto",
 					reason: "context_limit",
@@ -2486,6 +2506,13 @@ export class SessionMaintenance {
 					const hasMoreCandidates = candidateIndex < candidates.length - 1;
 					const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
 					if (!apiKey) continue;
+					if (
+						nativeCompactionFailure &&
+						(candidate.provider !== nativeCompactionFailure.provider ||
+							!shouldUseProviderNativeCompaction(candidate, preparation.settings))
+					) {
+						throw nativeCompactionFailure.error;
+					}
 
 					let attempt = 0;
 					while (true) {
@@ -2523,22 +2550,33 @@ export class SessionMaintenance {
 							}
 
 							const message = error instanceof Error ? error.message : String(error);
-							const id = AIError.classify(error, candidate.api);
+							const id = AIError.classify(
+								error instanceof NativeCompactionError ? error.cause : error,
+								candidate.api,
+							);
 							if (AIError.is(id, AIError.Flag.AuthFailed)) {
-								lastError = this.#buildCompactionAuthError();
+								if (!nativeCompactionFailure) lastError = this.#buildCompactionAuthError();
 								break;
 							}
 							if (AIError.is(id, AIError.Flag.Timeout)) {
+								const nativeFailure = error instanceof NativeCompactionError;
 								logger.warn(
-									hasMoreCandidates
-										? "Auto-compaction summarization timed out, trying next model"
-										: "Auto-compaction summarization timed out, not retrying same model",
+									nativeFailure
+										? "Provider-native auto-compaction timed out, preserving native failure"
+										: hasMoreCandidates
+											? "Auto-compaction summarization timed out, trying next model"
+											: "Auto-compaction summarization timed out, not retrying same model",
 									{
 										error: message,
 										model: `${candidate.provider}/${candidate.id}`,
 									},
 								);
-								lastError = error;
+								if (nativeFailure) {
+									nativeCompactionFailure ??= { error, provider: candidate.provider };
+									lastError = nativeCompactionFailure.error;
+								} else {
+									lastError = error;
+								}
 								break;
 							}
 
@@ -2550,7 +2588,12 @@ export class SessionMaintenance {
 									AIError.is(id, AIError.Flag.Transient) ||
 									AIError.is(id, AIError.Flag.UsageLimit));
 							if (!shouldRetry) {
-								lastError = error;
+								if (error instanceof NativeCompactionError) {
+									nativeCompactionFailure ??= { error, provider: candidate.provider };
+									lastError = nativeCompactionFailure.error;
+								} else {
+									lastError = error;
+								}
 								break;
 							}
 
@@ -2560,6 +2603,11 @@ export class SessionMaintenance {
 							// If retry delay is too long (>30s), try next candidate instead of waiting
 							const maxAcceptableDelayMs = 30_000;
 							if (delayMs > maxAcceptableDelayMs && hasMoreCandidates) {
+								if (error instanceof NativeCompactionError) {
+									nativeCompactionFailure ??= { error, provider: candidate.provider };
+									lastError = nativeCompactionFailure.error;
+									break;
+								}
 								logger.warn("Auto-compaction retry delay too long, trying next model", {
 									delayMs,
 									retryAfterMs,

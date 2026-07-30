@@ -32,15 +32,11 @@ import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type { EventBus } from "../../utils/event-bus";
+import { calculateTokensPerSecond } from "../../utils/token-rate";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
-import {
-	MAX_RPC_FRAME_BYTES,
-	MAX_RPC_REASSEMBLED_BYTES,
-	RPC_PROTOCOL_NEGOTIATION_GRACE_MS,
-	RpcFrameEncoder,
-} from "./rpc-frame";
+import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder, RpcStartupProjectionGate } from "./rpc-frame";
 import { claimRpcInput } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
@@ -703,24 +699,12 @@ export async function runRpcMode(
 	const writeOutput = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		writeFrames(frameEncoder.encodeFrames(obj));
 	};
-	let deferredStartupTodoProjection: object | undefined;
-	let deferringStartupTodoProjection = true;
-	let startupProtocolGraceTimer: NodeJS.Timeout | undefined;
-	const flushStartupTodoProjection = () => {
-		if (startupProtocolGraceTimer) {
-			clearTimeout(startupProtocolGraceTimer);
-			startupProtocolGraceTimer = undefined;
-		}
-		deferringStartupTodoProjection = false;
-		if (!deferredStartupTodoProjection) return;
-		writeOutput(deferredStartupTodoProjection);
-		deferredStartupTodoProjection = undefined;
-	};
+	const startupProjectionGate = new RpcStartupProjectionGate<object>(writeOutput);
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		writeOutput(obj);
 		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol") {
 			if (obj.success === true) frameEncoder.setProtocolVersion(2);
-			flushStartupTodoProjection();
+			startupProjectionGate.flush();
 		}
 	};
 	const emitRpcTitles = shouldEmitRpcTitles();
@@ -958,10 +942,7 @@ export async function runRpcMode(
 	// snapshots are coalesced until the client either negotiates v2 or proves it
 	// is staying on v1 with its first ordinary command.
 	session.subscribe(event => {
-		if (deferringStartupTodoProjection && event.type === "todo_projection_changed") {
-			deferredStartupTodoProjection = event;
-			return;
-		}
+		if (event.type === "todo_projection_changed" && startupProjectionGate.capture(event)) return;
 		output(event);
 	});
 
@@ -1003,13 +984,12 @@ export async function runRpcMode(
 	// reply cross process boundaries. Keep startup projection encoding undecided
 	// for a short bounded grace instead of racing stdin I/O against a zero-delay
 	// timer. Negotiation or the first ordinary command cancels this timer.
-	startupProtocolGraceTimer = setTimeout(flushStartupTodoProjection, RPC_PROTOCOL_NEGOTIATION_GRACE_MS);
-	startupProtocolGraceTimer.unref();
+	startupProjectionGate.startGrace();
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
-		if (command.type !== "negotiate_protocol") flushStartupTodoProjection();
+		if (command.type !== "negotiate_protocol") startupProjectionGate.flush();
 
 		switch (command.type) {
 			case "negotiate_protocol": {
@@ -1121,9 +1101,12 @@ export async function runRpcMode(
 					sessionId: session.sessionId,
 					sessionName: session.sessionName,
 					autoCompactionEnabled: session.autoCompactionEnabled,
-					messageCount: session.messages.length,
 					queuedMessageCount: session.queuedMessageCount,
 					todoPhases: session.getTodoPhases(),
+					fastModeEnabled: session.isFastModeEnabled(),
+					tokensPerSecond: calculateTokensPerSecond(session.messages, session.isStreaming),
+					fastModeActive: session.isFastModeActive(),
+					messageCount: session.messages.length,
 					systemPrompt: session.systemPrompt,
 					dumpTools: session.agent.state.tools.map(tool => ({
 						name: tool.name,
@@ -1134,6 +1117,17 @@ export async function runRpcMode(
 					contextUsage: session.getContextUsage(),
 				};
 				return success(id, "get_state", state);
+			}
+
+			case "set_fast_mode": {
+				const supported = session.setFastMode(command.enabled);
+				if (command.enabled && !supported) {
+					return error(id, "set_fast_mode", "Fast mode is unavailable for the current model.");
+				}
+				return success(id, "set_fast_mode", {
+					enabled: session.isFastModeEnabled(),
+					active: session.isFastModeActive(),
+				});
 			}
 
 			case "get_available_commands": {

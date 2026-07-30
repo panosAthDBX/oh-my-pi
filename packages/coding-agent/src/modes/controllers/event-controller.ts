@@ -6,10 +6,12 @@ import { logger, prompt, sanitizeText } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { extractTextContent } from "../../commit/utils";
 import { settings } from "../../config/settings";
+import { getEditClipboard } from "../../edit/edit-clipboard";
 import { getFileSnapshotStore } from "../../edit/file-snapshot-store";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
 import { detectCacheInvalidation } from "../../modes/components/cache-invalidation-marker";
 import {
+	groupedReadUsageCallIds,
 	ReadToolGroupComponent,
 	readArgsCollapseIntoGroup,
 	readArgsHaveTarget,
@@ -194,6 +196,10 @@ export class EventController {
 			todo_projection_changed: async () => this.ctx.refreshTodoProjections(),
 			irc_message: e => this.#handleIrcMessage(e),
 			notice: e => this.#handleNotice(e),
+			model_changed: async () => {
+				this.ctx.statusLine.invalidate();
+				this.ctx.ui.requestRender();
+			},
 			thinking_level_changed: async () => {
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
@@ -806,6 +812,7 @@ export class EventController {
 						renderArgs,
 						{
 							snapshots: getFileSnapshotStore(this.ctx.viewSession),
+							clipboard: getEditClipboard(this.ctx.viewSession),
 							showImages: settings.get("terminal.showImages"),
 							editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
 							editAllowFuzzy: settings.get("edit.fuzzyMatch"),
@@ -955,14 +962,28 @@ export class EventController {
 			}
 			this.#lastAssistantComponent = lastPostToolAssistantComponent ?? this.ctx.streamingComponent;
 			if (settings.get("display.showTokenUsage") && assistantUsageIsBilled(event.message.usage)) {
-				this.ctx.chatContainer.addChild(
-					createUsageRowBlock(
+				const readCallIds = groupedReadUsageCallIds(event.message);
+				const usageAttached =
+					readCallIds !== undefined &&
+					(this.#lastReadGroup?.attachUsage(
+						readCallIds,
 						event.message.usage,
 						event.message.duration,
 						event.message.ttft,
 						event.message.timestamp,
-					),
-				);
+					) ??
+						false);
+				if (!usageAttached) {
+					this.#resetReadGroup();
+					this.ctx.chatContainer.addChild(
+						createUsageRowBlock(
+							event.message.usage,
+							event.message.duration,
+							event.message.ttft,
+							event.message.timestamp,
+						),
+					);
+				}
 			}
 			if (displayMessage === event.message) {
 				this.ctx.transcriptMessageComponents.set(event.message, this.ctx.streamingComponent);
@@ -1015,6 +1036,7 @@ export class EventController {
 				event.args,
 				{
 					snapshots: getFileSnapshotStore(this.ctx.viewSession),
+					clipboard: getEditClipboard(this.ctx.viewSession),
 					showImages: settings.get("terminal.showImages"),
 					editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
 					editAllowFuzzy: settings.get("edit.fuzzyMatch"),

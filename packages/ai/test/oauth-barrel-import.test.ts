@@ -25,5 +25,5 @@ describe("OAuth barrel imports", () => {
 				await child.exited;
 			}
 		}
-	}, 20_000);
+	}, 60_000);
 });

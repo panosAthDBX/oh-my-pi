@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [17.2.0] - 2026-07-30
+
+### Fixed
+
+- Provider-native compaction failures now surface their transport error instead of silently switching to generic summarization; streaming V2 still falls back to native V1 when available.
+
 ## [17.1.7] - 2026-07-27
 
 ### Changed

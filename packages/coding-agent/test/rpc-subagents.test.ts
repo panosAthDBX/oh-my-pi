@@ -660,19 +660,12 @@ export default function (pi) {
 				(async () => {
 					const received: object[] = [];
 					const decoder = new RpcFrameDecoder();
-					let readySeen = false;
 					let negotiationSent = false;
 					for await (const rawFrame of readJsonl(child.stdout)) {
 						if (!isRecord(rawFrame)) continue;
 						received.push(rawFrame);
-						if (rawFrame.type === "ready") readySeen = true;
-						if (readySeen && !negotiationSent && rawFrame.type === "available_commands_update") {
+						if (!negotiationSent && rawFrame.type === "ready") {
 							negotiationSent = true;
-							// Model an asynchronously scheduled ready handler without
-							// relying on a wall-clock sleep.
-							for (let turn = 0; turn < 32; turn++) {
-								await new Promise<void>(resolve => setImmediate(resolve));
-							}
 							child.stdin.write(
 								`${JSON.stringify({ type: "negotiate_protocol", protocolVersion: 2, id: "ready-v2" })}\n`,
 							);

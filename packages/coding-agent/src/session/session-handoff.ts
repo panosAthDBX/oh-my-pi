@@ -65,7 +65,10 @@ export interface SessionHandoffHost {
 	resetTodoCycle(): void;
 	clearTodoProjections(): void;
 	buildDisplaySessionContext(): SessionContext;
-	resetAdvisorRuntimes(): void;
+	resetAdvisorSessionState(): void;
+	drainAndDetachAdvisorRecorders(): Promise<void>;
+	reattachAdvisorRecorderFeeds(): void;
+	clearAdvisorCost(): void;
 	syncTodoPhasesFromBranch(): void;
 }
 
@@ -125,6 +128,8 @@ export class SessionHandoff {
 			}
 		}
 
+		let advisorRecordersDetached = false;
+		let sessionTransitioned = false;
 		try {
 			if (handoffSignal.aborted) {
 				throw new Error("Handoff cancelled");
@@ -225,14 +230,21 @@ export class SessionHandoff {
 			}
 			await this.#host.flushPendingBash();
 			await this.#host.sessionManager.flush();
+			advisorRecordersDetached = true;
+			// Stop and settle in-flight advisors while the old-session feeds can still
+			// observe message_end, then mute before opening the replacement session.
+			await this.#host.drainAndDetachAdvisorRecorders();
 			const bashTransition = this.#host.beginBashSessionTransition();
 			this.#host.cancelOwnAsyncJobs();
-			let sessionTransitioned = false;
 			try {
 				await this.#host.sessionManager.newSession(
 					previousSessionFile ? { parentSession: previousSessionFile } : undefined,
 				);
 				this.#host.markBashSessionTransition(bashTransition);
+				// The handoff opens a fresh conversation, so the spend of the one it
+				// summarizes stays with it. Clearing here, at the commit point, keeps the
+				// status line honest even if a later step throws.
+				this.#host.clearAdvisorCost();
 				sessionTransitioned = true;
 			} finally {
 				this.#host.finishBashSessionTransition(bashTransition, sessionTransitioned);
@@ -285,7 +297,8 @@ export class SessionHandoff {
 			// Rebuild agent messages from session
 			const sessionContext = this.#host.buildDisplaySessionContext();
 			this.#host.agent.replaceMessages(sessionContext.messages);
-			this.#host.resetAdvisorRuntimes();
+			this.#host.resetAdvisorSessionState();
+			advisorRecordersDetached = false;
 			this.#host.syncTodoPhasesFromBranch();
 			this.#host.clearTodoProjections();
 			if (this.#host.extensionRunner) {
@@ -303,6 +316,10 @@ export class SessionHandoff {
 			}
 			throw error;
 		} finally {
+			if (advisorRecordersDetached) {
+				if (sessionTransitioned) this.#host.resetAdvisorSessionState();
+				else this.#host.reattachAdvisorRecorderFeeds();
+			}
 			sourceSignal?.removeEventListener("abort", onSourceAbort);
 			this.#handoffAbortController = undefined;
 		}

@@ -1,5 +1,5 @@
-import type { InMemorySnapshotStore } from "@oh-my-pi/hashline";
-import type { AgentTelemetryConfig, AgentTool } from "@oh-my-pi/pi-agent-core";
+import type { Clipboard, InMemorySnapshotStore } from "@oh-my-pi/hashline";
+import type { AgentOptions, AgentTelemetryConfig, AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { FetchImpl, ImageContent, Model, ServiceTierByFamily, ToolChoice } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async/job-manager";
@@ -60,6 +60,7 @@ import { MemoryRetainTool } from "./memory-retain";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
 import type { PlanProposalHandler } from "./resolve";
+import { SecurityScanTool } from "./security-scan";
 import { type TodoPhase, TodoTool } from "./todo";
 import { WriteTool } from "./write";
 import { isMountableUnderXdev, type XdevState } from "./xdev";
@@ -99,6 +100,7 @@ export * from "./read";
 export * from "./report-tool-issue";
 export * from "./resolve";
 export * from "./review";
+export * from "./security-scan";
 export * from "./todo";
 export * from "./tts";
 export * from "./vibe";
@@ -162,6 +164,8 @@ export interface ToolSession {
 	suppressSpawnAdvisory?: boolean;
 	/** Optional fetch implementation injected into the URL read pipeline (tests, proxies). Defaults to global fetch. */
 	fetch?: FetchImpl;
+	/** Provider credential resolver forwarded unchanged to restricted child sessions. */
+	getApiKey?: AgentOptions["getApiKey"];
 	/** Skip subprocess-kernel availability checks and warmup */
 	skipPythonPreflight?: boolean;
 	/** Pre-loaded context files (AGENTS.md, etc) */
@@ -191,6 +195,8 @@ export interface ToolSession {
 	customToolPaths?: ToolPathWithSource[];
 	/** Whether LSP integrations are enabled */
 	enableLsp?: boolean;
+	/** Whether LSP is limited to navigation and diagnostics. */
+	lspReadOnly?: boolean;
 	/** Whether this invocation may expose IRC. `false` removes it even for subagents. */
 	enableIrc?: boolean;
 	/**
@@ -351,6 +357,10 @@ export interface ToolSession {
 	 *  file changed out-of-band. Lazily initialized by `getFileSnapshotStore`. */
 	fileSnapshotStore?: InMemorySnapshotStore;
 
+	/** Per-session `CUT`/`PASTE` clipboard register shared across edit
+	 *  calls. Lazily initialized by `getEditClipboard`. */
+	editClipboard?: Clipboard;
+
 	/** Per-session log of unresolved git merge conflict regions surfaced by
 	 *  `read`. Each entry gets a stable id N referenced by `write conflict://N`
 	 *  to splice the recorded region with replacement content. Lazily initialized
@@ -394,6 +404,7 @@ export type ToolFactory = (session: ToolSession) => Tool | null | Promise<Tool |
  */
 export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	read: s => new ReadTool(s),
+	security_scan: s => new SecurityScanTool(s),
 	bash: s => new BashTool(s),
 	edit: s => new EditTool(s),
 	ast_grep: s => new AstGrepTool(s),
@@ -502,6 +513,18 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	// unreachable, in which case eval dispatches exclusively to the others.
 	const allowEval = effectivePythonAllowed || allowJs || effectiveRubyAllowed || effectiveJuliaAllowed;
 
+	// Checkpoint and rewind are a pair: listing one without the other strands
+	// the agent (it can checkpoint but not rewind, or vice versa). Auto-include
+	// the sister tool so a one-sided frontmatter `tools:` entry still works.
+	// Unlike the AST/auto-learn convenience auto-includes below, this is a
+	// safety pairing — it applies to restricted sessions too.
+	if (requestedTools && session.settings.get("checkpoint.enabled")) {
+		if (requestedTools.includes("checkpoint") && !requestedTools.includes("rewind")) {
+			requestedTools.push("rewind");
+		} else if (requestedTools.includes("rewind") && !requestedTools.includes("checkpoint")) {
+			requestedTools.push("checkpoint");
+		}
+	}
 	// Auto-include AST counterparts when their text-based sibling is present.
 	// Restricted callers own the active list and must not have it widened.
 	if (requestedTools && !restrictToolNames) {
@@ -571,10 +594,15 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "ast_edit") return session.settings.get("astEdit.enabled");
 		if (name === "inspect_image") return isInspectImageToolActive(session);
 		if (name === "web_search") return session.settings.get("web_search.enabled");
+		if (name === "security_scan") return session.settings.get("security.enabled");
 		if (name === "ask") return session.settings.get("ask.enabled");
 		if (name === "browser") return session.settings.get("browser.enabled");
 		if (name === "computer") return session.settings.get("computer.enabled");
-		if (name === "checkpoint" || name === "rewind") return session.settings.get("checkpoint.enabled");
+		if (name === "checkpoint" || name === "rewind")
+			return (
+				session.settings.get("checkpoint.enabled") &&
+				((session.taskDepth ?? 0) === 0 || requestedTools !== undefined)
+			);
 		if (name === "hub") {
 			return (
 				!restrictToolNames && session.enableIrc !== false && isIrcEnabled(session.settings, session.taskDepth ?? 0)
@@ -584,11 +612,15 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			return ["hindsight", "mnemopi"].includes(session.settings.get("memory.backend") ?? "");
 		}
 		if (name === "memory_edit") return session.settings.get("memory.backend") === "mnemopi";
-		if (name === "manage_skill") return session.settings.get("autolearn.enabled") && (session.taskDepth ?? 0) === 0;
+		if (name === "manage_skill")
+			return (
+				session.settings.get("autolearn.enabled") &&
+				((session.taskDepth ?? 0) === 0 || requestedTools !== undefined)
+			);
 		if (name === "learn") {
 			return (
 				session.settings.get("autolearn.enabled") &&
-				(session.taskDepth ?? 0) === 0 &&
+				((session.taskDepth ?? 0) === 0 || requestedTools !== undefined) &&
 				["hindsight", "mnemopi", "local"].includes(session.settings.get("memory.backend") ?? "")
 			);
 		}

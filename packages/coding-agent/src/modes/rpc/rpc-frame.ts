@@ -16,6 +16,56 @@ export const RPC_CLIENT_START_TIMEOUT_MS = 30_000;
  */
 export const RPC_PROTOCOL_NEGOTIATION_GRACE_MS = 500;
 
+export type RpcProtocolGraceScheduler = (flush: () => void, delayMs: number) => () => void;
+
+const scheduleProtocolGrace: RpcProtocolGraceScheduler = (flush, delayMs) => {
+	const timer = setTimeout(flush, delayMs);
+	timer.unref();
+	return () => clearTimeout(timer);
+};
+
+/**
+ * Coordinates startup projection delivery while the host chooses an RPC
+ * protocol. The gate owns the grace deadline, coalesces startup snapshots, and
+ * makes negotiation/ordinary-command transitions explicit so tests can drive
+ * protocol state without racing the wall clock.
+ */
+export class RpcStartupProjectionGate<T extends object> {
+	readonly #write: (event: T) => void;
+	readonly #scheduleGrace: RpcProtocolGraceScheduler;
+	#deferred?: T;
+	#deferring = true;
+	#cancelGrace?: () => void;
+
+	constructor(write: (event: T) => void, scheduleGrace: RpcProtocolGraceScheduler = scheduleProtocolGrace) {
+		this.#write = write;
+		this.#scheduleGrace = scheduleGrace;
+	}
+
+	capture(event: T): boolean {
+		if (!this.#deferring) return false;
+		this.#deferred = event;
+		return true;
+	}
+
+	startGrace(delayMs = RPC_PROTOCOL_NEGOTIATION_GRACE_MS): void {
+		if (!this.#deferring || this.#cancelGrace) return;
+		this.#cancelGrace = this.#scheduleGrace(() => {
+			this.#cancelGrace = undefined;
+			this.flush();
+		}, delayMs);
+	}
+
+	flush(): void {
+		this.#cancelGrace?.();
+		this.#cancelGrace = undefined;
+		this.#deferring = false;
+		const deferred = this.#deferred;
+		this.#deferred = undefined;
+		if (deferred) this.#write(deferred);
+	}
+}
+
 const RPC_CHUNK_PAYLOAD_BYTES = 256 * 1024;
 
 export type RpcProtocolVersion = 1 | 2;
