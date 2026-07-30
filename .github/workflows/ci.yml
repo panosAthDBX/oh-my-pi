@@ -436,8 +436,12 @@ jobs:
            with:
               targets: linux-x64-baseline linux-x64-modern
          - name: Install method smoke tests
+           # PR fan-out uses the latest released addon, which can legitimately
+           # trail the checkout package version. Compiled installs enforce the
+           # release sentinel, so rebuild the host addon from this checkout.
+           # Main artifacts are built from the checkout and can be reused.
            env:
-              OMP_INSTALL_TEST_SKIP_NATIVE_BUILD: "1"
+              OMP_INSTALL_TEST_SKIP_NATIVE_BUILD: ${{ github.event_name != 'pull_request' && '1' || '0' }}
            run: bun run ci:test:install-methods
 
    # Aggregates every validation job so publish-side release jobs gate on one

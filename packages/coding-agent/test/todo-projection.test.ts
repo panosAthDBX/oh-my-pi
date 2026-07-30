@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import * as os from "node:os";
 import {
 	type NamespacedTodoProjection,
 	type TodoProjectionPhase,
@@ -235,6 +236,32 @@ describe("todo projection integration", () => {
 		expect(lines[1]).toContain("namespace-injected");
 		expect(lines[2]).toContain("phase-injected");
 		expect(lines[3]).toContain("task-injected");
+	});
+
+	it("shortens absolute home paths in every extension-owned label before truncation", () => {
+		const home = os.homedir();
+		const store = new TodoProjectionStore();
+		store.set(`${home}/projection-namespace`, [
+			{
+				id: "phase",
+				name: `${home}/projection-phase`,
+				tasks: [
+					{
+						id: "task",
+						content: `${home}/projection-task`,
+						status: "in_progress",
+					},
+				],
+			},
+		]);
+
+		const lines = renderTodoProjectionLines(store.snapshot(), 120).map(line => Bun.stripANSI(line));
+		const rendered = lines.join("\n");
+
+		expect(lines[1]).toContain("~/projection-namespace");
+		expect(lines[2]).toContain("~/projection-phase");
+		expect(lines[3]).toContain("~/projection-task");
+		expect(rendered).not.toContain(home);
 	});
 
 	it("truncates every extension-owned projected label to the available HUD width", () => {

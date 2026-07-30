@@ -120,7 +120,7 @@ import type { ConfiguredThinkingLevel } from "../thinking";
 import { tinyTitleClient } from "../tiny/title-client";
 import type { LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme } from "../tools/path-utils";
-import { PREVIEW_LIMITS, replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
+import { PREVIEW_LIMITS, replaceTabs, shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
 import {
 	formatPhaseDisplayName,
@@ -434,8 +434,10 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 /** Format allowlisted projection fields for the anchored interactive todo HUD. */
 export function renderTodoProjectionLines(projections: readonly NamespacedTodoProjection[], columns: number): string[] {
 	const checkbox = theme.checkbox;
-	const formatProjectionText = (value: string, maxWidth: number): string =>
-		truncateToWidth(replaceTabs(sanitizeText(value)).replace(/[\r\n]+/g, " "), Math.max(1, maxWidth));
+	const formatProjectionText = (value: string, maxWidth: number): string => {
+		const sanitized = replaceTabs(sanitizeText(value)).replace(/[\r\n]+/g, " ");
+		return truncateToWidth(shortenPath(sanitized), Math.max(1, maxWidth));
+	};
 	const formatTask = (task: TodoProjectionItem): string => {
 		const content = formatProjectionText(
 			task.content,
