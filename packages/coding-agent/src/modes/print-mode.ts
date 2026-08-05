@@ -148,6 +148,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			process.stderr.write(`Extension error (${err.extensionPath}): ${err.error}\n`);
 		},
 	});
+	if (mode === "json") await stdoutTail;
 
 	// InteractiveMode applies the same startup default during TUI initialization.
 	// Print mode has no TUI bootstrap, so arm the shared session directly before
@@ -197,6 +198,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	}
 	// Startup extension events must reach JSON consumers before prompting begins.
 	await stdoutTail;
+
 
 	let wroteTextWorkingIndicator = false;
 	const writeTextWorkingIndicator = (): void => {
