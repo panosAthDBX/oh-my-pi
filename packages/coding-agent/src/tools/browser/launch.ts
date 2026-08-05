@@ -889,7 +889,7 @@ export async function applyStealthPatches(
 export function systemChromiumCandidatesForTest(
 	platform: NodeJS.Platform = process.platform,
 	home?: string,
-	which?: (name: string) => string | undefined,
+	which?: (name: string) => string | null | undefined,
 ): string[] {
 	return systemChromiumCandidates(platform, home, which);
 }

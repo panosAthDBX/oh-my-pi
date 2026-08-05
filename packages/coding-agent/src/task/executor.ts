@@ -17,6 +17,7 @@ import {
 	formatModelStringWithRouting,
 	resolveAgentPrewalkPattern,
 	resolveConfiguredModelPatterns,
+	resolveExplicitModelRole,
 	resolveModelOverride,
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
@@ -59,6 +60,7 @@ import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { generateTaskLabel } from "./label";
 import { resolveAgentPrewalkDefault } from "./prewalk";
+import { isReadOnlyAgent } from "./read-only-policy";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import {
 	type AgentDefinition,
@@ -344,6 +346,8 @@ export interface ExecutorOptions {
 	 */
 	detached?: boolean;
 	modelOverride?: string | string[];
+	/** Explicit pre-expansion model role alias selected for this run. */
+	modelRole?: string;
 	/**
 	 * Active model selector of the parent session, used as an auth-aware fallback
 	 * if the resolved subagent model has no working credentials. See #985.
@@ -890,6 +894,8 @@ interface RunMonitorArgs {
 	/** Parent settings for tiny-model label generation. */
 	settings?: Settings;
 	modelOverride?: string | string[];
+	/** Explicit pre-expansion model role alias selected for this run. */
+	modelRole?: string;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
 	eventBus?: EventBus;
@@ -1007,6 +1013,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		cost: 0,
 		durationMs: 0,
 		modelOverride: args.modelOverride,
+		modelRole: args.modelRole,
 	};
 
 	const outputChunks: string[] = [];
@@ -2064,6 +2071,8 @@ interface FinalizeRunArgs {
 	task: string;
 	assignment?: string;
 	modelOverride?: string | string[];
+	/** Explicit pre-expansion model role alias selected for this run. */
+	modelRole?: string;
 	outputSchema?: unknown;
 	outputSchemaMode?: StructuredSubagentSchemaMode;
 	outputSchemaSource?: StructuredSubagentSchemaSource;
@@ -2083,7 +2092,7 @@ interface FinalizeRunArgs {
  * event.
  */
 async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
-	const { monitor, done, index, id, agent, task, assignment, signal, modelOverride } = args;
+	const { monitor, done, index, id, agent, task, assignment, signal, modelOverride, modelRole } = args;
 	const progress = monitor.progress;
 	let exitCode = done.exitCode;
 	let stderr = done.error ?? "";
@@ -2210,6 +2219,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		contextTokens: progress.contextTokens,
 		contextWindow: progress.contextWindow,
 		modelOverride,
+		modelRole,
 		resolvedModel: progress.resolvedModel,
 		resolvedModelIsFallback: progress.resolvedModelIsFallback,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
@@ -2231,6 +2241,8 @@ export interface IrcWakeTurnMonitorOptions {
 	agent: AgentDefinition;
 	description?: string;
 	modelOverride?: string | string[];
+	/** Explicit pre-expansion model role alias selected for this run. */
+	modelRole?: string;
 	eventBus?: EventBus;
 	parentToolCallId?: string;
 	/** Fallback session file when the registry ref carries none. */
@@ -2275,6 +2287,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			task: ircTask,
 			description: options.description,
 			modelOverride: options.modelOverride,
+			modelRole: options.modelRole,
 			eventBus: options.eventBus,
 			parentToolCallId: options.parentToolCallId,
 			detached: true,
@@ -2332,6 +2345,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					agent,
 					task: ircTask,
 					modelOverride: options.modelOverride,
+					modelRole: options.modelRole,
 					outputSchema: options.outputSchema,
 					outputSchemaMode: options.outputSchemaMode,
 					outputSchemaSource: options.outputSchemaSource,
@@ -2400,14 +2414,20 @@ export async function finalizeSubagentLifecycle(args: {
 		args.abortKind === "budget" && args.keepAlive && !args.isolated && args.reviveSession !== null;
 	if (args.aborted && !resumableAbort) {
 		if (ref && ownsRef) {
-			// Terminal hard kill: mark `aborted` and detach the session before
-			// disposing so the ref satisfies the AgentRef invariant (session null
-			// when aborted) — ensureLive/hub focus must treat it as terminal, never
-			// route into the disposed session.
-			registry.setStatus(args.id, "aborted", ref);
-			registry.detachSession(args.id, ref);
+			// Route hard kills through the lifecycle owner so the terminal
+			// decision is durable and a restart cannot rediscover the transcript
+			// as a revivable parked agent.
+			try {
+				await AgentLifecycleManager.global().release(args.id, ref, { tombstone: true });
+			} catch (error) {
+				logger.warn("runSubagent: failed to persist kill tombstone", { id: args.id, error: String(error) });
+				registry.setStatus(args.id, "aborted", ref);
+				registry.detachSession(args.id, ref);
+				await disposeSession();
+			}
+		} else {
+			await disposeSession();
 		}
-		await disposeSession();
 		return;
 	}
 
@@ -2456,6 +2476,8 @@ export interface FollowUpTurnOptions {
 	message: string;
 	index?: number;
 	description?: string;
+	/** Explicit pre-expansion model role alias retained from the original run. */
+	modelRole?: string;
 	/** Structured-output state retained from the original invocation. */
 	outputSchema?: unknown;
 	outputSchemaMode?: StructuredSubagentSchemaMode;
@@ -2495,6 +2517,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		agent,
 		task: message,
 		description: options.description,
+		modelRole: options.modelRole,
 		signal,
 		onProgress: options.onProgress,
 		eventBus: options.eventBus,
@@ -2544,6 +2567,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		id,
 		agent,
 		task: message,
+		modelRole: options.modelRole,
 		outputSchema: options.outputSchema,
 		outputSchemaMode: options.outputSchemaMode,
 		outputSchemaSource: options.outputSchemaSource,
@@ -2570,6 +2594,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		id,
 		worktree,
 		modelOverride,
+		modelRole,
 		thinkingLevel,
 		outputSchema,
 		enableLsp,
@@ -2599,6 +2624,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			tokens: 0,
 			requests: 0,
 			modelOverride,
+			modelRole,
 			error: "Cancelled before start",
 			aborted: true,
 			abortReason: "Cancelled before start",
@@ -2689,6 +2715,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		modelRegistry: options.modelRegistry,
 		settings,
 		modelOverride,
+		modelRole,
 		signal,
 		onProgress,
 		eventBus: options.eventBus,
@@ -2722,6 +2749,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			agent,
 			description: options.description,
 			modelOverride,
+			modelRole,
 			eventBus: options.eventBus,
 			parentToolCallId: options.parentToolCallId,
 			sessionFile: subtaskSessionFile,
@@ -3107,6 +3135,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
 				task,
 				tools: session.getActiveToolNames(),
+				agent: agent.name,
+				modelRole: modelRole ?? resolveExplicitModelRole(modelOverride ?? agent.model, subagentSettings),
+				resolvedModel: progress.resolvedModel,
+				readOnly: isReadOnlyAgent(agent),
 				spawns: spawnsEnv,
 				readSummarize: agent.readSummarize,
 				outputSchema,
@@ -3372,7 +3404,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const done = await runSubagent();
 	monitor.finish();
 
-	return finalizeRunResult({
+	const result = await finalizeRunResult({
 		monitor,
 		done,
 		index,
@@ -3381,6 +3413,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		task,
 		assignment,
 		modelOverride,
+		modelRole,
 		outputSchema,
 		outputSchemaMode: options.outputSchemaMode,
 		outputSchemaSource: options.outputSchemaSource,
@@ -3392,4 +3425,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		sessionFile: subtaskSessionFile,
 		startTime,
 	});
+	AgentRegistry.global().setHistory(id, { outputPath: result.outputPath });
+	return result;
 }
