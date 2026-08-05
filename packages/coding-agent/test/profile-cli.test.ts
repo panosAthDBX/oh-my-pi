@@ -24,7 +24,7 @@ const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"
 type ProbeProcess = Bun.Subprocess<"ignore", "pipe", "pipe">;
 
 const PROFILE_PROBE_TIMEOUT_MS = 10_000;
-const PROFILE_TEST_TIMEOUT_MS = 15_000;
+const PROFILE_TEST_TIMEOUT_MS = 30_000;
 
 async function readStream(stream: ReadableStream<Uint8Array>): Promise<string> {
 	const reader = stream.getReader();
@@ -365,5 +365,7 @@ describe("global --profile flag", () => {
 		} finally {
 			await removeWithRetries(root);
 		}
-	});
+		// Same cold-spawn cost as the sibling above; it only escapes Bun's 5s
+		// default because that test warms the transpile cache first.
+	}, 30_000);
 });

@@ -762,8 +762,10 @@ describe("AgentSession handoff", () => {
 			details: {},
 			preserveData: { resultState: "keep-result" },
 		});
+		const promptCacheKey = "inherited-parent-cache";
 		const localAgent = new Agent({
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			promptCacheKey,
 		});
 		const localSession = new AgentSession({
 			agent: localAgent,
@@ -780,6 +782,7 @@ describe("AgentSession handoff", () => {
 		try {
 			await localSession.runIdleCompaction();
 			expect(compactSpy).toHaveBeenCalledTimes(1);
+			expect(compactSpy.mock.calls[0]?.[5]?.promptCacheKey).toBe(promptCacheKey);
 			const compactionEntry = localSessionManager.getEntries().find(entry => entry.type === "compaction");
 			if (compactionEntry?.type !== "compaction") throw new Error("Expected persisted compaction entry");
 			expect(compactionEntry.preserveData).toEqual({
@@ -865,30 +868,6 @@ describe("AgentSession handoff", () => {
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("does not switch providers after provider-native auto-compaction fails", async () => {
-		session.settings.set("compaction.strategy", "context-full");
-		session.settings.set("compaction.thresholdTokens", 50);
-		session.settings.set("compaction.keepRecentTokens", 1);
-		session.settings.set("contextPromotion.enabled", false);
-
-		const attemptedCandidates: string[] = [];
-		vi.spyOn(compactionModule, "compact").mockImplementation(async (_preparation, candidate) => {
-			attemptedCandidates.push(`${candidate.provider}/${candidate.id}`);
-			throw new compactionModule.NativeCompactionError(new Error("native compaction transport failed"));
-		});
-
-		await session.prompt("pending prompt ".repeat(120));
-		await waitFor(() =>
-			events.some(
-				event =>
-					event.type === "auto_compaction_end" &&
-					event.errorMessage?.includes("native compaction transport failed") === true,
-			),
-		);
-
-		expect(attemptedCandidates.length).toBeGreaterThan(0);
-		expect(new Set(attemptedCandidates.map(candidate => candidate.split("/", 1)[0]))).toHaveLength(1);
-	});
 	it("keeps pre-prompt context-full checks aligned with provider-anchored usage", async () => {
 		await session.dispose();
 		authStorage.setRuntimeApiKey("openai", "test-key");

@@ -20,6 +20,7 @@ import type { TaskEffort } from "../thinking";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../tools/hub";
 import { buildOutputValidator } from "../tools/output-schema-validator";
+import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { type ExecutorOptions, runSubprocess } from "./executor";
 import {
@@ -540,12 +541,16 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 	let mergeSummary = "";
 	let requiresRecoveryArtifacts = false;
 	let completedSuccessfully = false;
+	let deferredCleanup: Promise<void> | undefined;
 	try {
 		const id = await reserveStructuredSubagentId(request.session, {
 			...request.identity,
 			label: request.identity?.label ?? (request.invocationKind === "eval" ? "EvalAgent" : undefined),
 		});
 		const baseOptions = buildExecutorOptions(request, policy, lease, id);
+		baseOptions.onCleanupDeferred = completion => {
+			deferredCleanup = completion;
+		};
 		baseOptions.planReference = await loadPlanReference(request, policy);
 		let isolationContext: IsolationContext | null = null;
 		if (policy.isIsolated) {
@@ -639,8 +644,18 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
 		const shouldCleanup = lease.temporary && !shouldRetainArtifacts;
 		if (shouldCleanup) {
-			await fs.rm(lease.artifactsDir, { recursive: true, force: true });
-			lease.unregister?.();
+			const cleanupArtifacts = async (): Promise<void> => {
+				await fs.rm(lease.artifactsDir, { recursive: true, force: true });
+				lease.unregister?.();
+			};
+			if (deferredCleanup) {
+				trackLateCleanup(deferredCleanup.then(cleanupArtifacts), {
+					resource: "artifacts",
+					artifactsDir: lease.artifactsDir,
+				});
+			} else {
+				await cleanupArtifacts();
+			}
 		}
 	}
 }
