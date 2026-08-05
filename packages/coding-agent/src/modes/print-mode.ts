@@ -199,7 +199,6 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	// Startup extension events must reach JSON consumers before prompting begins.
 	await stdoutTail;
 
-
 	let wroteTextWorkingIndicator = false;
 	const writeTextWorkingIndicator = (): void => {
 		if (mode !== "text" || wroteTextWorkingIndicator) return;
