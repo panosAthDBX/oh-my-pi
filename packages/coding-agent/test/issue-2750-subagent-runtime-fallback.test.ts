@@ -33,6 +33,7 @@ function createYieldingSession(): AgentSession {
 		getActiveToolNames: () => ["yield"],
 		getEnabledToolNames: () => ["yield"],
 		setActiveToolsByName: async () => {},
+		setIrcWakeTurnObserver: () => {},
 		subscribe: (listener: (event: { type: string; [key: string]: unknown }) => void) => {
 			listeners.push(listener);
 			return () => {};

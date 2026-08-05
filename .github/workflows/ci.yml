@@ -307,7 +307,12 @@ jobs:
          - name: Test workspace packages and repo scripts (TS)
            env:
               OMP_TEST_CONCURRENCY: "4"
-           run: bun run ci:test:ts:workspace
+           run: |
+              bun run ci:test:ts:workspace
+              # Not `test:scripts`: scripts/musl-release.test.ts fails on main
+              # (its install.sh smoke-check executes a fake binary), so running
+              # the whole group here would red this job on an unrelated break.
+              bun test scripts/release.test.ts
 
    test_coding_agent_singleton:
       name: Test coding-agent singleton/global-state (TS)
@@ -751,12 +756,17 @@ jobs:
               pattern: omp-binary-*
               path: packages/coding-agent/binaries
               merge-multiple: true
+         # Dependency-free build (bun APIs + zip only), so no `bun install`
+         # is needed on this runner.
+         - name: Build browser relay artifacts
+           run: bun run --cwd packages/browser-relay build
          - name: Create GitHub Release
            uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
            with:
               tag_name: ${{ needs.release_metadata.outputs.release-tag }}
               files: |
                  packages/coding-agent/binaries/omp-*
+                 packages/browser-relay/dist/omp-browser-relay-extension.zip
               body_path: release-notes.md
               generate_release_notes: true
 

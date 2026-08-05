@@ -297,7 +297,7 @@ function buildAcpSpeechModelsCatalog(): Record<string, unknown> {
 async function elicitFromAcpClient(
 	connection: AgentSideConnection,
 	sessionId: string,
-	method: "select" | "confirm" | "input",
+	method: "select" | "confirm" | "input" | "editor",
 	message: string,
 	property: ElicitationPropertySchema,
 	dialogOptions: ExtensionUIDialogOptions | undefined,
@@ -378,9 +378,9 @@ function isAcceptedElicitation(
  * symmetric with every other `sessionUpdate` call in this file
  * (`record.session.sessionId` is always evaluated at emit time).
  *
- * The non-elicitation surface (custom components, editor, theming,
- * terminal input) remains stubbed — ACP clients render those themselves
- * or not at all. Capability gating respects the client's `initialize`
+ * The non-elicitation surface (custom components, theming, terminal
+ * input) remains stubbed — ACP clients render those themselves or not
+ * at all. Capability gating respects the client's `initialize`
  * advertisement.
  */
 export function createAcpExtensionUiContext(
@@ -444,7 +444,18 @@ export function createAcpExtensionUiContext(
 		pasteToEditor: () => {},
 		setEditorText: () => {},
 		getEditorText: () => "",
-		editor: async () => undefined,
+		editor: async (title, prefill, dialogOptions) => {
+			if (!supportsForm) return undefined;
+			const value = await elicitFromAcpClient(
+				connection,
+				getSessionId(),
+				"editor",
+				title,
+				{ type: "string", ...(prefill ? { default: prefill } : {}) },
+				dialogOptions,
+			);
+			return typeof value === "string" ? value : undefined;
+		},
 		addAutocompleteProvider: () => {},
 		setEditorComponent: () => {},
 		get theme() {
@@ -2328,7 +2339,7 @@ export class AcpAgent implements Agent {
 			this.#clientCapabilities,
 		);
 		if (this.#clientCapabilities?.elicitation?.form != null) {
-			record.session.setUsageFallbackConfirmer(confirmation => {
+			record.session.setUsageFallbackConfirmer((confirmation, signal) => {
 				const reserve =
 					confirmation.remainingPercent === undefined
 						? "inside the configured reserve margin"
@@ -2336,6 +2347,7 @@ export class AcpAgent implements Agent {
 				return uiContext.confirm(
 					"Coding-plan reserve reached",
 					`${confirmation.from} has ${reserve}. Switch to ${confirmation.to}? Choose No to keep using the current plan.`,
+					{ signal },
 				);
 			});
 		}

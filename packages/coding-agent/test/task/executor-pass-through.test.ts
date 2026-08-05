@@ -87,6 +87,7 @@ function createMockSession(
 		getLastAssistantMessage: () => undefined,
 		abort: async () => {},
 		dispose: async () => {},
+		setIrcWakeTurnObserver: () => {},
 	};
 	return session as unknown as AgentSession;
 }
@@ -437,5 +438,26 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(result.exitCode).toBe(0);
 		const forwarded = spy.mock.calls[0]?.[0];
 		expect(forwarded?.thinkingLevel).toBe(ThinkingLevel.Low);
+	});
+	it("persists an explicit role from a caller model override", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const settings = Settings.isolated({
+			modelRoles: { reviewer: `${model.provider}/${model.id}` },
+		});
+		const session = yieldEmittingSession();
+		const initSpy = vi.spyOn(session.sessionManager, "appendSessionInit");
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-model-override-role",
+			modelOverride: "@reviewer",
+			settings,
+			modelRegistry: createModelRegistry(model),
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(initSpy).toHaveBeenCalledWith(expect.objectContaining({ modelRole: "reviewer" }));
 	});
 });
