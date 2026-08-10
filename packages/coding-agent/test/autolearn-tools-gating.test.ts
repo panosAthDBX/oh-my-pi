@@ -36,6 +36,13 @@ describe("autolearn tool gating", () => {
 		expect(names).not.toContain("manage_skill");
 	});
 
+	it("force-includes Supermemory recall and retain but not reflect into explicit tool lists", async () => {
+		const names = (await createTools(makeSession({ "memory.backend": "supermemory" }), ["read"])).map(t => t.name);
+		expect(names).toContain("recall");
+		expect(names).toContain("retain");
+		expect(names).not.toContain("reflect");
+	});
+
 	it("offers manage_skill but not learn when enabled with no memory backend", async () => {
 		const names = (await createTools(makeSession({ "autolearn.enabled": true, "memory.backend": "off" }))).map(
 			t => t.name,
@@ -55,6 +62,17 @@ describe("autolearn tool gating", () => {
 		expect(manage?.loadMode).toBe("essential");
 	});
 
+	it("offers learn with Supermemory when auto-learn is enabled", async () => {
+		const tools = await createTools(makeSession({ "autolearn.enabled": true, "memory.backend": "supermemory" }));
+		expect(tools.map(t => t.name)).toContain("learn");
+		expect(tools.find(t => t.name === "learn")?.loadMode).toBe("essential");
+
+		const restricted = (
+			await createTools(makeSession({ "autolearn.enabled": true, "memory.backend": "supermemory" }), ["read"])
+		).map(t => t.name);
+		expect(restricted).toContain("learn");
+	});
+
 	it("force-includes the tools into an explicit restricted toolNames list", async () => {
 		// A session created with autolearn on but a narrow tool list still gets the
 		// controller/guidance, so the tools the nudge points at must be present.
@@ -71,23 +89,37 @@ describe("autolearn tool gating", () => {
 		expect(noBackend).not.toContain("learn");
 	});
 
-	it("excludes the tools from a subagent when not in the explicit list", async () => {
-		// taskDepth > 0: the controller never runs here, so a subagent's explicit
-		// whitelist must not be silently widened with write-capable tools.
+	it("excludes automatic learning from subagents and depth-zero /tan clones while retaining manual memory tools", async () => {
 		const sub = (
-			await createTools(makeSession({ "autolearn.enabled": true, "memory.backend": "mnemopi" }, { taskDepth: 1 }), [
-				"read",
-			])
+			await createTools(
+				makeSession({ "autolearn.enabled": true, "memory.backend": "mnemopi" }, { taskDepth: 1, agentKind: "sub" }),
+				["read"],
+			)
 		).map(t => t.name);
 		expect(sub).not.toContain("manage_skill");
 		expect(sub).not.toContain("learn");
 
-		// Nor via discovery (no explicit list) at depth.
-		const subDiscovered = (
-			await createTools(makeSession({ "autolearn.enabled": true, "memory.backend": "mnemopi" }, { taskDepth: 1 }))
+		// `/tan` is a subagent despite starting at task depth zero.
+		const tan = (
+			await createTools(
+				makeSession({ "autolearn.enabled": true, "memory.backend": "mnemopi" }, { taskDepth: 0, agentKind: "sub" }),
+				["read"],
+			)
 		).map(t => t.name);
-		expect(subDiscovered).not.toContain("manage_skill");
-		expect(subDiscovered).not.toContain("learn");
+		expect(tan).toEqual(expect.arrayContaining(["recall", "retain"]));
+		expect(tan).not.toContain("manage_skill");
+		expect(tan).not.toContain("learn");
+	});
+
+	it("falls back to task depth when ToolSession omits agentKind", async () => {
+		const depthOnlySubagent = (
+			await createTools(makeSession({ "autolearn.enabled": true, "memory.backend": "mnemopi" }, { taskDepth: 1 }), [
+				"read",
+			])
+		).map(tool => tool.name);
+		expect(depthOnlySubagent).toEqual(expect.arrayContaining(["recall", "retain"]));
+		expect(depthOnlySubagent).not.toContain("manage_skill");
+		expect(depthOnlySubagent).not.toContain("learn");
 	});
 
 	it("allows the tools in a subagent when explicitly requested in toolNames", async () => {

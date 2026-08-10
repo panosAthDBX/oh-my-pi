@@ -104,6 +104,7 @@ import type {
 	TurnStartEvent,
 } from "../shared-events";
 import type { SlashCommandInfo } from "../slash-commands";
+import type { TodoProjectionPhase } from "./todo-projection";
 
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
 export type { ExecOptions, ExecResult } from "../../exec/exec";
@@ -1328,6 +1329,15 @@ export interface ExtensionAPI {
 		tier: ExtensionServiceTier<Family> | undefined,
 	): void;
 
+	/**
+	 * Replace the derived todo/status projection owned by `namespace` in the
+	 * current session. Pass `undefined` to remove that namespace.
+	 *
+	 * Projection state is display-only: it never mutates native todos, enters
+	 * the transcript, or participates in todo reminders and normalization.
+	 */
+	setTodoProjection(namespace: string, phases: readonly TodoProjectionPhase[] | undefined): void;
+
 	/** Get the current session name. */
 	getSessionName(): string | undefined;
 
@@ -1547,6 +1557,7 @@ export interface ExtensionActions {
 	setServiceTier?: SetServiceTierHandler;
 	getSessionName: () => string | undefined;
 	setSessionName: (name: string) => Promise<void>;
+	setTodoProjection: (namespace: string, phases: readonly TodoProjectionPhase[] | undefined) => void;
 }
 
 /** Actions for ExtensionContext (ctx.* in event handlers). */

@@ -56,6 +56,114 @@ function expectAcpNotifications(updates: SessionNotification[]): void {
 	}
 }
 
+it("maps todo projection snapshots to ACP plans after native todos", () => {
+	const updates = mapAgentSessionEventToAcpSessionUpdates(
+		{
+			type: "todo_projection_changed",
+			projections: [
+				{
+					namespace: "deployments",
+					phases: [
+						{
+							id: "release",
+							name: "Release",
+							tasks: [
+								{ id: "publish", content: "Publish package", status: "in_progress" },
+								{ id: "verify", content: "Verify release", status: "failed" },
+								{ id: "cancel", content: "Cancel release", status: "cancelled" },
+								{ id: "abandon", content: "Abandon release", status: "abandoned" },
+							],
+						},
+					],
+				},
+			],
+		} as AgentSessionEvent,
+		"session-1",
+		{
+			todoPhases: [
+				{
+					name: "Native",
+					tasks: [{ content: "Native task", status: "pending" }],
+				},
+			],
+		},
+	);
+
+	expect(updates).toHaveLength(1);
+	expectAcpNotifications(updates);
+	expect(updates[0]?.update).toEqual({
+		sessionUpdate: "plan",
+		entries: [
+			{ content: "Native task", priority: "medium", status: "pending" },
+			{ content: "[deployments / Release] Publish package", priority: "medium", status: "in_progress" },
+			{ content: "[deployments / Release] Verify release [failed]", priority: "medium", status: "completed" },
+			{ content: "[deployments / Release] Cancel release [cancelled]", priority: "medium", status: "completed" },
+			{ content: "[deployments / Release] Abandon release [abandoned]", priority: "medium", status: "completed" },
+		],
+	});
+});
+
+it("preserves projected rows across native ACP plan replacements", () => {
+	const todoProjections = [
+		{
+			namespace: "deployments",
+			phases: [
+				{
+					id: "release",
+					name: "Release",
+					tasks: [{ id: "publish", content: "Publish package", status: "in_progress" as const }],
+				},
+			],
+		},
+	];
+	const cases: Array<{ event: AgentSessionEvent; nativeContent?: string }> = [
+		{
+			event: {
+				type: "tool_execution_end",
+				toolCallId: "todo-1",
+				toolName: "todo",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "updated" }],
+					details: {
+						phases: [{ name: "Native", tasks: [{ content: "Tool native", status: "pending" }] }],
+					},
+				},
+			} as AgentSessionEvent,
+			nativeContent: "Tool native",
+		},
+		{
+			event: {
+				type: "todo_reminder",
+				todos: [{ content: "Reminder native", status: "pending" }],
+				attempt: 1,
+				maxAttempts: 3,
+			},
+			nativeContent: "Reminder native",
+		},
+		{ event: { type: "todo_auto_clear" } },
+	];
+
+	for (const { event, nativeContent } of cases) {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(event, "session-1", { todoProjections });
+		expectAcpNotifications(updates);
+		const plan = updates.find(update => update.update.sessionUpdate === "plan");
+		expect(plan?.update).toEqual({
+			sessionUpdate: "plan",
+			entries: [
+				...(nativeContent
+					? [{ content: nativeContent, priority: "medium" as const, status: "pending" as const }]
+					: []),
+				{
+					content: "[deployments / Release] Publish package",
+					priority: "medium" as const,
+					status: "in_progress" as const,
+				},
+			],
+		});
+	}
+});
+
 const TEST_MODEL: Model = buildModel({
 	id: "claude-sonnet-4-20250514",
 	name: "Claude Sonnet",

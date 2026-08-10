@@ -216,6 +216,16 @@ describe("AgentSession handoff", () => {
 						.filter(entry => entry.type === "custom_message" && entry.customType === "handoff").length,
 				});
 			}
+			if (event.type === "session_switch") {
+				expect(session.getTodoProjections()).toEqual([]);
+				session.setTodoProjection("rebuilt", [
+					{
+						id: "replacement",
+						name: "Replacement session",
+						tasks: [{ id: "continue", content: "Continue work", status: "in_progress" }],
+					},
+				]);
+			}
 			return emit(event);
 		});
 
@@ -242,6 +252,13 @@ describe("AgentSession handoff", () => {
 			.spyOn(compactionModule, "generateHandoffFromContext")
 			.mockResolvedValue("## Goal\nContinue from here");
 
+		session.setTodoProjection("stale", [
+			{
+				id: "outgoing",
+				name: "Outgoing session",
+				tasks: [{ id: "old", content: "Old work", status: "pending" }],
+			},
+		]);
 		await session.handoff();
 
 		const nextSessionFile = session.sessionFile;
@@ -265,6 +282,7 @@ describe("AgentSession handoff", () => {
 				handoffEntryCount: 1,
 			},
 		]);
+		expect(session.getTodoProjections().map(projection => projection.namespace)).toEqual(["rebuilt"]);
 	});
 
 	it("runs handoff generation through the configured side stream function", async () => {

@@ -36,6 +36,7 @@ function createMockSession(
 		sessionManager: {
 			appendSessionInit: () => {},
 		},
+		getTodoProjections: () => [],
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async () => {},

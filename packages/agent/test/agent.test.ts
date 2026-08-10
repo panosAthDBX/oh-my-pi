@@ -18,6 +18,29 @@ describe("Agent", () => {
 		expect(agent.state.messages).not.toContainEqual(message);
 	});
 
+	it("calls onAccepted synchronously after acquiring prompt admission", async () => {
+		const mock = createMockModel({ responses: [] });
+		const stream = new AssistantMessageEventStream();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: () => stream,
+		});
+		let admittedWhileStreaming = false;
+		let rejectedConcurrentPrompt: Promise<void> | undefined;
+
+		const prompt = agent.prompt("first", {
+			onAccepted: () => {
+				admittedWhileStreaming = agent.state.isStreaming;
+				rejectedConcurrentPrompt = agent.prompt("second");
+			},
+		});
+		const concurrentPrompt = rejectedConcurrentPrompt;
+		if (!concurrentPrompt) throw new Error("Expected concurrent prompt attempt");
+		expect(admittedWhileStreaming).toBe(true);
+		await expect(concurrentPrompt).rejects.toBeInstanceOf(AgentBusyError);
+		agent.abort();
+		await prompt;
+	});
 	it("classifies agent-authored steering as a parent steering message", async () => {
 		const toolSchema = type({ value: type("string") });
 		const executed: string[] = [];
@@ -279,7 +302,7 @@ describe("Agent", () => {
 	});
 	it("keeps follow-up ownership when the deadline expires during a dequeue hook", async () => {
 		const mock = createMockModel({ responses: [{ content: ["done"] }] });
-		const agent = new Agent({ streamFn: mock.stream, deadline: Date.now() + 25 });
+		const agent = new Agent({ streamFn: mock.stream, deadline: Date.now() + 250 });
 		let hookSignal: AbortSignal | undefined;
 		agent.addBeforeQueuedMessageDequeueHook(async signal => {
 			if (!signal) throw new Error("Expected the active loop signal");

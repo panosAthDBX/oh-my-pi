@@ -5,6 +5,10 @@ import * as path from "node:path";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type {
+	NamespacedTodoProjection,
+	TodoProjectionPhase,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/todo-projection";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import {
 	ACP_BOOTSTRAP_RACE_GUARD_MS,
@@ -22,6 +26,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS } from "@oh-my-pi/pi-coding-agent/stt/models";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import type { TodoPhase } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import {
 	DEFAULT_TTS_LOCAL_MODEL_KEY,
 	DEFAULT_TTS_VOICE,
@@ -147,6 +152,8 @@ class FakeAgentSession {
 	waitForIdleBlocker: (() => Promise<void>) | undefined;
 	asyncJobDrain: ((options?: { timeoutMs?: number }) => Promise<boolean>) | undefined;
 	usageFallbackConfirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined;
+	todoPhases: TodoPhase[] = [];
+	todoProjections: NamespacedTodoProjection[] = [];
 	#listeners = new Set<(event: AgentSessionEvent) => void>();
 
 	constructor(
@@ -192,6 +199,21 @@ class FakeAgentSession {
 					thinkingLevel: level,
 				} as AgentSessionEvent);
 			}
+		}
+	}
+
+	getTodoPhases(): TodoPhase[] {
+		return this.todoPhases;
+	}
+
+	getTodoProjections(): NamespacedTodoProjection[] {
+		return this.todoProjections;
+	}
+
+	setTodoProjection(namespace: string, phases: readonly TodoProjectionPhase[] | undefined): void {
+		this.todoProjections = phases ? [{ namespace, phases }] : [];
+		for (const listener of this.#listeners) {
+			listener({ type: "todo_projection_changed", projections: this.todoProjections });
 		}
 	}
 
@@ -870,6 +892,53 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("delivers startup and later todo projection snapshots as ACP plans", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.todoPhases = [{ name: "Native", tasks: [{ content: "Native task", status: "pending" }] }];
+		session.setTodoProjection("startup", [
+			{
+				id: "release",
+				name: "Release",
+				tasks: [{ id: "publish", content: "Publish package", status: "in_progress" }],
+			},
+		]);
+
+		await waitForBootstrapGuard();
+		const startupPlan = harness.updates.find(
+			notification =>
+				notification.sessionId === created.sessionId &&
+				notification.update.sessionUpdate === "plan" &&
+				notification.update.entries.some(entry => entry.content.includes("Publish package")),
+		);
+		expect(startupPlan?.update).toEqual({
+			sessionUpdate: "plan",
+			entries: [
+				{ content: "Native task", priority: "medium", status: "pending" },
+				{ content: "[startup / Release] Publish package", priority: "medium", status: "in_progress" },
+			],
+		});
+
+		const baseline = harness.updates.length;
+		session.setTodoProjection("startup", [
+			{
+				id: "release",
+				name: "Release",
+				tasks: [{ id: "verify", content: "Verify package", status: "completed" }],
+			},
+		]);
+		expect(harness.updates.slice(baseline).map(notification => notification.update)).toContainEqual({
+			sessionUpdate: "plan",
+			entries: [
+				{ content: "Native task", priority: "medium", status: "pending" },
+				{ content: "[startup / Release] Verify package", priority: "medium", status: "completed" },
+			],
+		});
+
+		harness.abortController.abort();
 	});
 
 	it("emits a single config_option_update per setSessionConfigOption(thinking) call", async () => {

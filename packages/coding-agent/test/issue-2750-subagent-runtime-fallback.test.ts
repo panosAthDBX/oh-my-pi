@@ -29,6 +29,7 @@ function createYieldingSession(): AgentSession {
 		state: { messages: [] },
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
+		getTodoProjections: () => [],
 		getActiveToolNames: () => ["yield"],
 		getEnabledToolNames: () => ["yield"],
 		setActiveToolsByName: async () => {},

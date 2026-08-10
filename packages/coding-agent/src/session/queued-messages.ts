@@ -3,7 +3,7 @@ import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import type { RestoredQueuedMessage } from "./agent-session-types";
 import { type CustomMessage, readQueueChipText } from "./messages";
 
-function queuedTextContent(message: AgentMessage): string | undefined {
+export function queuedTextContent(message: AgentMessage): string | undefined {
 	if (!("content" in message)) return undefined;
 	const content = message.content;
 	if (typeof content === "string") return content;

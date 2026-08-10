@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { SessionFocusController } from "@oh-my-pi/pi-coding-agent/modes/controllers/session-focus-controller";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import type { InteractiveModeContext, TodoPhase } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -13,11 +13,12 @@ interface SessionStub {
 	setStreaming: (streaming: boolean) => void;
 }
 
-function makeSessionStub(opts: { isStreaming?: boolean } = {}): SessionStub {
+function makeSessionStub(opts: { isStreaming?: boolean; todos?: TodoPhase[] } = {}): SessionStub {
 	let listener: ((event: AgentSessionEvent) => Promise<void> | void) | undefined;
 	let unsubscribeCalls = 0;
 	const stub = {
 		isStreaming: opts.isStreaming ?? false,
+		getTodoPhases: () => opts.todos ?? [],
 		subscribe(fn: (event: AgentSessionEvent) => Promise<void> | void) {
 			listener = fn;
 			return () => {
@@ -50,6 +51,7 @@ interface Harness {
 		resetTranscriptAnchors: () => number;
 		renderInitialMessages: () => number;
 		mainUnsubscribe: () => number;
+		setTodos: () => number;
 	};
 }
 
@@ -61,6 +63,7 @@ function makeHarness(): Harness {
 	let resetTranscriptAnchors = 0;
 	let renderInitialMessages = 0;
 	let mainUnsubscribe = 0;
+	let setTodos = 0;
 
 	const ctx = {
 		session: main.session,
@@ -87,6 +90,9 @@ function makeHarness(): Harness {
 		renderInitialMessages: () => {
 			renderInitialMessages++;
 		},
+		setTodos: () => {
+			setTodos++;
+		},
 		updateEditorBorderColor() {},
 		ui: { requestRender() {} },
 		showStatus() {},
@@ -109,6 +115,7 @@ function makeHarness(): Harness {
 			resetTranscriptAnchors: () => resetTranscriptAnchors,
 			renderInitialMessages: () => renderInitialMessages,
 			mainUnsubscribe: () => mainUnsubscribe,
+			setTodos: () => setTodos,
 		},
 	};
 }
@@ -136,6 +143,7 @@ describe("SessionFocusController", () => {
 		expect(h.counts.clearTransientSessionUi()).toBe(1);
 		expect(h.counts.resetTranscriptAnchors()).toBe(1);
 		expect(h.counts.renderInitialMessages()).toBe(1);
+		expect(h.counts.setTodos()).toBe(1);
 		expect(h.setSessionCalls).toEqual([[worker.session, "Worker"]]);
 
 		const event = { type: "message_start", message: { role: "user" } };

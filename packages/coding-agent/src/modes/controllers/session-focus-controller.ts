@@ -112,6 +112,6 @@ export class SessionFocusController {
 		if (target.isStreaming) await this.ctx.eventController.handleEvent({ type: "agent_start" });
 		else setTerminalTitleState("idle");
 		this.ctx.updateEditorBorderColor();
-		this.ctx.ui.requestRender();
+		this.ctx.setTodos(target.getTodoPhases());
 	}
 }
