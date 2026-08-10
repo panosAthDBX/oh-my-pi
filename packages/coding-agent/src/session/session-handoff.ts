@@ -75,6 +75,7 @@ export interface SessionHandoffHost {
 	resetMemoryContextForNewTranscript(): Promise<void>;
 	clearPendingNextTurnMessages(): void;
 	resetTodoCycle(): void;
+	clearTodoProjections(): void;
 	buildDisplaySessionContext(): SessionContext;
 	resetAdvisorSessionState(): void;
 	drainAndDetachAdvisorRecorders(): Promise<void>;
@@ -321,6 +322,7 @@ export class SessionHandoff {
 			this.#host.resetAdvisorSessionState();
 			advisorRecordersDetached = false;
 			this.#host.syncTodoPhasesFromBranch();
+			this.#host.clearTodoProjections();
 			if (this.#host.extensionRunner) {
 				await this.#host.extensionRunner.emit({
 					type: "session_switch",

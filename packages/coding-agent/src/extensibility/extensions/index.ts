@@ -11,6 +11,7 @@ export {
 	loadExtensions,
 } from "./loader";
 export * from "./runner";
+export * from "./todo-projection";
 // Type guards
 export * from "./types";
 export * from "./wrapper";

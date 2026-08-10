@@ -58,6 +58,9 @@
 
 - Removed the `resolveAgentModelSource` model-resolver export, whose only use was being fed to `resolveExplicitModelRole`. Replaced by `resolveAgentModelSelection`, which returns the expanded `patterns` and the pre-expansion `role` together so a spawn path cannot derive one without the other ([#7910](https://github.com/can1357/oh-my-pi/pull/7910) by [@enieuwy](https://github.com/enieuwy)).
 - A run is now attributed to the model that actually produced its output, not whichever model the session was last pointed at. A retry fallback that errored on its first request — an exhausted quota, a hard provider error — was credited with the whole run in the Agent Hub row and the settled task result, even when the previous model did every turn. Sessions expose the serving model directly, holding the last model that produced output while a candidate is armed but unproven, and transcript-derived history stops at the newest turn that produced output.
+### Added
+
+- Added the `setTodoProjection()` coding-agent extension API for namespaced, display-only lifecycle progress that stays isolated from native session todos and transcript state; RPC clients receive defensive projection snapshots, including projections published by `session_start` handlers ([#6522](https://github.com/can1357/oh-my-pi/pull/6522) by [@panosAthDBX](https://github.com/panosAthDBX)).
 
 ## [17.2.12] - 2026-08-08
 
@@ -631,6 +634,12 @@
 
 ### Added
 
+- Added a native Supermemory memory backend with project-scoped recall, profiles, explicit save/search, automatic retention, compaction context, `/memory` operations, and self-hosted endpoint support via `SUPERMEMORY_BASE_URL`.
+
+### Fixed
+
+- Fixed deferred memory backend settings being ignored by fork, resume, branch, and handoff session transitions.
+- Fixed automatic Supermemory retention reusing one document identity across cadence windows, which caused later conversation windows to overwrite earlier retained content.
 - `omp usage` now surfaces auto-disabled credentials as red `✗` tombstone rows (identity, how long ago, the shortened upstream cause — e.g. `Refresh token expired` — and a re-login hint), including a provider section when no active credential remains. User-driven tombstones (`replaced by newer credential`, `deleted by user`) and API-key rows stay hidden. Requires a broker with `GET /v1/credentials/disabled`; older brokers degrade to no tombstone rows.
 - `omp usage` warns about Anthropic's ~30-day OAuth grant lifetime: accounts whose interactive login (`authorizedAt`) is within a week of the deadline get a yellow `⚠ re-login within <time>` line, and past-deadline accounts a red one. Grants die server-side exactly ~30 days after login regardless of refresh rotation, so this is the only warning before the broker auto-disables the row.
 

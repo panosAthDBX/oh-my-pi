@@ -5,6 +5,7 @@ import {
 	MAX_RPC_REASSEMBLED_BYTES,
 	RpcFrameDecoder,
 	RpcFrameEncoder,
+	RpcStartupProjectionGate,
 } from "../src/modes/rpc/rpc-frame";
 
 function decode(frame: string): Record<string, unknown> {
@@ -302,5 +303,56 @@ describe("RPC frame encoding", () => {
 				data: "fQ==",
 			}),
 		).toThrow("rpc chunk sequence mismatch");
+	});
+});
+
+describe("RPC startup projection gate", () => {
+	it("lets negotiated protocol state win without waiting on scheduler turns", () => {
+		const written: object[] = [];
+		let expireGrace: (() => void) | undefined;
+		let graceCancelled = false;
+		const gate = new RpcStartupProjectionGate<object>(
+			event => written.push(event),
+			(flush, delayMs) => {
+				expect(delayMs).toBe(500);
+				expireGrace = flush;
+				return () => {
+					graceCancelled = true;
+				};
+			},
+		);
+
+		expect(gate.capture({ revision: 1 })).toBe(true);
+		expect(gate.capture({ revision: 2 })).toBe(true);
+		gate.startGrace();
+
+		// The negotiate response switches the encoder immediately, then flushes.
+		gate.flush();
+		expect(graceCancelled).toBe(true);
+		expect(written).toEqual([{ revision: 2 }]);
+		expect(gate.capture({ revision: 3 })).toBe(false);
+
+		// Even a stale timer callback cannot replay the coalesced snapshot.
+		expireGrace?.();
+		expect(written).toEqual([{ revision: 2 }]);
+	});
+
+	it("eventually releases a passive v1 host from test-owned grace", () => {
+		const written: object[] = [];
+		let expireGrace: (() => void) | undefined;
+		const gate = new RpcStartupProjectionGate<object>(
+			event => written.push(event),
+			flush => {
+				expireGrace = flush;
+				return () => {};
+			},
+		);
+
+		gate.capture({ type: "todo_projection_changed" });
+		gate.startGrace();
+		expect(written).toEqual([]);
+
+		expireGrace?.();
+		expect(written).toEqual([{ type: "todo_projection_changed" }]);
 	});
 });

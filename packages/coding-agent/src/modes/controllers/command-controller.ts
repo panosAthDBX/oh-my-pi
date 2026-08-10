@@ -614,7 +614,7 @@ export class CommandController {
 		const argumentText = text.slice(7).trim();
 		const action = argumentText.split(/\s+/, 1)[0]?.toLowerCase() || "view";
 		const agentDir = this.ctx.settings.getAgentDir();
-		const backend = await resolveMemoryBackend(this.ctx.settings);
+		const backend = this.ctx.session?.getMemoryBackend?.() ?? (await resolveMemoryBackend(this.ctx.settings));
 
 		if (action === "view") {
 			const payload = await backend.buildDeveloperInstructions(agentDir, this.ctx.settings, this.ctx.session);

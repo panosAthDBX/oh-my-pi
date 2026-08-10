@@ -6,6 +6,65 @@ import type { RpcChunkFrame } from "./rpc-types";
 export const MAX_RPC_FRAME_BYTES = 1024 * 1024;
 /** Maximum UTF-8 size of one logical frame reassembled by protocol v2. */
 export const MAX_RPC_REASSEMBLED_BYTES = 64 * 1024 * 1024;
+/** Outer deadline for the bundled client's ready and protocol-negotiation startup sequence. */
+export const RPC_CLIENT_START_TIMEOUT_MS = 30_000;
+/**
+ * Bounded server grace for a host to react to `ready` before startup events use
+ * the v1 encoder. RpcClient writes negotiation in the ready continuation; 500ms
+ * leaves cross-process scheduling headroom while remaining far below its 30s
+ * startup deadline.
+ */
+export const RPC_PROTOCOL_NEGOTIATION_GRACE_MS = 500;
+
+export type RpcProtocolGraceScheduler = (flush: () => void, delayMs: number) => () => void;
+
+const scheduleProtocolGrace: RpcProtocolGraceScheduler = (flush, delayMs) => {
+	const timer = setTimeout(flush, delayMs);
+	timer.unref();
+	return () => clearTimeout(timer);
+};
+
+/**
+ * Coordinates startup projection delivery while the host chooses an RPC
+ * protocol. The gate owns the grace deadline, coalesces startup snapshots, and
+ * makes negotiation/ordinary-command transitions explicit so tests can drive
+ * protocol state without racing the wall clock.
+ */
+export class RpcStartupProjectionGate<T extends object> {
+	readonly #write: (event: T) => void;
+	readonly #scheduleGrace: RpcProtocolGraceScheduler;
+	#deferred?: T;
+	#deferring = true;
+	#cancelGrace?: () => void;
+
+	constructor(write: (event: T) => void, scheduleGrace: RpcProtocolGraceScheduler = scheduleProtocolGrace) {
+		this.#write = write;
+		this.#scheduleGrace = scheduleGrace;
+	}
+
+	capture(event: T): boolean {
+		if (!this.#deferring) return false;
+		this.#deferred = event;
+		return true;
+	}
+
+	startGrace(delayMs = RPC_PROTOCOL_NEGOTIATION_GRACE_MS): void {
+		if (!this.#deferring || this.#cancelGrace) return;
+		this.#cancelGrace = this.#scheduleGrace(() => {
+			this.#cancelGrace = undefined;
+			this.flush();
+		}, delayMs);
+	}
+
+	flush(): void {
+		this.#cancelGrace?.();
+		this.#cancelGrace = undefined;
+		this.#deferring = false;
+		const deferred = this.#deferred;
+		this.#deferred = undefined;
+		if (deferred) this.#write(deferred);
+	}
+}
 
 const RPC_CHUNK_PAYLOAD_BYTES = 256 * 1024;
 
@@ -246,7 +305,9 @@ function encodeRpcFrameFromJson(
 	streamedMessages?: readonly unknown[],
 ): string {
 	if (serializedFrameBytes(json) <= MAX_RPC_FRAME_BYTES) return `${json}\n`;
-	if (isRecord(frame) && frame.type === "response") {
+	if (isRecord(frame) && (frame.type === "response" || frame.type === "todo_projection_changed")) {
+		// Projection arrays are schema-bearing snapshots. Generic v1 shrinking
+		// would append string elision markers to them and create an invalid event.
 		return `${JSON.stringify(overflowFrame(frame))}\n`;
 	}
 

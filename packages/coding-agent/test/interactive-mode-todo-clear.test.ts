@@ -3,8 +3,15 @@ import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import {
+	type ExtensionFactory,
+	ExtensionRunner,
+	loadExtensionFromFactory,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -14,6 +21,8 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { NativeScrollbackLiveRegion } from "@oh-my-pi/pi-tui";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
+const FOCUSED_AGENT_ID = "TodoProjectionFocusedWorker";
+
 function renderTodos(mode: InteractiveMode): string {
 	return Bun.stripANSI(mode.todoContainer.render(120).join("\n"));
 }
@@ -21,6 +30,8 @@ function renderTodos(mode: InteractiveMode): string {
 describe("InteractiveMode todo HUD persistence", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
+	let focusedSession: AgentSession | undefined;
 	let session: AgentSession;
 	let mode: InteractiveMode;
 	let eventBus: EventBus;
@@ -32,10 +43,13 @@ describe("InteractiveMode todo HUD persistence", () => {
 	beforeEach(async () => {
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-todo-clear-");
+		focusedSession = undefined;
 	});
 
 	afterEach(async () => {
 		mode?.stop();
+		AgentRegistry.global().unregister(FOCUSED_AGENT_ID);
+		await focusedSession?.dispose();
 		await session?.dispose();
 		authStorage?.close();
 		tempDir?.removeSync();
@@ -44,18 +58,31 @@ describe("InteractiveMode todo HUD persistence", () => {
 		resetSettingsForTest();
 	});
 
-	async function createMode(todoClearDelay: number): Promise<void> {
+	async function createMode(todoClearDelay: number, extensionFactory?: ExtensionFactory): Promise<void> {
 		await Settings.init({
 			inMemory: true,
 			cwd: tempDir.path(),
 			overrides: { "tasks.todoClearDelay": todoClearDelay },
 		});
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		const modelRegistry = new ModelRegistry(authStorage);
+		modelRegistry = new ModelRegistry(authStorage);
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
 
 		eventBus = new EventBus();
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		let extensionRunner: ExtensionRunner | undefined;
+		if (extensionFactory) {
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				extensionFactory,
+				tempDir.path(),
+				eventBus,
+				runtime,
+				"startup-projection",
+			);
+			extensionRunner = new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, modelRegistry);
+		}
 		session = new AgentSession({
 			agent: new Agent({
 				initialState: {
@@ -65,12 +92,33 @@ describe("InteractiveMode todo HUD persistence", () => {
 					messages: [],
 				},
 			}),
-			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			sessionManager,
 			settings: Settings.isolated({ "tasks.todoClearDelay": todoClearDelay }),
 			modelRegistry,
+			extensionRunner,
 		});
 		mode = new InteractiveMode(session, "test", undefined, undefined, undefined, undefined, eventBus);
 	}
+
+	it("renders a projection published by a session_start handler on initial startup", async () => {
+		await createMode(-1, pi => {
+			pi.on("session_start", () => {
+				pi.setTodoProjection("startup-projection", [
+					{
+						id: "startup-phase",
+						name: "Startup phase",
+						tasks: [{ id: "startup-task", content: "Startup task", status: "in_progress" }],
+					},
+				]);
+			});
+		});
+		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
+
+		await mode.init();
+
+		expect(renderTodos(mode)).toContain("startup-projection");
+		expect(renderTodos(mode)).toContain("Startup task");
+	});
 
 	it("clears closed todos from the panel instantly without mutating session history", async () => {
 		await createMode(0);
@@ -165,6 +213,130 @@ describe("InteractiveMode todo HUD persistence", () => {
 
 		mode.setTodos([]);
 		expect(liveRegion.getNativeScrollbackLiveRegionStart?.()).toBeUndefined();
+	});
+
+	it("renders projection changes from the session focused through Agent Hub", async () => {
+		await createMode(-1);
+		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
+		session.setTodoPhases([
+			{ name: "Main native phase", tasks: [{ content: "Main native task", status: "in_progress" }] },
+		]);
+		await mode.init();
+		session.setTodoProjection("main-projection", [
+			{
+				id: "main-phase",
+				name: "Main phase",
+				tasks: [{ id: "main-task", content: "Main task", status: "in_progress" }],
+			},
+		]);
+		mode.refreshTodoProjections();
+		expect(renderTodos(mode)).toContain("main-projection");
+		expect(renderTodos(mode)).toContain("Main native task");
+
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		focusedSession = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Focused test"],
+					tools: [],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: Settings.isolated({ "tasks.todoClearDelay": -1 }),
+			modelRegistry,
+		});
+		focusedSession.setTodoPhases([
+			{ name: "Focused native phase", tasks: [{ content: "Focused native task", status: "in_progress" }] },
+		]);
+		AgentRegistry.global().register({
+			id: FOCUSED_AGENT_ID,
+			displayName: FOCUSED_AGENT_ID,
+			kind: "sub",
+			parentId: "Main",
+			session: focusedSession,
+			sessionFile: null,
+			status: "running",
+		});
+
+		focusedSession.setTodoProjection("focused-projection", [
+			{
+				id: "focused-phase",
+				name: "Focused phase",
+				tasks: [{ id: "focused-task", content: "Focused task", status: "in_progress" }],
+			},
+		]);
+		await mode.focusAgentSession(FOCUSED_AGENT_ID);
+
+		expect(renderTodos(mode)).toContain("focused-projection");
+		expect(renderTodos(mode)).toContain("Focused task");
+		expect(renderTodos(mode)).not.toContain("main-projection");
+		expect(renderTodos(mode)).toContain("Focused native task");
+		expect(renderTodos(mode)).not.toContain("Main native task");
+
+		await mode.unfocusSession();
+		expect(renderTodos(mode)).toContain("main-projection");
+		expect(renderTodos(mode)).not.toContain("focused-projection");
+		expect(renderTodos(mode)).toContain("Main native task");
+		expect(renderTodos(mode)).not.toContain("Focused native task");
+	});
+
+	it("never persists focused-session todos into the main session during reconciliation", async () => {
+		await createMode(-1);
+		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
+		session.setTodoPhases([{ name: "Main", tasks: [{ content: "Keep main untouched", status: "pending" }] }]);
+		await mode.init();
+
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		focusedSession = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Focused reconciliation test"],
+					tools: [],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: Settings.isolated({ "tasks.todoClearDelay": -1 }),
+			modelRegistry,
+		});
+		focusedSession.setTodoPhases([
+			{ name: "Focused", tasks: [{ content: "Finish worker task", status: "in_progress" }] },
+		]);
+		AgentRegistry.global().register({
+			id: FOCUSED_AGENT_ID,
+			displayName: FOCUSED_AGENT_ID,
+			kind: "sub",
+			parentId: "Main",
+			session: focusedSession,
+			sessionFile: null,
+			status: "running",
+		});
+		await mode.focusAgentSession(FOCUSED_AGENT_ID);
+
+		vi.useFakeTimers();
+		eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+			id: "FinishedWorker",
+			index: 1,
+			agent: "task",
+			description: "Finish worker task",
+			status: "completed",
+			detached: true,
+		});
+		vi.advanceTimersByTime(100);
+
+		expect(session.getTodoPhases()).toEqual([
+			{ name: "Main", tasks: [{ content: "Keep main untouched", status: "pending" }] },
+		]);
+		expect(focusedSession.getTodoPhases()).toEqual([
+			{ name: "Focused", tasks: [{ content: "Finish worker task", status: "in_progress" }] },
+		]);
+		expect(renderTodos(mode)).toContain("Finish worker task");
+		expect(renderTodos(mode)).not.toContain("Keep main untouched");
 	});
 
 	it("marks todos complete when subagent reconciliation reports a finished agent", async () => {

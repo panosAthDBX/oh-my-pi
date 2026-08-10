@@ -41,6 +41,7 @@ function yieldEmittingSession(
 		servingModel: serving(modelSwitch?.from),
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
+		getTodoProjections: () => [],
 		getActiveToolNames: () => activeTools,
 		getEnabledToolNames: () => activeTools,
 		getAllToolNames: () => activeTools,

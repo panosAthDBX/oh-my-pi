@@ -71,6 +71,7 @@ function createMockSession(
 		model: { api: "anthropic-messages" } as never,
 		extensionRunner: undefined as never,
 		sessionManager: { appendSessionInit: () => {} } as never,
+		getTodoProjections: () => [],
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async () => {},

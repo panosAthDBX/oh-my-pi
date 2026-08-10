@@ -283,6 +283,10 @@
 - Fixed Claude scoped weekly limits (e.g. `Claude 7 Day (Fable)`) with `is_active: false` being dropped by the `/usage` parser, rendering as `not reported` in `omp usage` despite carrying real utilization. Live payloads mark only the currently binding limit active — an account pinned at a 100% Fable cap reports its 77% shared weekly row as inactive too — so `is_active` signals severity ranking, not bucket existence, and is now ignored. Exhaustion gating is unchanged: tier rows still hard-block only at confirmed 100% with a future reset.
 - Fixed a TDZ crash (`Cannot access 'claudeCodeVersion' before initialization`) when `providers/anthropic` was the first module loaded: `providers/anthropic` → `stream` → `registry` → `registry/oauth/anthropic` circled back into the still-initializing provider module. The Claude Code fingerprint constants now live in the leaf module `providers/claude-code-fingerprint` (star re-exported from `providers/anthropic`, so import paths are unchanged).
 
+### Fixed
+
+- Fixed parallel package initialization crashing on an Anthropic provider/OAuth import cycle by moving shared Claude fingerprint constants into a dependency-free module.
+
 ## [17.1.3] - 2026-07-24
 
 ### Fixed

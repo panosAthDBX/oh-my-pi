@@ -182,6 +182,7 @@ export class ExtensionUiController {
 			getCommands: () => getSessionSlashCommands(this.ctx.session),
 			getSessionName: () => this.ctx.sessionManager.getSessionName(),
 			setSessionName: name => this.#updateSessionName(name),
+			setTodoProjection: (namespace, phases) => this.ctx.session.setTodoProjection(namespace, phases),
 		};
 		const contextActions: ExtensionContextActions = {
 			getModel: () => this.ctx.session.model,
@@ -415,6 +416,7 @@ export class ExtensionUiController {
 			getCommands: () => getSessionSlashCommands(this.ctx.session),
 			getSessionName: () => this.ctx.sessionManager.getSessionName(),
 			setSessionName: name => this.#updateSessionName(name),
+			setTodoProjection: (namespace, phases) => this.ctx.session.setTodoProjection(namespace, phases),
 		};
 		const contextActions: ExtensionContextActions = {
 			getModel: () => this.ctx.session.model,

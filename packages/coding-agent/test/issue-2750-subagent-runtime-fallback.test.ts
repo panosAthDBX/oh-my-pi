@@ -45,6 +45,7 @@ function createYieldingSession(fallback: "served" | "unproven" = "served"): Agen
 		servingModel: { selector: "primary/bad-runtime-model", isFallback: false } as ServingModel | undefined,
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
+		getTodoProjections: () => [],
 		getActiveToolNames: () => ["yield"],
 		getEnabledToolNames: () => ["yield"],
 		setActiveToolsByName: async () => {},

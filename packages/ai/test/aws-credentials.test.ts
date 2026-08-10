@@ -211,13 +211,33 @@ describe("resolveAwsCredentials", () => {
 		await expect(resolveAwsCredentials({ profile: "failing" })).rejects.toThrow(/exited 7.*auth helper broke/);
 	});
 
-	test("aborts a long-running helper when the caller's signal fires", async () => {
-		const script = await writeFixture("hang.js", `setTimeout(()=>{},60_000);`);
-		await writeConfig("hangs", `credential_process = ${quoteForConfig(process.execPath)} ${quoteForConfig(script)}`);
+	test("keeps shared resolution owned after its caller aborts", async () => {
+		await writeConfig("other", "");
+		Bun.env.AWS_EC2_METADATA_DISABLED = "false";
+		const tokenGate = Promise.withResolvers<Response>();
+		let requestCount = 0;
+		const fetchImpl = async (..._args: Parameters<typeof fetch>): Promise<Response> => {
+			requestCount += 1;
+			if (requestCount === 1) return tokenGate.promise;
+			if (requestCount === 2) return new Response("test-role");
+			return Response.json({
+				AccessKeyId: "AKIADELAYED",
+				SecretAccessKey: "secret",
+				Token: "token",
+				Expiration: "2099-01-01T00:00:00Z",
+			});
+		};
+
 		const ctrl = new AbortController();
-		const promise = resolveAwsCredentials({ profile: "hangs", signal: ctrl.signal });
-		setTimeout(() => ctrl.abort(new Error("test abort")), 50);
-		await expect(promise).rejects.toBeDefined();
+		const aborted = resolveAwsCredentials({ profile: "missing", signal: ctrl.signal, fetch: fetchImpl });
+		ctrl.abort(new Error("test abort"));
+		await expect(aborted).rejects.toBeDefined();
+
+		const completed = resolveAwsCredentials({ profile: "missing", fetch: fetchImpl });
+		tokenGate.resolve(new Response("imds-token"));
+		const creds = await completed;
+		expect(creds.accessKeyId).toBe("AKIADELAYED");
+		expect(requestCount).toBe(3);
 	});
 
 	test("resolves ECS container credentials with the authorization token", async () => {

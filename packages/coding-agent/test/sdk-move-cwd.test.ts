@@ -1,10 +1,12 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import * as memoryBackend from "@oh-my-pi/pi-coding-agent/memory-backend";
+import type { MemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/types";
+import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
@@ -67,6 +69,65 @@ describe("createAgentSession cwd after /move", () => {
 			expect(textContent(result)).toContain(cwdB);
 		} finally {
 			await session.dispose();
+		}
+	});
+
+	it("builds extension memory runtime context from the current session cwd", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-memory-move-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "cwd-a");
+		const cwdB = path.join(tempDir, "cwd-b");
+		fs.mkdirSync(cwdA, { recursive: true });
+		fs.mkdirSync(cwdB, { recursive: true });
+		const observedScopes: string[] = [];
+		const extension: ExtensionFactory = pi => {
+			pi.on("agent_start", async (_event, context) => {
+				const status = await context.memory?.status();
+				if (status?.scope) observedScopes.push(status.scope);
+			});
+		};
+		const backend: MemoryBackend = {
+			id: "supermemory",
+			async start() {},
+			async buildDeveloperInstructions() {
+				return undefined;
+			},
+			async clear() {},
+			async enqueue() {},
+			async status(context) {
+				return { backend: "supermemory", active: true, writable: true, searchable: true, scope: context.cwd };
+			},
+		};
+		const resolveBackend = vi.spyOn(memoryBackend, "resolveMemoryBackend").mockResolvedValue(backend);
+		const sessionManager = SessionManager.create(cwdA, path.join(tempDir, "sessions"));
+		try {
+			const { session } = await createAgentSession({
+				cwd: cwdA,
+				agentDir: tempDir,
+				sessionManager,
+				settings: Settings.isolated({ "memory.backend": "supermemory" }),
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				extensions: [extension],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				skipPythonPreflight: true,
+			});
+			try {
+				await session.extensionRunner?.emit({ type: "agent_start" });
+				await sessionManager.moveTo(cwdB);
+				await session.extensionRunner?.emit({ type: "agent_start" });
+
+				expect(observedScopes).toEqual([cwdA, cwdB]);
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			resolveBackend.mockRestore();
 		}
 	});
 });
