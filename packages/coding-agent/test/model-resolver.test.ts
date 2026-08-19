@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { DEFAULT_MODEL_PER_PROVIDER } from "@oh-my-pi/pi-catalog/provider-models";
 import {
 	expandRoleAlias,
@@ -9,8 +10,9 @@ import {
 	parseModelPattern,
 	parseModelString,
 	pickDefaultAvailableModel,
+	resolveAgentAdvisorSelection,
 	resolveAgentModelPatterns,
-	resolveAgentModelSource,
+	resolveAgentModelSelection,
 	resolveAgentPrewalkPattern,
 	resolveAllowedModels,
 	resolveCliModel,
@@ -436,6 +438,17 @@ describe("pickDefaultAvailableModel", () => {
 		expect(result?.provider).toBe("zhipu-coding-plan");
 		expect(result?.id).toBe("glm-5.1");
 	});
+
+	test("prefers SuperGrok over paid xAI when both defaults are present", () => {
+		const paid = getBundledModel("xai", DEFAULT_MODEL_PER_PROVIDER.xai);
+		const oauth = getBundledModel("xai-oauth", DEFAULT_MODEL_PER_PROVIDER["xai-oauth"]);
+		if (!paid || !oauth) {
+			throw new Error("Expected bundled xAI provider defaults");
+		}
+
+		expect(pickDefaultAvailableModel([paid, oauth])?.provider).toBe("xai-oauth");
+		expect(pickDefaultAvailableModel([paid])?.provider).toBe("xai");
+	});
 });
 
 describe("parseModelPattern", () => {
@@ -664,6 +677,76 @@ describe("parseModelPattern", () => {
 		});
 	});
 
+	describe("provider-qualified selectors vs aggregator raw-id shadowing", () => {
+		const anthropicOpus5 = createOpusModel("anthropic", "claude-opus-5", "Claude Opus 5");
+		const openRouterOpus5 = buildModel({
+			id: "anthropic/claude-opus-5",
+			name: "Claude Opus 5 (OpenRouter)",
+			api: "anthropic-messages",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			reasoning: true,
+			thinking: {
+				mode: "budget",
+				efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+			},
+			input: ["text", "image"],
+			cost: { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+			contextWindow: 200000,
+			maxTokens: 32000,
+		});
+
+		test("anthropic/claude-opus-5 does not shadow onto the OpenRouter flat id when anthropic is unavailable", () => {
+			// Anthropic carries claude-opus-5 in the bundled catalog but is absent from
+			// the candidate set (disabled provider, missing creds at boot): the selector
+			// is provider-qualified and must fail rather than re-bind to OpenRouter.
+			const result = parseModelPattern("anthropic/claude-opus-5", [openRouterOpus5]);
+			expect(result.model).toBeUndefined();
+		});
+
+		test("the provider lock is case-insensitive (Anthropic/Claude-Opus-5 still fails closed)", () => {
+			// The matcher compares ids case-insensitively, so the lock must too —
+			// otherwise case variance silently re-enables the aggregator shadow.
+			const result = parseModelPattern("Anthropic/Claude-Opus-5", [openRouterOpus5]);
+			expect(result.model).toBeUndefined();
+		});
+
+		test("anthropic/claude-opus-5 resolves to the anthropic provider when it is available", () => {
+			const result = parseModelPattern("anthropic/claude-opus-5", [anthropicOpus5, openRouterOpus5]);
+			expect(result.model?.provider).toBe("anthropic");
+			expect(result.model?.id).toBe("claude-opus-5");
+		});
+
+		test("explicit openrouter/anthropic/claude-opus-5 still selects the OpenRouter model", () => {
+			const result = parseModelPattern("openrouter/anthropic/claude-opus-5", [openRouterOpus5]);
+			expect(result.model?.provider).toBe("openrouter");
+			expect(result.model?.id).toBe("anthropic/claude-opus-5");
+		});
+
+		test("resolveModelFromString keeps the provider lock when anthropic is absent", () => {
+			const result = resolveModelFromString("anthropic/claude-opus-5", [openRouterOpus5]);
+			expect(result).toBeUndefined();
+		});
+
+		test("resolveCliModel keeps the provider lock when anthropic is absent", () => {
+			const result = resolveCliModel({
+				cliModel: "anthropic/claude-opus-5",
+				modelRegistry: {
+					getAll: () => [openRouterOpus5],
+					getAvailable: () => [],
+				},
+			});
+			expect(result.model).toBeUndefined();
+			expect(result.error).toBeTruthy();
+		});
+
+		test("openai/gpt-4o:extended still resolves to the OpenRouter raw id (openai carries no such id)", () => {
+			const result = parseModelPattern("openai/gpt-4o:extended", allModels);
+			expect(result.model?.provider).toBe("openrouter");
+			expect(result.model?.id).toBe("openai/gpt-4o:extended");
+		});
+	});
+
 	describe("edge cases", () => {
 		test("empty pattern matches via partial matching", () => {
 			// Empty string is included in all model IDs, so partial matching finds a match
@@ -845,8 +928,37 @@ describe("resolveAgentPrewalkPattern", () => {
 		expect(resolveAgentPrewalkPattern({ settingsOverride: "", agentPrewalk: false })).toBeUndefined();
 	});
 });
+describe("resolveAgentAdvisorSelection", () => {
+	test("agent definition alone decides: true → advisor role, pattern → custom model, false/absent → off", () => {
+		expect(resolveAgentAdvisorSelection({ agentAdvisor: true })).toEqual({});
+		expect(resolveAgentAdvisorSelection({ agentAdvisor: "moonshot/k3" })).toEqual({ model: "moonshot/k3" });
+		expect(resolveAgentAdvisorSelection({ agentAdvisor: false })).toBeUndefined();
+		expect(resolveAgentAdvisorSelection({})).toBeUndefined();
+	});
+
+	test("settings override wins over the agent definition", () => {
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "off", agentAdvisor: true })).toBeUndefined();
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "off", agentAdvisor: "moonshot/k3" })).toBeUndefined();
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "on", agentAdvisor: false })).toEqual({});
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "openai/gpt-4o", agentAdvisor: false })).toEqual({
+			model: "openai/gpt-4o",
+		});
+	});
+
+	test("override 'on' keeps the agent's custom advisor model when one is defined", () => {
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "on", agentAdvisor: "moonshot/k3" })).toEqual({
+			model: "moonshot/k3",
+		});
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "on" })).toEqual({});
+	});
+
+	test("blank override falls through to the agent definition", () => {
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "  ", agentAdvisor: true })).toEqual({});
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "", agentAdvisor: false })).toBeUndefined();
+	});
+});
 describe("resolveAgentModelPatterns", () => {
-	test("selects the first non-empty source and skips aliases with no patterns", () => {
+	test("pairs the first non-empty source's role with its patterns, skipping aliases with no patterns", () => {
 		const settings = Settings.isolated({
 			modelRoles: {
 				empty: "",
@@ -855,32 +967,34 @@ describe("resolveAgentModelPatterns", () => {
 			},
 		});
 
-		const emptyRequest = {
-			requestModel: "",
-			settingsOverride: "@override",
-			agentModel: ["@definition"],
-			settings,
-		};
-		expect(resolveAgentModelPatterns(emptyRequest)).toEqual(["openai/gpt-4o"]);
-		expect(resolveAgentModelSource(emptyRequest)).toBe("@override");
+		expect(
+			resolveAgentModelSelection({
+				requestModel: "",
+				settingsOverride: "@override",
+				agentModel: ["@definition"],
+				settings,
+			}),
+		).toEqual({ patterns: ["openai/gpt-4o"], role: "override" });
 
-		const emptyAlias = {
-			requestModel: "@empty",
-			settingsOverride: ",,",
-			agentModel: ["@definition"],
-			settings,
-		};
-		expect(resolveAgentModelPatterns(emptyAlias)).toEqual(["anthropic/claude-sonnet-4-5"]);
-		expect(resolveAgentModelSource(emptyAlias)).toEqual(["@definition"]);
+		expect(
+			resolveAgentModelSelection({
+				requestModel: "@empty",
+				settingsOverride: ",,",
+				agentModel: ["@definition"],
+				settings,
+			}),
+		).toEqual({ patterns: ["anthropic/claude-sonnet-4-5"], role: "definition" });
 
-		const concreteRequest = {
-			requestModel: "openai/gpt-4o",
-			settingsOverride: "@override",
-			agentModel: ["@definition"],
-			settings,
-		};
-		expect(resolveAgentModelSource(concreteRequest)).toBe("openai/gpt-4o");
-		expect(resolveExplicitModelRole(resolveAgentModelSource(concreteRequest), settings)).toBeUndefined();
+		// An explicit selector carries no role identity, so the child must not
+		// capture the routing of a role that happens to name the same model.
+		expect(
+			resolveAgentModelSelection({
+				requestModel: "openai/gpt-4o",
+				settingsOverride: "@override",
+				agentModel: ["@definition"],
+				settings,
+			}),
+		).toEqual({ patterns: ["openai/gpt-4o"], role: undefined });
 	});
 
 	test("falls back to the active session model when @task is unset", () => {

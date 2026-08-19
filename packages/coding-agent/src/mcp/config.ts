@@ -54,6 +54,7 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 		};
 		if (server.args) config.args = server.args;
 		if (server.env) config.env = server.env;
+		if (server.envPolicy) config.envPolicy = server.envPolicy;
 		if (server.cwd) config.cwd = server.cwd;
 		return config;
 	}
@@ -65,6 +66,7 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 			url: server.url ?? "",
 		};
 		if (server.headers) config.headers = server.headers;
+		if (server.headerPolicy) config.headerPolicy = server.headerPolicy;
 		return config;
 	}
 
@@ -75,6 +77,7 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 			url: server.url ?? "",
 		};
 		if (server.headers) config.headers = server.headers;
+		if (server.headerPolicy) config.headerPolicy = server.headerPolicy;
 		return config;
 	}
 
@@ -221,6 +224,43 @@ export function extractExaApiKey(config: MCPServerConfig): string | undefined {
 	return undefined;
 }
 
+/** Exa MCP tools already covered by the native Exa integration. */
+const NATIVE_EXA_MCP_TOOLS: Record<string, true> = { web_search_exa: true };
+
+/**
+ * Parse the comma-separated `tools` restriction from an Exa MCP config.
+ * Returns `null` when the config does not restrict its tool set.
+ */
+function getRequestedExaMcpTools(config: MCPServerConfig): string[] | null {
+	const raw = (() => {
+		if (config.type === "http" || config.type === "sse") {
+			const httpConfig = config as { url?: string };
+			if (!httpConfig.url) return undefined;
+			try {
+				return new URL(httpConfig.url).searchParams.get("tools") ?? undefined;
+			} catch {
+				return undefined;
+			}
+		}
+		if (!config.type || config.type === "stdio") {
+			const stdioConfig = config as { args?: string[] };
+			const args = stdioConfig.args ?? [];
+			for (let i = 0; i < args.length; i++) {
+				if (/^--?tools$/i.test(args[i])) return args[i + 1];
+				const match = args[i].match(/(?:^|[\s?&])tools=([^&\s]+)/i) ?? args[i].match(/--?tools[=\s]([^\s]+)/i);
+				if (match) return match[1];
+			}
+		}
+		return undefined;
+	})();
+	if (!raw) return null;
+	const tools = raw
+		.split(",")
+		.map(tool => tool.trim())
+		.filter(tool => tool.length > 0);
+	return tools.length > 0 ? tools : null;
+}
+
 /** Result of filtering Exa MCP servers */
 export interface ExaFilterResult {
 	/** Configs with Exa servers removed */
@@ -233,7 +273,9 @@ export interface ExaFilterResult {
 
 /**
  * Filter out Exa MCP servers and extract their API keys.
- * Since we have native Exa integration, we don't need the MCP server.
+ * Since we have native Exa integration, we don't need the MCP server —
+ * unless the config explicitly requests Exa tools the native integration
+ * does not provide (e.g. `web_fetch_exa`, `web_search_advanced_exa`).
  */
 export function filterExaMCPServers(
 	configs: Record<string, MCPServerConfig>,
@@ -245,16 +287,21 @@ export function filterExaMCPServers(
 
 	for (const [name, config] of Object.entries(configs)) {
 		if (isExaMCPServer(name, config)) {
-			// Extract API key before filtering
+			// Extract API key for the native Exa integration even when the MCP
+			// server is kept below for its extra tools.
 			const apiKey = extractExaApiKey(config);
 			if (apiKey) {
 				exaApiKeys.push(apiKey);
 			}
-		} else {
-			filtered[name] = config;
-			if (sources[name]) {
-				filteredSources[name] = sources[name];
+			const requested = getRequestedExaMcpTools(config);
+			const hasExtraTools = requested?.some(tool => !NATIVE_EXA_MCP_TOOLS[tool.toLowerCase()]) ?? false;
+			if (!hasExtraTools) {
+				continue;
 			}
+		}
+		filtered[name] = config;
+		if (sources[name]) {
+			filteredSources[name] = sources[name];
 		}
 	}
 

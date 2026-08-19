@@ -4,7 +4,7 @@
  * Converts MCP tool definitions to CustomTool format for the agent.
  */
 import type { AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import type { TSchema } from "@oh-my-pi/pi-ai";
+import type { ImageContent, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import { normalizeSchemaForMCP } from "@oh-my-pi/pi-ai/utils/schema";
 import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
@@ -191,30 +191,40 @@ export interface MCPToolDetails {
 	meta?: OutputMeta;
 }
 /**
- * Format MCP content for LLM consumption.
+ * Convert MCP content to agent content while retaining image payloads.
  */
-function formatMCPContent(content: MCPContent[]): string {
-	const parts: string[] = [];
+function formatMCPContent(content: MCPContent[]): Array<TextContent | ImageContent> {
+	const blocks: Array<TextContent | ImageContent> = [];
+	let text = "";
+	const flushText = () => {
+		if (!text) return;
+		blocks.push({ type: "text", text });
+		text = "";
+	};
+	const appendText = (value: string) => {
+		text += text ? `\n\n${value}` : value;
+	};
 
 	for (const item of content) {
 		switch (item.type) {
 			case "text":
-				parts.push(item.text);
+				appendText(item.text);
 				break;
 			case "image":
-				parts.push(`[Image: ${item.mimeType}]`);
+				flushText();
+				blocks.push(item);
 				break;
 			case "resource":
-				if (item.resource.text) {
-					parts.push(`[Resource: ${item.resource.uri}]\n${item.resource.text}`);
-				} else {
-					parts.push(`[Resource: ${item.resource.uri}]`);
-				}
+				appendText(
+					item.resource.text
+						? `[Resource: ${item.resource.uri}]\n${item.resource.text}`
+						: `[Resource: ${item.resource.uri}]`,
+				);
 				break;
 		}
 	}
-
-	return parts.join("\n\n");
+	flushText();
+	return blocks.length > 0 ? blocks : [{ type: "text", text: "" }];
 }
 
 /** Build a CustomToolResult from a callTool response. */
@@ -225,7 +235,7 @@ function buildResult(
 	provider?: string,
 	providerName?: string,
 ): CustomToolResult<MCPToolDetails> {
-	const text = formatMCPContent(result.content);
+	const content = formatMCPContent(result.content);
 	const details: MCPToolDetails = {
 		serverName,
 		mcpToolName,
@@ -235,8 +245,14 @@ function buildResult(
 		provider,
 		providerName,
 	};
-	const contentText = result.isError ? `Error: ${text}` : text;
-	const toolResult: CustomToolResult<MCPToolDetails> = { content: [{ type: "text", text: contentText }], details };
+	if (result.isError) {
+		if (content[0]?.type === "text") {
+			content[0] = { type: "text", text: `Error: ${content[0].text}` };
+		} else {
+			content.unshift({ type: "text", text: "Error:" });
+		}
+	}
+	const toolResult: CustomToolResult<MCPToolDetails> = { content, details };
 	if (result.isError) {
 		toolResult.isError = true;
 	}
@@ -357,6 +373,18 @@ export function createMCPToolName(serverName: string, toolName: string): string 
 	return `mcp__${sanitizedServerName}_${normalizedToolName}`;
 }
 
+export interface MCPToolOriginSource {
+	readonly name: string;
+	readonly mcpServerName?: unknown;
+	readonly mcpToolName?: unknown;
+}
+
+/** Stable identity for a tool's original MCP route, before its public name was normalized. */
+export function getMCPToolOriginKey(tool: MCPToolOriginSource): string | undefined {
+	if (typeof tool.mcpServerName !== "string" || typeof tool.mcpToolName !== "string") return undefined;
+	return `${tool.mcpServerName}\u0000${tool.mcpToolName}`;
+}
+
 /**
  * Keeps one MCP tool per minted name and logs collisions between distinct MCP
  * origins. The winner is chosen by a stable origin key (server name + original
@@ -365,19 +393,16 @@ export function createMCPToolName(serverName: string, toolName: string): string 
  * silently flip ownership of the minted name. Non-MCP tools pass through
  * unchanged.
  */
-export function deduplicateMCPToolsByName<T extends { name: string; mcpServerName?: unknown; mcpToolName?: unknown }>(
-	tools: readonly T[],
-): T[] {
+export function deduplicateMCPToolsByName<T extends MCPToolOriginSource>(tools: readonly T[]): T[] {
 	const deduplicated: T[] = [];
 	const registered = new Map<string, { tool: T; originKey: string; index: number }>();
 
 	for (const tool of tools) {
-		if (typeof tool.mcpServerName !== "string" || typeof tool.mcpToolName !== "string") {
+		const originKey = getMCPToolOriginKey(tool);
+		if (originKey === undefined) {
 			deduplicated.push(tool);
 			continue;
 		}
-
-		const originKey = `${tool.mcpServerName}\u0000${tool.mcpToolName}`;
 		const existing = registered.get(tool.name);
 		if (!existing) {
 			registered.set(tool.name, { tool, originKey, index: deduplicated.length });

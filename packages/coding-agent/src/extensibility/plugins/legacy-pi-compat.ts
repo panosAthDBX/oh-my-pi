@@ -423,6 +423,25 @@ function isGlobalRequireCall(node: StructuralAstNode | null, scope: BindingScope
 	);
 }
 
+/**
+ * Whether `node` is a `createRequire(...)` factory call imported from
+ * `node:module` (or its `module` alias).
+ */
+function isCreateRequireInvocation(
+	node: StructuralAstNode | null,
+	createRequireBindings: ReadonlySet<string>,
+	moduleNamespaceBindings: ReadonlySet<string>,
+): boolean {
+	if (node?.type !== "CallExpression") return false;
+	const callee = asAstNode(node.callee);
+	if (callee?.type === "Identifier" && typeof callee.name === "string") {
+		return createRequireBindings.has(callee.name);
+	}
+	if (callee?.type !== "MemberExpression" || staticMemberPropertyName(callee) !== "createRequire") return false;
+	const object = asAstNode(callee.object);
+	return object?.type === "Identifier" && typeof object.name === "string" && moduleNamespaceBindings.has(object.name);
+}
+
 function staticMemberPropertyName(node: StructuralAstNode): string | null {
 	const property = asAstNode(node.property);
 	if (node.computed !== true && property?.type === "Identifier" && typeof property.name === "string") {
@@ -458,6 +477,28 @@ function collectExtensionSpecifierReferences(
 			references.push({ kind, specifier: node.value, start: node.start, end: node.end });
 		}
 	};
+	const createRequireBindings = new Set<string>();
+	const moduleNamespaceBindings = new Set<string>();
+	for (const { node } of collectScopedAstNodes(ast, candidate => candidate.type === "ImportDeclaration")) {
+		const source = asAstNode(node.source);
+		if (source?.type !== "StringLiteral" || (source.value !== "node:module" && source.value !== "module")) continue;
+		for (const value of Array.isArray(node.specifiers) ? node.specifiers : []) {
+			const specifier = asAstNode(value);
+			const local = asAstNode(specifier?.local);
+			if (local?.type !== "Identifier" || typeof local.name !== "string") continue;
+			if (specifier?.type === "ImportNamespaceSpecifier") {
+				moduleNamespaceBindings.add(local.name);
+			} else if (specifier?.type === "ImportSpecifier") {
+				const imported = asAstNode(specifier.imported);
+				if (
+					(imported?.type === "Identifier" && imported.name === "createRequire") ||
+					(imported?.type === "StringLiteral" && imported.value === "createRequire")
+				) {
+					createRequireBindings.add(local.name);
+				}
+			}
+		}
+	}
 	for (const { node, scope } of collectScopedAstNodes(ast, isSpecifierReferenceNode)) {
 		if (
 			node.type === "ImportDeclaration" ||
@@ -478,6 +519,18 @@ function collectExtensionSpecifierReferences(
 				record("import", nodeArgument(node, 0));
 			} else if (isIdentifier(callee, "require") && !scopeHasBinding(scope, REQUIRE_BINDING)) {
 				record("require", nodeArgument(node, 0));
+			} else if (isCreateRequireInvocation(callee, createRequireBindings, moduleNamespaceBindings)) {
+				// `createRequire(base)(spec)` — pin the invoked bare dependency so it
+				// loads without a runtime `node_modules` lookup. Relative specifiers
+				// resolve against `base`, which is not rewritten, so restrict to bare.
+				const argument = nodeArgument(node, 0);
+				if (
+					argument?.type === "StringLiteral" &&
+					typeof argument.value === "string" &&
+					isBareExtensionDependencySpecifier(argument.value)
+				) {
+					record("require", argument);
+				}
 			}
 		}
 	}
@@ -1298,12 +1351,59 @@ async function findNodePackageRootUncached(packageName: string, importerPath: st
 		if (await pathExists(path.join(candidate, "package.json"))) {
 			return candidate;
 		}
+		const workspaceMember = await findWorkspaceMemberPackageRoot(dir, packageName);
+		if (workspaceMember) {
+			return workspaceMember;
+		}
 		const parent = path.dirname(dir);
 		if (parent === dir) {
 			return null;
 		}
 		dir = parent;
 	}
+}
+
+/**
+ * Resolve `packageName` as a workspace member when `dir` is a workspace root.
+ *
+ * An installed git dependency of a monorepo plugin contains the full
+ * workspace tree but no node_modules links: `bun install` materializes a git
+ * dependency's regular npm dependencies into the host tree and skips its
+ * `workspace:*` / `file:` edges. Bare imports between workspace siblings
+ * therefore never resolve through the node_modules walk above. When a
+ * directory on that walk declares `workspaces` (array form or the yarn-style
+ * `{ packages: [...] }` object), scan the member manifests for the requested
+ * package name. node_modules candidates at the same level win, so an
+ * explicitly installed copy still shadows the workspace member.
+ */
+async function findWorkspaceMemberPackageRoot(dir: string, packageName: string): Promise<string | null> {
+	if (!(await pathExists(path.join(dir, "package.json")))) {
+		return null;
+	}
+	const manifest = await readPackageManifest(dir);
+	const rawWorkspaces = manifest?.workspaces;
+	const patterns = Array.isArray(rawWorkspaces)
+		? rawWorkspaces
+		: isRecord(rawWorkspaces) && Array.isArray(rawWorkspaces.packages)
+			? rawWorkspaces.packages
+			: null;
+	if (!patterns) {
+		return null;
+	}
+	for (const pattern of patterns) {
+		if (typeof pattern !== "string" || pattern.startsWith("!")) {
+			continue;
+		}
+		const glob = new Bun.Glob(path.join(pattern, "package.json"));
+		for await (const match of glob.scan({ cwd: dir, onlyFiles: true })) {
+			const memberRoot = path.dirname(path.join(dir, match));
+			const memberManifest = await readPackageManifest(memberRoot);
+			if (memberManifest?.name === packageName) {
+				return memberRoot;
+			}
+		}
+	}
+	return null;
 }
 
 async function readPackageManifest(packageRoot: string): Promise<Record<string, unknown> | null> {

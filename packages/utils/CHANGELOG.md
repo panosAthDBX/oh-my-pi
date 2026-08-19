@@ -2,6 +2,79 @@
 
 ## [Unreleased]
 
+## [17.3.8] - 2026-08-19
+
+### Added
+
+- Exported `BINARY_SNIFF_BYTES`, the header window `isProbablyBinary` sniffs, so a caller holding the whole file in memory can classify the identical prefix through `isProbablyBinaryHeader` instead of reopening the file.
+
+## [17.3.5] - 2026-08-16
+
+### Fixed
+
+- Fixed the Markdown renderer incorrectly breaking into a raw code block when a 4-space-indented line (such as a box-drawing tree child under a └── branch) directly followed paragraph text; it now correctly stays part of the paragraph, matching standard Markdown behavior.
+
+## [17.3.2] - 2026-08-13
+
+### Fixed
+
+- Fixed `fetchWithRetry()` aborts during retry backoff to preserve the documented `"Request was aborted"` error contract ([#8450](https://github.com/can1357/oh-my-pi/issues/8450)).
+
+## [17.3.0] - 2026-08-13
+
+### Fixed
+
+- Optimized performance of partial JSON parsing for long streaming tool-call arguments.
+- Fixed Mermaid ASCII multi-word edge labels where routed lines would show through spaces.
+
+## [17.2.15] - 2026-08-12
+
+### Changed
+
+- Extended parsed Server-Sent Events (SSE) to include optional id and retry fields, enabling reconnecting transports to retain stream cursors and respect server-requested retry intervals.
+
+## [17.2.13] - 2026-08-11
+
+### Changed
+
+- Changed stale process-log retention from the newest five files globally to one newest file per completed process and day within the current and previous four local calendar days. This preserves bounded daily diagnostic coverage while continuing to remove one-use audit files.
+- Changed outbound User-Agent consumers to share the versioned `USER_AGENT` constant (`omp/<version>`).
+
+### Fixed
+
+- Fixed Mermaid ASCII state pseudostates rendering empty boxes, miscoloring final-state borders, and inverting rounded corners in bottom-to-top diagrams.
+
+## [17.2.11] - 2026-08-07
+
+### Added
+
+- Added `repair` and `rawKeys` options to `parseFrontmatter` to support spec-conformant loading (disabling lenient recovery and preserving keys verbatim), and exported `normalizeFrontmatterKeys` for manual key normalization.
+
+### Fixed
+
+- Fixed the in-house `marked` list tokenizer incorrectly consuming trailing blank lines at the end of input, ensuring correct list tightness and token generation matching standard `marked` behavior.
+
+## [17.2.10] - 2026-08-06
+
+### Added
+
+- Introduced zero-dependency in-house modules replacing external packages, importable via `@oh-my-pi/pi-utils/<module>`: `acp` (Agent Client Protocol), `browsers` (Chrome for Testing discovery/install), `chalk` (ANSI styling), `dates` (date formatting), `dom` (HTML parser, WHATWG DOM subset, and CSS selectors), `docx` (DOCX to HTML), `headers` (browser header generation), `lru` (LRU cache), `marked` (GFM markdown lexer/parser), `readability` (article extraction), `template` (Handlebars-compatible templating), `turndown` (HTML to Markdown), `vterm` (headless terminal emulator), and `xml` (XML parser).
+- Added postmortem fatal recovery hint providers to allow applications to print actionable recovery commands before cleanup starts.
+
+### Changed
+
+- Rewrote the logger file backend in-house, maintaining the identical line format, daily rotation, and pruning behavior without external dependencies.
+
+### Fixed
+
+- Fixed PowerShell (`powershell.exe` / `pwsh`) support when used as a custom `shellPath` by correctly passing `-NoLogo -Command` (and `-NoProfile` under `PI_BASH_NO_LOGIN`) instead of POSIX flags.
+- Fixed the in-house `marked` list tokenizer consuming the trailing blank line into the list token when the next top-level line was a plain paragraph. The blank now always becomes a separate `space` token (matching real marked), so a list's token shape no longer depends on what follows it — restoring the TUI streaming lexer's freeze invariant — and a list followed by a paragraph is tight, not loose, per CommonMark.
+- Added the missing Handlebars built-in `lookup` helper to the in-house `template` engine (`{{lookup obj key}}`, proto-safe property access; a user-registered `lookup` helper still takes precedence).
+
+### Removed
+
+- Removed external dependencies on `handlebars`, `winston`, and `winston-daily-rotate-file`.
+
 ## [17.2.9] - 2026-08-05
 
 ### Added

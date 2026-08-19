@@ -207,6 +207,10 @@ export class ModelHubComponent implements Component {
 	#rolesRows: RolesRow[] = [];
 	#roleIndex = 0;
 	#roleHover: number | null = null;
+	/** First roles row drawn in the scroll window; follows the cursor and clamps to the list. */
+	#roleScrollStart = 0;
+	/** Roles rows actually drawn this frame; bounds mouse hit-testing to the visible window. */
+	#rolesVisibleCount = 0;
 
 	#assigning: AssignTarget | null = null;
 	#strip: StripState | null = null;
@@ -837,7 +841,10 @@ export class ModelHubComponent implements Component {
 				chips.push({
 					label,
 					styled: assignedHere
-						? theme.fg(info.color ?? "muted", `${theme.status.enabled}${label}`) +
+						? // Separator required: under the `nerd` preset this glyph is a
+							// two-cell-wide PUA icon that `visibleWidth` counts as one, so
+							// without it the icon overhangs and eats `label`'s first char.
+							theme.fg(info.color ?? "muted", `${theme.status.enabled} ${label}`) +
 							theme.fg("dim", ` ${theme.status.success}`)
 						: theme.fg(info.color ?? "muted", label),
 					role,
@@ -1299,6 +1306,15 @@ export class ModelHubComponent implements Component {
 		}
 	}
 
+	/** Scroll `#roleScrollStart` just enough to keep `#roleIndex` inside a window of `viewHeight` rows, clamped to the list. */
+	#ensureRoleVisible(viewHeight: number, total: number): number {
+		if (viewHeight <= 0) return 0;
+		let start = this.#roleScrollStart;
+		if (this.#roleIndex < start) start = this.#roleIndex;
+		else if (this.#roleIndex >= start + viewHeight) start = this.#roleIndex - viewHeight + 1;
+		return Math.max(0, Math.min(start, Math.max(0, total - viewHeight)));
+	}
+
 	/** Step the roles cursor by one row, skipping separator rows. Wraps at the ends unless `wrap: false` (then the cursor stays put). */
 	#stepRoleIndex(from: number, delta: -1 | 1, options: { wrap?: boolean } = {}): number {
 		const wrap = options.wrap ?? true;
@@ -1470,7 +1486,8 @@ export class ModelHubComponent implements Component {
 			this.#sidebarHover = overSidebar ? this.#sidebarEntryIndexAt(contentLine) : null;
 			if (overBody && entry.kind === "roles" && this.#assigning === null) {
 				const roleLine = bodyLine - this.#rolesRowStart;
-				this.#roleHover = roleLine >= 0 && roleLine < this.#rolesRowCount ? roleLine : null;
+				this.#roleHover =
+					roleLine >= 0 && roleLine < this.#rolesVisibleCount ? roleLine + this.#roleScrollStart : null;
 			} else {
 				this.#roleHover = null;
 				if (overBody && this.#isBrowserView(entry)) {
@@ -1505,8 +1522,9 @@ export class ModelHubComponent implements Component {
 		if (overBody) {
 			if (entry.kind === "roles" && this.#assigning === null) {
 				this.#focus = "list";
-				const roleLine = bodyLine - this.#rolesRowStart;
-				if (roleLine >= 0 && roleLine < this.#rolesRowCount) {
+				const listLine = bodyLine - this.#rolesRowStart;
+				if (listLine >= 0 && listLine < this.#rolesVisibleCount) {
+					const roleLine = listLine + this.#roleScrollStart;
 					const rowDef = this.#rolesRows[roleLine];
 					if (rowDef && rowDef.kind !== "separator") {
 						if (roleLine === this.#roleIndex) {
@@ -1715,7 +1733,16 @@ export class ModelHubComponent implements Component {
 
 		const cycleOrder = this.#cycleOrder();
 		const listFocused = this.#focus === "list";
-		for (let i = 0; i < this.#rolesRows.length && lines.length < rows - 2; i++) {
+		// Window the list around the cursor so entries past the panel height stay
+		// reachable; the trailing indicator line steals one row when clipped.
+		const total = this.#rolesRows.length;
+		const capacity = Math.max(0, rows - 2 - this.#rolesRowStart);
+		const overflow = total > capacity;
+		const viewHeight = overflow ? Math.max(0, capacity - 1) : capacity;
+		this.#roleScrollStart = this.#ensureRoleVisible(viewHeight, total);
+		const endIndex = Math.min(this.#roleScrollStart + viewHeight, total);
+		this.#rolesVisibleCount = Math.max(0, endIndex - this.#roleScrollStart);
+		for (let i = this.#roleScrollStart; i < endIndex; i++) {
 			const rowDef = this.#rolesRows[i];
 			if (!rowDef) continue;
 			const selected = i === this.#roleIndex;
@@ -1797,6 +1824,15 @@ export class ModelHubComponent implements Component {
 			}
 			line = this.#finishRolesRow(line, width, hovered);
 			lines.push(line);
+		}
+
+		if (overflow) {
+			const hiddenAbove = this.#roleScrollStart;
+			const hiddenBelow = total - endIndex;
+			const parts: string[] = [];
+			if (hiddenAbove > 0) parts.push(`↑ ${hiddenAbove} more`);
+			if (hiddenBelow > 0) parts.push(`↓ ${hiddenBelow} more`);
+			lines.push(truncateToWidth(theme.fg("dim", `   ${parts.join("   ")}`), width));
 		}
 
 		// Live preview of the quick-switch cycle, rendered with the exact

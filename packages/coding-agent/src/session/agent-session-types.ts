@@ -45,6 +45,12 @@ export const SHUTDOWN_CONSOLIDATE_BUDGET_MS = 1_500;
 export interface AgentSessionDisposeOptions {
 	mnemopiConsolidateTimeoutMs?: number;
 	/**
+	 * Deadline for the settle/drain wait before the terminal memory release
+	 * (default 5s). The bounded-teardown paths (signal handlers, tests) may
+	 * shorten it; late event handlers are still finalized after they settle.
+	 */
+	drainTimeoutMs?: number;
+	/**
 	 * Postmortem reason that triggered this dispose (signal/fatal teardown
 	 * paths). When set, the persisted `session_exit` diagnostic records it
 	 * instead of the generic `"dispose"` used for normal programmatic disposal
@@ -158,6 +164,8 @@ export interface AgentSessionConfig {
 	createMemoryTools?: () => Promise<AgentTool[]>;
 	/** Creates the built-in `computer` tool for session-scoped runtime enablement (see {@link AgentSession.setComputerToolEnabled}). */
 	createComputerTool?: () => Promise<AgentTool | null>;
+	/** Creates the private `think` scratchpad tool for runtime setting changes. */
+	createThinkTool?: () => Promise<AgentTool | null>;
 	/** Creates the built-in `inspect_image` tool for session-scoped runtime enablement (see {@link AgentSession.setInspectImageMode}). */
 	createInspectImageTool?: () => Promise<AgentTool | null>;
 	/** Model registry for API key resolution and model discovery. */
@@ -168,6 +176,8 @@ export interface AgentSessionConfig {
 	createVibeTools?: () => AgentTool[];
 	/** Names whose current registry entry is the built-in implementation. */
 	builtInToolNames?: Iterable<string>;
+	/** MCP names whose initial registry entries came from the manager snapshot. */
+	mcpManagerToolNames?: Iterable<string>;
 	/** Updates tool-session predicates from the live active tool set. */
 	setActiveToolNames?: (names: Iterable<string>) => void;
 	/** Registers the write transport when runtime xdev mounts first need it. */
@@ -201,8 +211,6 @@ export interface AgentSessionConfig {
 		toolNames: string[],
 		tools: Map<string, AgentTool>,
 	) => Promise<{ systemPrompt: string[]; xdevCatalogNames?: readonly string[] }>;
-	/** Local calendar date provider used by prompt-cache invalidation. */
-	getLocalCalendarDate?: () => string;
 	/** Tools mounted under `xd://`, for `/tools` display. */
 	getXdevToolEntries?: () => Array<{ name: string; summary: string }>;
 	/** `xd://` presentation state backed by the canonical tool map. */

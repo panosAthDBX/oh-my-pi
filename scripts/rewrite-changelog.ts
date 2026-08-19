@@ -8,7 +8,7 @@
  * the final shipped behavior belongs in release notes.
  *
  * For every non-empty `[Unreleased]` section this script hands the whole section
- * to a small model (default `google-vertex/gemini-3.5-flash` via `@oh-my-pi/pi-ai`)
+ * to a small model (default `google-antigravity/gemini-3.7-flash` via `@oh-my-pi/pi-ai`)
  * and asks for a complete replacement grouped by changelog category. The model
  * returns structured sections/items; markdown is rendered locally so only the
  * Unreleased section changes and formatting stays deterministic.
@@ -31,19 +31,10 @@
 
 import * as path from "node:path";
 import { parseArgs } from "node:util";
-import {
-	type Api,
-	AuthStorage,
-	completeSimple,
-	Effort,
-	type Model,
-	SqliteAuthCredentialStore,
-	type Tool,
-	type ToolCall,
-} from "@oh-my-pi/pi-ai";
+import { type } from "@oh-my-pi/omptype";
+import { type Api, completeSimple, Effort, type Model, type Tool, type ToolCall } from "@oh-my-pi/pi-ai";
+import { discoverAuthStorage } from "@oh-my-pi/pi-ai/auth-broker";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { getAgentDbPath } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
 import {
 	type ChangelogDocument,
 	changelogPaths,
@@ -55,7 +46,7 @@ import {
 	resolveRepoRoot,
 } from "./fix-changelogs";
 
-const DEFAULT_MODEL = "google-vertex/gemini-3.5-flash";
+const DEFAULT_MODEL = "google-antigravity/gemini-3.7-flash";
 
 // --------------------------------------------------------------------------
 // Prompts
@@ -109,12 +100,12 @@ async function openModel(modelSpec: string): Promise<RewriteModel> {
 	const modelId = modelSpec.slice(slash + 1);
 	const model = getBundledModel(provider as GeneratedProvider, modelId);
 	if (!model) throw new Error(`unknown model "${modelSpec}" (not in bundled catalog)`);
-	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
-	const storage = new AuthStorage(store);
-	await storage.reload();
+	const storage = await discoverAuthStorage({ sourceLabel: "rewrite-changelog" });
 	const apiKey = await storage.getApiKey(provider);
 	if (!apiKey) {
-		throw new Error(`no credentials for provider "${provider}" (run \`omp login\` or set the provider env var)`);
+		throw new Error(
+			`no credentials for provider "${provider}" via ${storage.sourceLabel ?? "auth storage"} (check broker or run \`omp login\`)`,
+		);
 	}
 	return { model, apiKey, spec: modelSpec };
 }
@@ -151,15 +142,13 @@ interface RewrittenSection {
 	items: string[];
 }
 
-const REWRITE_RESPONSE = z.object({
-	sections: z
-		.array(
-			z.object({
-				category: z.enum(["Breaking Changes", "Added", "Changed", "Fixed", "Removed"]),
-				items: z.array(z.string()),
-			}),
-		)
-		.default([]),
+const REWRITE_RESPONSE = type({
+	sections: type({
+		category: "'Breaking Changes' | 'Added' | 'Changed' | 'Fixed' | 'Removed'",
+		items: "string[]",
+	})
+		.array()
+		.default(() => []),
 });
 
 const REWRITE_PARAMETERS = {
@@ -198,11 +187,11 @@ const REWRITE_TOOL: Tool = {
 };
 
 function validateRewrite(args: Record<string, unknown>): RewrittenSection[] {
-	const parsed = REWRITE_RESPONSE.safeParse(args);
-	if (!parsed.success) {
-		throw new Error(`invalid tool arguments: ${parsed.error.issues.map(issue => issue.message).join("; ")}`);
+	const parsed = REWRITE_RESPONSE(args);
+	if (parsed instanceof type.errors) {
+		throw new Error(`invalid tool arguments: ${parsed.summary}`);
 	}
-	return parsed.data.sections
+	return parsed.sections
 		.map(sec => ({
 			category: sec.category,
 			items: sec.items.map(item => item.trim()).filter(Boolean),
@@ -381,7 +370,7 @@ function parseCli(argv: string[]): CliOptions | "help" {
 		options: {
 			"dry-run": { type: "boolean", default: false },
 			check: { type: "boolean", default: false },
-			model: { type: "string", default: DEFAULT_MODEL },
+			model: { type: "string", short: "m", default: DEFAULT_MODEL },
 			package: { type: "string" },
 			"repo-root": { type: "string" },
 			concurrency: { type: "string", default: "4" },
@@ -400,14 +389,14 @@ function parseCli(argv: string[]): CliOptions | "help" {
 
 function usage(): string {
 	return [
-		"Usage: bun scripts/rewrite-changelog.ts [--dry-run|--check] [--model <prov/id>] [--package <substr>] [--concurrency <n>]",
+		"Usage: bun scripts/rewrite-changelog.ts [--dry-run|--check] [-m|--model <prov/id>] [--package <substr>] [--concurrency <n>]",
 		"",
 		"Hands each non-empty [Unreleased] changelog section to a small model and rewrites the entries",
 		"into user-facing release notes, dropping intermediate developer churn and implementation-only details",
 		"while preserving public contract, exports, API, config, auth, and billing behavior.",
 		"",
 		"Options:",
-		`  --model <prov/id>  Classifier model (default ${DEFAULT_MODEL}).`,
+		`  -m, --model <prov/id>  Classifier model (default ${DEFAULT_MODEL}).`,
 		"  --package <substr> Only changelogs whose path contains this substring.",
 		"  --concurrency <n>  Max concurrent changelogs to process in parallel (default 4).",
 		"  --dry-run          Report what would be dropped without writing files.",

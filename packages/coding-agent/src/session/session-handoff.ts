@@ -14,7 +14,9 @@ import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import type { ExtensionRunner, SessionBeforeSwitchResult } from "../extensibility/extensions";
-import { obfuscateProviderContext, type SecretObfuscator } from "../secrets/obfuscator";
+import { copyLocalArtifacts, resolveLocalUrlToPath } from "../internal-urls";
+import { obfuscateProviderContext } from "../secrets/message-transform";
+import type { SecretObfuscator } from "../secrets/obfuscator";
 import type { HandoffResult, SessionHandoffOptions } from "./agent-session-types";
 import type { BashSessionTransition } from "./bash-runner";
 import type { SessionContext } from "./session-context";
@@ -27,6 +29,17 @@ function createHandoffContext(document: string): string {
 function createHandoffFileName(date = new Date()): string {
 	const fileTimestamp = date.toISOString().replace(/[:.]/g, "-");
 	return `handoff-${fileTimestamp}.md`;
+}
+
+function throwIfHandoffAborted(signal: AbortSignal): void {
+	if (!signal.aborted) return;
+	const reason = signal.reason;
+	if (reason instanceof DOMException && reason.name === "AbortError") {
+		throw new Error("Handoff cancelled");
+	}
+	if (reason instanceof Error) throw reason;
+	if (typeof reason === "string" && reason.length > 0) throw new Error(reason);
+	throw new Error("Handoff aborted by session");
 }
 
 /** Capabilities borrowed from the owning AgentSession. */
@@ -81,10 +94,10 @@ export class SessionHandoff {
 		this.#host = host;
 	}
 	/**
-	 * Cancel in-progress handoff generation.
+	 * Cancel in-progress handoff generation, preserving a harness-provided reason.
 	 */
-	abortHandoff(): void {
-		this.#handoffAbortController?.abort();
+	abortHandoff(reason?: Error): void {
+		this.#handoffAbortController?.abort(reason);
 	}
 
 	/**
@@ -118,7 +131,7 @@ export class SessionHandoff {
 		const sourceSignal = options?.signal;
 		const onSourceAbort = () => {
 			if (!handoffSignal.aborted) {
-				handoffAbortController.abort();
+				handoffAbortController.abort(sourceSignal?.reason);
 			}
 		};
 		if (sourceSignal) {
@@ -131,9 +144,7 @@ export class SessionHandoff {
 		let advisorRecordersDetached = false;
 		let sessionTransitioned = false;
 		try {
-			if (handoffSignal.aborted) {
-				throw new Error("Handoff cancelled");
-			}
+			throwIfHandoffAborted(handoffSignal);
 
 			const model = this.#host.model();
 			if (!model) {
@@ -208,11 +219,23 @@ export class SessionHandoff {
 			);
 			const handoffText = this.#host.deobfuscateFromProvider(rawHandoffText);
 
-			if (handoffSignal.aborted) {
-				throw new Error("Handoff cancelled");
-			}
-			if (!handoffText) {
-				return undefined;
+			throwIfHandoffAborted(handoffSignal);
+			if (!handoffText || handoffText.trim().length === 0) {
+				// Empty/whitespace-only generation is a real failure, not a user
+				// cancellation. #7904 stopped masking provider errors as "Handoff
+				// cancelled"; an empty document is the remaining path that produced the
+				// same misleading, undebuggable message (#7993).
+				logger.warn("Handoff generation produced no content", {
+					sessionId: this.#host.sessionId(),
+					autoTriggered: options?.autoTriggered ?? false,
+				});
+				// Auto-handoff is best-effort: returning undefined lets maintenance fall
+				// back to context-full compaction. A user-initiated handoff must surface
+				// the failure instead of a silent, misleading "cancelled".
+				if (options?.autoTriggered) {
+					return undefined;
+				}
+				throw new Error("Handoff generation produced no content");
 			}
 
 			// Start a new session
@@ -234,6 +257,15 @@ export class SessionHandoff {
 			// Stop and settle in-flight advisors while the old-session feeds can still
 			// observe message_end, then mute before opening the replacement session.
 			await this.#host.drainAndDetachAdvisorRecorders();
+			// Snapshot the outgoing session's local:// root BEFORE newSession() mints a
+			// fresh session id (and therefore a fresh, empty local root). The handoff
+			// document routinely references plans/scratch files under local://, so those
+			// artifacts must follow the session switch or every reference dangles.
+			const localProtocolOptions = {
+				getArtifactsDir: () => this.#host.sessionManager.getArtifactsDir(),
+				getSessionId: () => this.#host.sessionManager.getSessionId(),
+			};
+			const previousLocalRoot = resolveLocalUrlToPath("local://", localProtocolOptions);
 			const bashTransition = this.#host.beginBashSessionTransition();
 			this.#host.cancelOwnAsyncJobs();
 			try {
@@ -270,6 +302,17 @@ export class SessionHandoff {
 			await this.#host.resetMemoryContextForNewTranscript();
 			this.#host.clearPendingNextTurnMessages();
 			this.#host.resetTodoCycle();
+
+			// Carry local:// artifacts into the replacement session (best-effort: the
+			// switch is already committed, so a copy failure must not fail the handoff).
+			try {
+				const newLocalRoot = resolveLocalUrlToPath("local://", localProtocolOptions);
+				await copyLocalArtifacts(previousLocalRoot, newLocalRoot);
+			} catch (error) {
+				logger.warn("Failed to copy local artifacts into handoff session", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 
 			// Inject the handoff document as a custom message
 			const handoffContent = createHandoffContext(handoffText);
@@ -311,9 +354,10 @@ export class SessionHandoff {
 
 			return { document: handoffText, savedPath };
 		} catch (error) {
-			if (handoffSignal.aborted || (error instanceof Error && error.name === "AbortError")) {
-				throw new Error("Handoff cancelled");
-			}
+			// Only a genuine cancellation (user Esc or an unreasoned source-signal
+			// abort) maps to "Handoff cancelled". A harness-provided abort reason and
+			// provider failures surface verbatim.
+			throwIfHandoffAborted(handoffSignal);
 			throw error;
 		} finally {
 			if (advisorRecordersDetached) {

@@ -71,6 +71,22 @@ type YamlLoadResult =
 	| { kind: "invalid"; error: unknown; backupPath?: string }
 	| { kind: "unreadable"; error: unknown };
 
+type MainYamlReadResult = {
+	settings: RawSettings | null;
+	configPath: string | null;
+};
+
+type ProjectSettingsReadResult = {
+	settings: RawSettings;
+	fileSettings: RawSettings;
+	shellPathSource: string | undefined;
+};
+
+type ConfigOverlayReadResult = {
+	settings: RawSettings;
+	shellPathSource: string | undefined;
+};
+
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
 	cwd?: string;
@@ -353,6 +369,8 @@ export class Settings {
 	#modifiedProjectModelRoles = new Set<string>();
 	/** Individual global model roles modified during this session (for partial save) */
 	#modifiedGlobalModelRoles = new Set<string>();
+	/** Changes whenever a live API mutates a persisted layer. */
+	#persistedMutationGeneration = 0;
 	/**
 	 * Original process-wide model-role overrides captured before a project edit
 	 * temporarily replaced them via `#updateRuntimeModelRoleOverride`. Restored
@@ -370,6 +388,8 @@ export class Settings {
 	#savePromise?: Promise<void>;
 	#projectSaveTimer?: NodeJS.Timeout;
 	#projectSavePromise?: Promise<void>;
+	/** Coalesces concurrent persisted-layer refreshes into one atomic reload. */
+	#reloadFromDiskPromise?: Promise<void>;
 
 	/** Whether to persist changes */
 	#persist: boolean;
@@ -442,11 +462,15 @@ export class Settings {
 	}
 
 	/**
-	 * Create an isolated instance for testing.
-	 * Does not affect the global singleton.
+	 * Create an in-memory settings instance without affecting the global singleton.
+	 * A supplied storage handle remains shared for runtime data while setting overrides stay non-persistent.
 	 */
-	static isolated(overrides: Partial<Record<SettingPath, unknown>> = {}): Settings {
+	static isolated(
+		overrides: Partial<Record<SettingPath, unknown>> = {},
+		options: { storage?: AgentStorage | null } = {},
+	): Settings {
 		const instance = new Settings({ inMemory: true, overrides });
+		instance.#storage = options.storage ?? null;
 		instance.#rebuildMerged();
 		return instance;
 	}
@@ -499,6 +523,7 @@ export class Settings {
 		const prev = this.get(path);
 		const segments = path.split(".");
 		setByPath(this.#global, segments, value);
+		this.#persistedMutationGeneration++;
 		this.#modified.add(path);
 		this.#rebuildMerged();
 		const next = this.get(path);
@@ -618,6 +643,83 @@ export class Settings {
 		cloned.#rebuildMerged();
 		cloned.#fireAllHooks();
 		return cloned;
+	}
+
+	/**
+	 * Re-read the current global, project, and explicit overlay layers from disk
+	 * without replacing this instance or discarding runtime overrides.
+	 *
+	 * All sources are loaded before any live layer is replaced, so readers never
+	 * observe a partially refreshed configuration. Concurrent callers share the
+	 * same reload.
+	 */
+	async reloadFromDisk(): Promise<void> {
+		if (!this.#persist) return;
+		if (this.#reloadFromDiskPromise) return this.#reloadFromDiskPromise;
+
+		const reload = this.#reloadPersistedLayers();
+		this.#reloadFromDiskPromise = reload;
+		try {
+			await reload;
+		} finally {
+			if (this.#reloadFromDiskPromise === reload) {
+				this.#reloadFromDiskPromise = undefined;
+			}
+		}
+	}
+
+	async #reloadPersistedLayers(): Promise<void> {
+		for (;;) {
+			await this.flush();
+			const mutationGeneration = this.#persistedMutationGeneration;
+			const previousSignaledValues = {
+				modelRoles: this.get("modelRoles"),
+				sessionAccent: this.get("statusLine.sessionAccent"),
+			};
+			const previousHookValues = new Map<SettingPath, unknown>();
+			for (const key of Object.keys(SETTING_HOOKS) as SettingPath[]) {
+				previousHookValues.set(key, this.get(key));
+			}
+
+			const [globalResult, projectResult, overlayResult] = await Promise.allSettled([
+				this.#readExistingMainYaml(false),
+				this.#readProjectSettings(false),
+				this.#readConfigOverlays(false),
+			]);
+			if (mutationGeneration !== this.#persistedMutationGeneration) continue;
+			if (globalResult.status === "rejected") throw globalResult.reason;
+			if (projectResult.status === "rejected") throw projectResult.reason;
+			if (overlayResult.status === "rejected") throw overlayResult.reason;
+
+			this.#configPath = globalResult.value.configPath;
+			this.#global = globalResult.value.settings ?? {};
+			this.#project = projectResult.value.settings;
+			this.#projectFileSettings = projectResult.value.fileSettings;
+			this.#projectShellPathSource = projectResult.value.shellPathSource;
+			this.#configOverlay = overlayResult.value.settings;
+			this.#overlayShellPathSource = overlayResult.value.shellPathSource;
+			this.#rebuildMerged();
+
+			const nextModelRoles = this.get("modelRoles");
+			if (!Bun.deepEquals(nextModelRoles, previousSignaledValues.modelRoles)) {
+				this.#fireEffectiveSettingChanged("modelRoles", nextModelRoles, previousSignaledValues.modelRoles);
+			}
+			const nextSessionAccent = this.get("statusLine.sessionAccent");
+			if (!Bun.deepEquals(nextSessionAccent, previousSignaledValues.sessionAccent)) {
+				this.#fireEffectiveSettingChanged(
+					"statusLine.sessionAccent",
+					nextSessionAccent,
+					previousSignaledValues.sessionAccent,
+				);
+			}
+			for (const [key, previous] of previousHookValues) {
+				const next = this.get(key);
+				if (!Bun.deepEquals(next, previous)) {
+					SETTING_HOOKS[key]?.(next, previous);
+				}
+			}
+			return;
+		}
 	}
 
 	/**
@@ -866,6 +968,7 @@ export class Settings {
 		current[role] = modelId;
 		setByPath(this.#project, ["modelRoles"], current);
 		this.#modifiedProjectModelRoles.add(role);
+		this.#persistedMutationGeneration++;
 		this.#rebuildMerged();
 		this.#fireEffectiveSettingChanged("modelRoles", this.get("modelRoles"), prev);
 		this.#queueProjectSave();
@@ -899,6 +1002,7 @@ export class Settings {
 		// clobbered by this process's stale in-memory snapshot.
 		setByPath(this.#global, ["modelRoles"], current);
 		this.#modifiedGlobalModelRoles.add(role);
+		this.#persistedMutationGeneration++;
 		this.#rebuildMerged();
 		this.#queueSave();
 		this.#fireEffectiveSettingChanged("modelRoles", this.get("modelRoles"), prev);
@@ -1087,7 +1191,7 @@ export class Settings {
 		return loaded ?? {};
 	}
 
-	async #loadYamlIfPresent(filePath: string): Promise<YamlLoadResult> {
+	async #loadYamlIfPresent(filePath: string, captureLegacyChangelogVersion = true): Promise<YamlLoadResult> {
 		let content: string;
 		try {
 			content = await fs.promises.readFile(filePath, "utf8");
@@ -1111,7 +1215,10 @@ export class Settings {
 				error: new Error("Settings YAML must contain a mapping at the document root"),
 			};
 		}
-		return { kind: "loaded", settings: this.#migrateRawSettings(parsed as RawSettings) };
+		return {
+			kind: "loaded",
+			settings: this.#migrateRawSettings(parsed as RawSettings, captureLegacyChangelogVersion),
+		};
 	}
 
 	async #resolveYamlWritePath(filePath: string): Promise<string> {
@@ -1211,55 +1318,81 @@ export class Settings {
 		}
 	}
 
-	async #loadExistingMainYaml(): Promise<RawSettings | null> {
-		if (!this.#configPath) return null;
+	async #readExistingMainYaml(quarantineInvalid: boolean): Promise<MainYamlReadResult> {
+		if (!this.#configPath) return { settings: null, configPath: null };
 		for (const filename of MAIN_CONFIG_FILENAMES) {
 			const configPath = path.join(this.#agentDir, filename);
-			const loaded = await this.#loadYamlIfPresentForStartup(configPath);
-			if (loaded) {
-				this.#configPath = configPath;
-				return loaded;
-			}
+			const loaded = quarantineInvalid
+				? await this.#loadYamlIfPresentForStartup(configPath)
+				: this.#unwrapYamlLoadResult(configPath, await this.#loadYamlIfPresent(configPath, false));
+			if (loaded) return { settings: loaded, configPath };
 		}
-		this.#configPath = path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
-		return null;
+		return {
+			settings: null,
+			configPath: path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]),
+		};
 	}
 
-	async #loadProjectSettings(): Promise<RawSettings> {
-		this.#projectShellPathSource = undefined;
+	async #loadExistingMainYaml(): Promise<RawSettings | null> {
+		const result = await this.#readExistingMainYaml(true);
+		this.#configPath = result.configPath;
+		return result.settings;
+	}
+
+	async #readProjectSettings(quarantineInvalid: boolean): Promise<ProjectSettingsReadResult> {
+		let shellPathSource: string | undefined;
 		let merged: RawSettings = {};
 		try {
 			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd });
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level === "project") {
 					merged = this.#deepMerge(merged, item.data as RawSettings);
-					if (Object.hasOwn(item.data, "shellPath")) this.#projectShellPathSource = item.path;
+					if (Object.hasOwn(item.data, "shellPath")) shellPathSource = item.path;
 				}
 			}
 		} catch {
-			this.#projectShellPathSource = undefined;
+			shellPathSource = undefined;
 			// Capability discovery is best-effort; the native project config below
 			// remains authoritative for its model-role layer and must not be hidden.
 		}
 		const projectConfigPath = path.join(this.#cwd, ".omp", "config.yml");
-		const nativeProject = await this.#loadYaml(projectConfigPath);
-		this.#projectFileSettings = structuredClone(nativeProject);
+		const nativeProject = quarantineInvalid
+			? await this.#loadYaml(projectConfigPath)
+			: (this.#unwrapYamlLoadResult(projectConfigPath, await this.#loadYamlIfPresent(projectConfigPath, false)) ??
+				{});
 		const nativeModelRoles = getByPath(nativeProject, ["modelRoles"]);
 		if (nativeModelRoles !== undefined) {
 			merged = this.#deepMerge(merged, { modelRoles: nativeModelRoles });
 		}
-		return this.#migrateRawSettings(merged);
+		return {
+			settings: this.#migrateRawSettings(merged, quarantineInvalid),
+			fileSettings: structuredClone(nativeProject),
+			shellPathSource,
+		};
+	}
+
+	async #loadProjectSettings(): Promise<RawSettings> {
+		const result = await this.#readProjectSettings(true);
+		this.#projectFileSettings = result.fileSettings;
+		this.#projectShellPathSource = result.shellPathSource;
+		return result.settings;
+	}
+
+	async #readConfigOverlays(captureLegacyChangelogVersion = true): Promise<ConfigOverlayReadResult> {
+		let shellPathSource: string | undefined;
+		let settings: RawSettings = {};
+		for (const filePath of this.#configFiles) {
+			const overlay = await this.#loadOverlayYaml(filePath, captureLegacyChangelogVersion);
+			settings = this.#deepMerge(settings, overlay);
+			if (Object.hasOwn(overlay, "shellPath")) shellPathSource = filePath;
+		}
+		return { settings, shellPathSource };
 	}
 
 	async #loadConfigOverlays(): Promise<RawSettings> {
-		this.#overlayShellPathSource = undefined;
-		let merged: RawSettings = {};
-		for (const filePath of this.#configFiles) {
-			const overlay = await this.#loadOverlayYaml(filePath);
-			merged = this.#deepMerge(merged, overlay);
-			if (Object.hasOwn(overlay, "shellPath")) this.#overlayShellPathSource = filePath;
-		}
-		return merged;
+		const result = await this.#readConfigOverlays();
+		this.#overlayShellPathSource = result.shellPathSource;
+		return result.settings;
 	}
 
 	/**
@@ -1267,7 +1400,7 @@ export class Settings {
 	 * missing or malformed files are hard errors so a typo'd path cannot
 	 * silently fall back to the persistent settings.
 	 */
-	async #loadOverlayYaml(filePath: string): Promise<RawSettings> {
+	async #loadOverlayYaml(filePath: string, captureLegacyChangelogVersion = true): Promise<RawSettings> {
 		let content: string;
 		try {
 			content = await Bun.file(filePath).text();
@@ -1288,7 +1421,7 @@ export class Settings {
 		if (typeof parsed !== "object" || Array.isArray(parsed)) {
 			throw new Error(`Config overlay must be a YAML mapping: ${filePath}`);
 		}
-		return this.#migrateRawSettings(parsed as RawSettings);
+		return this.#migrateRawSettings(parsed as RawSettings, captureLegacyChangelogVersion);
 	}
 
 	async #migrateFromLegacy(): Promise<void> {
@@ -1329,7 +1462,7 @@ export class Settings {
 	}
 
 	/** Apply schema migrations to raw settings */
-	#migrateRawSettings(raw: RawSettings): RawSettings {
+	#migrateRawSettings(raw: RawSettings, captureLegacyChangelogVersion = true): RawSettings {
 		// queueMode -> steeringMode
 		if ("queueMode" in raw && !("steeringMode" in raw)) {
 			raw.steeringMode = raw.queueMode;
@@ -1341,7 +1474,7 @@ export class Settings {
 		// longer dirty user-tracked configs. Capture for marker seeding (see
 		// #seedLastChangelogVersionMarker), then strip the key — the next
 		// config save drops it from disk.
-		if (typeof raw.lastChangelogVersion === "string") {
+		if (captureLegacyChangelogVersion && typeof raw.lastChangelogVersion === "string") {
 			this.#legacyLastChangelogVersion ??= raw.lastChangelogVersion;
 		}
 		delete raw.lastChangelogVersion;
@@ -1782,6 +1915,26 @@ export class Settings {
 		if (tierTouched) raw.tier = tierObj;
 		delete raw.fastModeScope;
 
+		// advisor.subagents (blanket advisor on every spawned subagent) → per-agent
+		// task.agentAdvisor, migrated to the bundled generic `task` agent. An
+		// explicit boolean maps to "on"/"off" IN THE SAME LAYER — migration runs
+		// per file, so a project-level `false` must keep overriding a global
+		// `true` after both layers migrate.
+		{
+			const advisorObj = isRecord(raw.advisor) ? raw.advisor : undefined;
+			const legacySubagents =
+				advisorObj && "subagents" in advisorObj ? advisorObj.subagents : raw["advisor.subagents"];
+			if (typeof legacySubagents === "boolean") {
+				const taskObj = isRecord(raw.task) ? raw.task : {};
+				const agentAdvisor = isRecord(taskObj.agentAdvisor) ? taskObj.agentAdvisor : {};
+				if (!("task" in agentAdvisor)) agentAdvisor.task = legacySubagents ? "on" : "off";
+				taskObj.agentAdvisor = agentAdvisor;
+				raw.task = taskObj;
+			}
+			if (advisorObj) delete advisorObj.subagents;
+			delete raw["advisor.subagents"];
+		}
+
 		// v17 renames that used to nest under a boolean parent path:
 		//   dev.autoqa.consent -> dev.autoqaConsent
 		//   todo.reminders.max -> todo.remindersMax
@@ -1859,6 +2012,52 @@ export class Settings {
 				? [value, ...AUTO_IMAGE_PROVIDER_ORDER.filter(id => id !== value)]
 				: undefined,
 		);
+
+		// Consolidate the retired Exa suite toggles onto the sole remaining
+		// provider switch. The old runtime required both `enabled` and
+		// `enableSearch`, so preserve that AND semantics when both are present.
+		// Researcher and Websets were removed with the standalone Exa tools.
+		const exaObj = isRecord(raw.exa) ? raw.exa : undefined;
+		const exaEnabledValues = [
+			exaObj?.enabled,
+			raw["exa.enabled"],
+			exaObj?.enableSearch,
+			raw["exa.enableSearch"],
+		].filter((value): value is boolean => typeof value === "boolean");
+		const hasFlatExaSetting =
+			"exa.enabled" in raw ||
+			"exa.enableSearch" in raw ||
+			"exa.enableResearcher" in raw ||
+			"exa.enableWebsets" in raw;
+		if (exaObj || hasFlatExaSetting) {
+			const exaRoot = exaObj ?? {};
+			if (exaEnabledValues.length > 0) {
+				exaRoot.enabled = exaEnabledValues.every(Boolean);
+			}
+			delete exaRoot.enableSearch;
+			delete exaRoot.enableResearcher;
+			delete exaRoot.enableWebsets;
+			if (Object.keys(exaRoot).length > 0) {
+				raw.exa = exaRoot;
+			} else {
+				delete raw.exa;
+			}
+			delete raw["exa.enabled"];
+			delete raw["exa.enableSearch"];
+			delete raw["exa.enableResearcher"];
+			delete raw["exa.enableWebsets"];
+		}
+
+		// computer.backend and model-specific controller routing were removed
+		// when the computer tool moved to one native desktop implementation.
+		const computerObj = isRecord(raw.computer) ? raw.computer : undefined;
+		if (computerObj && "backend" in computerObj) {
+			delete computerObj.backend;
+			if (Object.keys(computerObj).length === 0) {
+				delete raw.computer;
+			}
+		}
+		delete raw["computer.backend"];
 
 		return raw;
 	}

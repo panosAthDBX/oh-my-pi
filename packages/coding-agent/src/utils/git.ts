@@ -10,6 +10,7 @@ import {
 	parseNumstat,
 } from "../commit/git/diff";
 import type { FileDiff, FileHunks, NumstatEntry } from "../commit/types";
+import { REJECT_PROMPT_COMMAND } from "../exec/non-interactive-env";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -20,6 +21,8 @@ export interface GitCommandResult {
 	exitCode: number;
 	stdout: string;
 	stderr: string;
+	/** True when stdout or stderr hit {@link GIT_COMMAND_OUTPUT_LIMIT_BYTES} and the captured text is incomplete. */
+	truncated: boolean;
 }
 
 export interface GitRepository {
@@ -65,6 +68,7 @@ export interface DiffOptions {
 	readonly numstat?: boolean;
 	readonly signal?: AbortSignal;
 	readonly stat?: boolean;
+	readonly requireComplete?: boolean;
 }
 
 export interface StatusOptions {
@@ -172,6 +176,29 @@ export class GitCommandError extends Error {
 	}
 }
 
+/**
+ * A git subprocess produced more output than {@link GIT_COMMAND_OUTPUT_LIMIT_BYTES}
+ * and its captured stdout was truncated. Thrown only for callers that opt into
+ * completeness via `diff({ requireComplete: true })`, where operating on a partial
+ * diff would silently corrupt downstream parsing — e.g. the split-commit builder,
+ * which would otherwise throw a misleading "No diff found" for files sorting after
+ * a large binary blob whose base85 payload pushed the diff past the cap.
+ */
+export class GitOutputTruncatedError extends Error {
+	readonly args: readonly string[];
+	readonly result: GitCommandResult;
+
+	constructor(args: readonly string[], result: GitCommandResult) {
+		const limitMiB = Math.round(GIT_COMMAND_OUTPUT_LIMIT_BYTES / (1024 * 1024));
+		super(
+			`git ${args.join(" ")} produced more than ${limitMiB} MiB of output; the captured result is truncated and incomplete.`,
+		);
+		this.name = "GitOutputTruncatedError";
+		this.args = [...args];
+		this.result = result;
+	}
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Internal: Core execution
 // ════════════════════════════════════════════════════════════════════════════
@@ -199,7 +226,7 @@ const GIT_NON_INTERACTIVE_ENV = {
 	GIT_TERMINAL_PROMPT: "0",
 	LC_ALL: undefined,
 	LC_MESSAGES: "C",
-	SSH_ASKPASS: "/usr/bin/false",
+	SSH_ASKPASS: REJECT_PROMPT_COMMAND,
 } satisfies Record<string, string | undefined>;
 const GH_NON_INTERACTIVE_ENV = {
 	...GIT_NON_INTERACTIVE_ENV,
@@ -225,6 +252,11 @@ export const GIT_COMMAND_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
  * degrades instead of freezing the UI indefinitely.
  */
 export const GIT_SPAWN_SYNC_TIMEOUT_MS = 5_000;
+/**
+ * Stat-poll interval for {@link head.watch}. One `stat` per interval keeps an
+ * always-on status line cheap while surfacing a branch switch within a second.
+ */
+export const HEAD_WATCH_INTERVAL_MS = 1000;
 
 const GIT_COMMAND_TIMEOUT_EXIT_CODE = 124;
 // Exit code returned when the `git` binary cannot be launched at all (spawn
@@ -306,7 +338,10 @@ async function waitForExitWithTimeout(
 	}
 }
 
-async function readCappedText(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<string> {
+async function readCappedText(
+	stream: ReadableStream<Uint8Array>,
+	maxBytes: number,
+): Promise<{ text: string; truncated: boolean }> {
 	const reader = stream.getReader();
 	const decoder = new TextDecoder();
 	const chunks: string[] = [];
@@ -329,7 +364,7 @@ async function readCappedText(stream: ReadableStream<Uint8Array>, maxBytes: numb
 		}
 		chunks.push(decoder.decode());
 		if (truncated) chunks.push(GIT_OUTPUT_TRUNCATED_MARKER);
-		return chunks.join("");
+		return { text: chunks.join(""), truncated };
 	} finally {
 		reader.releaseLock();
 	}
@@ -366,10 +401,15 @@ async function collectSubprocessResult(
 		void stdoutPromise.catch(() => undefined);
 		void stderrPromise.catch(() => undefined);
 		await Promise.all([cancelOutput(stdoutStream), cancelOutput(stderrStream)]);
-		return { exitCode: GIT_COMMAND_TIMEOUT_EXIT_CODE, stdout: "", stderr: exit.stderr };
+		return { exitCode: GIT_COMMAND_TIMEOUT_EXIT_CODE, stdout: "", stderr: exit.stderr, truncated: false };
 	}
 	const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-	return { exitCode: exit.exitCode ?? 0, stdout, stderr };
+	return {
+		exitCode: exit.exitCode ?? 0,
+		stdout: stdout.text,
+		stderr: stderr.text,
+		truncated: stdout.truncated || stderr.truncated,
+	};
 }
 
 interface CommandOptions {
@@ -490,7 +530,7 @@ async function git(cwd: string, args: readonly string[], options: CommandOptions
 			// A deleted/nonexistent cwd also surfaces as a spawn ENOENT; only blame
 			// the binary when the working directory actually exists.
 			const stderr = fs.existsSync(cwd) ? "git is not installed." : `working directory does not exist: ${cwd}`;
-			return { exitCode: GIT_SPAWN_ENOENT_EXIT_CODE, stdout: "", stderr };
+			return { exitCode: GIT_SPAWN_ENOENT_EXIT_CODE, stdout: "", stderr, truncated: false };
 		}
 		throw err;
 	}
@@ -1234,7 +1274,11 @@ export const diff = Object.assign(
 		if (options.allowFailure) {
 			return (await git(cwd, args, { env: options.env, readOnly: true, signal: options.signal })).stdout;
 		}
-		return runText(cwd, args, { env: options.env, readOnly: true, signal: options.signal });
+		const result = await runChecked(cwd, args, { env: options.env, readOnly: true, signal: options.signal });
+		if (options.requireComplete && result.truncated) {
+			throw new GitOutputTruncatedError(args, result);
+		}
+		return result.stdout;
 	},
 	{
 		/** List changed file paths. */
@@ -1999,12 +2043,17 @@ export const patch = {
 		}
 	},
 
-	/** Join patch parts into a single patch string. */
+	/**
+	 * Join patch parts into a single patch string.
+	 *
+	 * Each part is terminated with a single `\n` if it lacks one, then parts are
+	 * concatenated verbatim — matching git's native multi-file diff layout. Parts
+	 * are NOT separated by an extra blank line and trailing newlines are NOT
+	 * stripped: a `GIT binary patch` block ends in a blank line that
+	 * `git apply --binary` requires, and stripping it corrupts the patch (#8899).
+	 */
 	join(parts: string[]): string {
-		return `${parts
-			.map(part => (part.endsWith("\n") ? part : `${part}\n`))
-			.join("\n")
-			.replace(/\n+$/, "")}\n`;
+		return parts.map(part => (part.endsWith("\n") ? part : `${part}\n`)).join("");
 	},
 };
 
@@ -2294,6 +2343,28 @@ export const head = {
 		const result = await git(cwd, ["rev-parse", `--short=${length}`, "HEAD"], { readOnly: true, signal });
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
+	},
+
+	/**
+	 * Watch the repository's HEAD for branch moves. Returns a disposer.
+	 *
+	 * Deliberately stat-polls via `fs.watchFile` instead of `fs.watch`: git
+	 * swaps HEAD with `HEAD.lock` + atomic rename, which unlinks the HEAD inode
+	 * — and Bun's inotify-backed `fs.watch` permanently stops delivering events
+	 * after observing a rename in the watched directory (oven-sh/bun#24875), so
+	 * an event watcher fires once and then freezes on Linux (issue #8412 was
+	 * the same freeze for file-inode watches on every platform). A path-based
+	 * stat poll re-resolves the path each interval and survives inode swaps
+	 * everywhere. Reftable repos keep ref state in `<gitDir>/reftable` (their
+	 * HEAD file is a static stub), so the poll targets that directory instead.
+	 */
+	watch(repository: GitRepository, onChange: () => void): () => void {
+		const target = isReftableRepoSync(repository) ? path.join(repository.gitDir, "reftable") : repository.headPath;
+		const listener = (curr: fs.Stats, prev: fs.Stats) => {
+			if (curr.mtimeMs !== prev.mtimeMs || curr.ino !== prev.ino || curr.size !== prev.size) onChange();
+		};
+		fs.watchFile(target, { interval: HEAD_WATCH_INTERVAL_MS }, listener).unref();
+		return () => fs.unwatchFile(target, listener);
 	},
 };
 

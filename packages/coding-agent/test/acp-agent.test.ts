@@ -1,22 +1,7 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type {
-	AgentSideConnection,
-	ClientCapabilities,
-	CreateElicitationRequest,
-	CreateElicitationResponse,
-	PromptRequest,
-	SessionNotification,
-} from "@agentclientprotocol/sdk";
-import {
-	zForkSessionResponse,
-	zLoadSessionResponse,
-	zNewSessionResponse,
-	zPromptResponse,
-	zSessionNotification,
-} from "@agentclientprotocol/sdk/dist/schema/zod.gen.js";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -39,6 +24,8 @@ import type {
 import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS } from "@oh-my-pi/pi-coding-agent/stt/models";
+import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { TodoPhase } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import {
 	DEFAULT_TTS_LOCAL_MODEL_KEY,
@@ -47,17 +34,26 @@ import {
 	TTS_LOCAL_VOICE_OPTIONS,
 } from "@oh-my-pi/pi-coding-agent/tts/models";
 import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
-import type { z } from "zod/v4";
+import type {
+	AgentSideConnection,
+	ClientCapabilities,
+	CreateElicitationRequest,
+	CreateElicitationResponse,
+	PromptRequest,
+	SessionNotification,
+	Validator,
+} from "@oh-my-pi/pi-utils/acp";
+import {
+	zForkSessionResponse,
+	zLoadSessionResponse,
+	zNewSessionResponse,
+	zPromptResponse,
+	zSessionNotification,
+} from "@oh-my-pi/pi-utils/acp";
 import { TOOL_NAME as DELAYED_MCP_TOOL_NAME } from "./fixtures/delayed-tool-mcp";
 
-/**
- * Validate an ACP wire payload against the external `@agentclientprotocol/sdk`
- * Zod schemas. Those schemas come from the ACP protocol SDK (external boundary)
- * and cannot be expressed as ArkType, so they stay on Zod and are validated via
- * `.safeParse` directly rather than through the ArkType-only `expectAcpStructure`
- * helper in `./helpers/acp-schema`.
- */
-function expectAcpStructure(schema: z.ZodType, value: unknown): void {
+/** Validates an ACP wire payload against the in-house protocol schemas. */
+function expectAcpStructure(schema: Validator<unknown>, value: unknown): void {
 	const result = schema.safeParse(value);
 	expect(result.success, result.success ? undefined : JSON.stringify(result.error.issues, null, 2)).toBe(true);
 }
@@ -88,6 +84,16 @@ const TEST_MODELS: Model[] = [
 		maxTokens: 8_192,
 	}),
 ];
+
+function createTaskSession(cwd: string): ToolSession {
+	return {
+		cwd,
+		hasUI: false,
+		settings: Settings.isolated({}),
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
+	} as unknown as ToolSession;
+}
 
 function makeAssistantMessage(text: string, thinking?: string) {
 	const content: Array<{ type: "text"; text: string } | { type: "thinking"; thinking: string }> = [
@@ -450,6 +456,7 @@ interface AgentHarness {
 	cwdA: string;
 	cwdB: string;
 	findSession(sessionId: string): FakeAgentSession | undefined;
+	waitForUpdate(predicate: (notification: SessionNotification) => boolean): Promise<SessionNotification>;
 }
 
 function getChunkMessageId(notification: SessionNotification): string | undefined {
@@ -468,6 +475,7 @@ const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
 afterEach(async () => {
+	vi.useRealTimers();
 	if (originalAgentDir) {
 		setAgentDir(originalAgentDir);
 	} else {
@@ -496,11 +504,20 @@ async function createHarness(
 	await Settings.init({ agentDir, inMemory: true });
 
 	const updates: SessionNotification[] = [];
+	const updateWaiters = new Set<{
+		predicate: (notification: SessionNotification) => boolean;
+		resolve: (notification: SessionNotification) => void;
+	}>();
 	const abortController = new AbortController();
 	const sessions: FakeAgentSession[] = [];
 	const connection = {
 		sessionUpdate: async (notification: SessionNotification) => {
 			updates.push(notification);
+			for (const waiter of updateWaiters) {
+				if (!waiter.predicate(notification)) continue;
+				updateWaiters.delete(waiter);
+				waiter.resolve(notification);
+			}
 		},
 		unstable_createElicitation: options.elicitationHandler
 			? async (req: CreateElicitationRequest) => options.elicitationHandler!(req)
@@ -535,16 +552,20 @@ async function createHarness(
 		cwdA,
 		cwdB,
 		findSession: (sessionId: string) => sessions.find(session => session.sessionId === sessionId),
+		waitForUpdate: predicate => {
+			const existing = updates.find(predicate);
+			if (existing) return Promise.resolve(existing);
+			const { promise, resolve } = Promise.withResolvers<SessionNotification>();
+			updateWaiters.add({ predicate, resolve });
+			return promise;
+		},
 	};
 }
 
-/**
- * Wait until `#scheduleBootstrapUpdates`'s timer has fired and the
- * session-lifetime subscription is installed. 30 ms of slack absorbs
- * `setTimeout` drift without slowing tests meaningfully.
- */
-async function waitForBootstrapGuard(): Promise<void> {
-	await Bun.sleep(ACP_BOOTSTRAP_RACE_GUARD_MS + 150);
+/** Fire `#scheduleBootstrapUpdates`'s guard without paying wall-clock time. */
+async function advanceBootstrapGuard(): Promise<void> {
+	vi.advanceTimersByTime(ACP_BOOTSTRAP_RACE_GUARD_MS);
+	await Promise.resolve();
 }
 
 describe("ACP agent", () => {
@@ -677,7 +698,6 @@ describe("ACP agent", () => {
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
 
 		const handler = session.planProposalHandler;
-		expect(typeof handler).toBe("function");
 
 		// No plan file written → handler surfaces a ToolError telling the
 		// agent to write the plan before requesting approval.
@@ -809,11 +829,12 @@ describe("ACP agent", () => {
 		// reached the client first), those changes must surface to clients as
 		// `config_option_update` so TORTAS-style fleet views stay in sync.
 		const harness = await createHarness();
+		vi.useFakeTimers();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
-		// Wait past the 50ms bootstrap timer so the lifetime subscription is
+		// Advance past the 50ms bootstrap timer so the lifetime subscription is
 		// installed before we drive an internal thinking-level change.
-		await waitForBootstrapGuard();
+		await advanceBootstrapGuard();
 
 		const updatesBefore = harness.updates.length;
 		session.setThinkingLevel("high");
@@ -840,6 +861,7 @@ describe("ACP agent", () => {
 		session.setThinkingLevel("high");
 		expect(harness.updates.length).toBe(updatesBeforeRedundant);
 
+		vi.useRealTimers();
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
@@ -851,8 +873,9 @@ describe("ACP agent", () => {
 		// about yet (matches Zed's `Received session notification for unknown
 		// session` race that `#scheduleBootstrapUpdates` already guards).
 		// The fake harness lets us simulate that pre-bootstrap window by
-		// driving the change before sleeping past the 50ms guard.
+		// driving the change before advancing past the 50ms guard.
 		const harness = await createHarness();
+		vi.useFakeTimers();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
 
@@ -869,10 +892,9 @@ describe("ACP agent", () => {
 					notification.update.sessionUpdate === "config_option_update",
 			);
 		expect(beforeBootstrap.length).toBe(0);
-
-		// After the 50ms bootstrap timer fires the subscription is installed,
-		// and subsequent changes do surface.
-		await waitForBootstrapGuard();
+		// After advancing through the 50ms bootstrap timer, the subscription is
+		// installed and subsequent changes do surface.
+		await advanceBootstrapGuard();
 		const baseline = harness.updates.length;
 		session.setThinkingLevel("medium");
 		const afterBootstrap = harness.updates
@@ -884,12 +906,14 @@ describe("ACP agent", () => {
 			);
 		expect(afterBootstrap.length).toBeGreaterThanOrEqual(1);
 
+		vi.useRealTimers();
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
 
 	it("delivers startup and later todo projection snapshots as ACP plans", async () => {
 		const harness = await createHarness();
+		vi.useFakeTimers();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
 		session.todoPhases = [{ name: "Native", tasks: [{ content: "Native task", status: "pending" }] }];
@@ -901,13 +925,14 @@ describe("ACP agent", () => {
 			},
 		]);
 
-		await waitForBootstrapGuard();
-		const startupPlan = harness.updates.find(
+		const startupPlanPromise = harness.waitForUpdate(
 			notification =>
 				notification.sessionId === created.sessionId &&
 				notification.update.sessionUpdate === "plan" &&
 				notification.update.entries.some(entry => entry.content.includes("Publish package")),
 		);
+		await advanceBootstrapGuard();
+		const startupPlan = await startupPlanPromise;
 		expect(startupPlan?.update).toEqual({
 			sessionUpdate: "plan",
 			entries: [
@@ -931,6 +956,7 @@ describe("ACP agent", () => {
 				{ content: "[startup / Release] Verify package", priority: "medium", status: "completed" },
 			],
 		});
+		vi.useRealTimers();
 
 		harness.abortController.abort();
 	});
@@ -941,11 +967,12 @@ describe("ACP agent", () => {
 		// push the notification. The ACP surface must not also push a duplicate
 		// `config_option_update` of its own.
 		const harness = await createHarness();
+		vi.useFakeTimers();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		// Wait past the bootstrap guard so the lifetime subscription is
 		// installed and the client-driven setSessionConfigOption produces
 		// exactly one notification through it.
-		await waitForBootstrapGuard();
+		await advanceBootstrapGuard();
 
 		const updatesBefore = harness.updates.length;
 		const response = await harness.agent.setSessionConfigOption({
@@ -971,6 +998,7 @@ describe("ACP agent", () => {
 			| undefined;
 		expect(thinkingOption?.currentValue).toBe("high");
 
+		vi.useRealTimers();
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
@@ -984,9 +1012,10 @@ describe("ACP agent", () => {
 		// Zed's status bar) goes stale the moment prewalk hands off to a
 		// cheaper model mid-session.
 		const harness = await createHarness();
+		vi.useFakeTimers();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
-		await waitForBootstrapGuard();
+		await advanceBootstrapGuard();
 
 		const updatesBefore = harness.updates.length;
 		await session.setModel(TEST_MODELS[1]!);
@@ -1013,6 +1042,7 @@ describe("ACP agent", () => {
 		await session.setModel(TEST_MODELS[1]!);
 		expect(harness.updates.length).toBe(updatesBeforeRedundant);
 
+		vi.useRealTimers();
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
@@ -1023,8 +1053,9 @@ describe("ACP agent", () => {
 		// lifetime subscription push the notification. The ACP surface must not
 		// also push a duplicate `config_option_update` of its own.
 		const harness = await createHarness();
+		vi.useFakeTimers();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
-		await waitForBootstrapGuard();
+		await advanceBootstrapGuard();
 
 		const updatesBefore = harness.updates.length;
 		const response = await harness.agent.setSessionConfigOption({
@@ -1048,6 +1079,7 @@ describe("ACP agent", () => {
 			| undefined;
 		expect(modelOption?.currentValue).toBe(`${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`);
 
+		vi.useRealTimers();
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
@@ -1168,6 +1200,48 @@ describe("ACP agent", () => {
 				update => typeof getChunkMessageId(update) === "string" && getChunkMessageId(update)!.length > 0,
 			),
 		).toBe(true);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("loads a session stored under a legacy/hashed project directory (#7779)", async () => {
+		const harness = await createHarness();
+		const stored = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stored);
+		stored.sessionManager.appendMessage({ role: "user", content: "legacy hello", timestamp: Date.now() });
+		stored.sessionManager.appendMessage(makeAssistantMessage("legacy reply"));
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+
+		const sessionFile = stored.sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("session file not persisted");
+		const sessionId = stored.sessionId;
+		// Release the writer so the directory can be renamed out from under it.
+		await stored.dispose();
+
+		// Simulate the hashed-directory era (#7397, reverted in #7656): the
+		// session file lives under a project directory whose name the current
+		// cwd->dir scheme would never produce, so the cwd-scoped scan misses it.
+		const cwdDerivedDir = path.dirname(sessionFile);
+		const sessionsRoot = path.dirname(cwdDerivedDir);
+		const hashedDir = path.join(sessionsRoot, `home-cwd-a-${"a".repeat(64)}`);
+		await fs.promises.rename(cwdDerivedDir, hashedDir);
+
+		const loaded = await harness.agent.loadSession({
+			sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+		});
+		expectAcpStructure(zLoadSessionResponse, loaded);
+
+		const replayChunks = harness.updates.filter(
+			update =>
+				update.sessionId === sessionId &&
+				(update.update.sessionUpdate === "user_message_chunk" ||
+					update.update.sessionUpdate === "agent_message_chunk"),
+		);
+		expect(replayChunks.length).toBeGreaterThan(0);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
@@ -1701,6 +1775,34 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("refreshes task agent descriptions on ACP /reload-plugins", async () => {
+		const harness = await createHarness();
+		const agentDir = path.join(harness.cwdA, ".omp", "agents");
+		const agentFile = path.join(agentDir, "acp-reload-agent.md");
+		await fs.promises.mkdir(agentDir, { recursive: true });
+		await fs.promises.writeFile(
+			agentFile,
+			"---\nname: acp-reload-agent\ndescription: VERSION_ONE\n---\nACP reload agent.\n",
+		);
+		const taskTool = await TaskTool.create(createTaskSession(harness.cwdA));
+		expect(taskTool.description).toContain("VERSION_ONE");
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+
+		await fs.promises.writeFile(
+			agentFile,
+			"---\nname: acp-reload-agent\ndescription: VERSION_TWO\n---\nACP reload agent.\n",
+		);
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			messageId: "00000000-0000-4000-8000-000000000006",
+			prompt: [{ type: "text", text: "/reload-plugins" }],
+		} as PromptRequest);
+
+		expect(taskTool.description).toContain("VERSION_TWO");
+		expect(taskTool.description).not.toContain("VERSION_ONE");
+		harness.abortController.abort();
 	});
 
 	it("advertises ACP-safe builtins and skill commands", async () => {

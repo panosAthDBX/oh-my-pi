@@ -171,7 +171,6 @@ declare module "@oh-my-pi/pi-agent-core/compaction/entries" {
 	interface CustomCompactionSessionEntries {
 		titleChange: TitleChangeEntry;
 		credentialPin: CredentialPinEntry;
-		resetBoundary: ResetBoundaryEntry;
 	}
 }
 
@@ -227,6 +226,8 @@ export interface SessionInitEntry extends SessionEntryBase {
 	spawns?: string;
 	/** The agent's `readSummarize` setting (`false` = read summarization disabled); absent uses the session default. */
 	readSummarize?: boolean;
+	/** Effective advisor for this subagent: `"on"` = advisor-role model, else an explicit model pattern; absent = unadvised. */
+	advisor?: string;
 }
 
 /** Mode change entry - tracks agent mode transitions (e.g. plan mode). */

@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -36,39 +36,13 @@ describe("InteractiveMode todo HUD persistence", () => {
 	let mode: InteractiveMode;
 	let eventBus: EventBus;
 
-	beforeAll(async () => {
-		await initTheme();
-	});
-
-	beforeEach(async () => {
-		resetSettingsForTest();
-		tempDir = TempDir.createSync("@pi-todo-clear-");
-		focusedSession = undefined;
-	});
-
-	afterEach(async () => {
-		mode?.stop();
-		AgentRegistry.global().unregister(FOCUSED_AGENT_ID);
-		await focusedSession?.dispose();
-		await session?.dispose();
-		authStorage?.close();
-		tempDir?.removeSync();
-		vi.useRealTimers();
-		vi.restoreAllMocks();
-		resetSettingsForTest();
-	});
-
-	async function createMode(todoClearDelay: number, extensionFactory?: ExtensionFactory): Promise<void> {
-		await Settings.init({
-			inMemory: true,
-			cwd: tempDir.path(),
-			overrides: { "tasks.todoClearDelay": todoClearDelay },
-		});
-		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		modelRegistry = new ModelRegistry(authStorage);
+	async function replaceMode(todoClearDelay = -1, extensionFactory?: ExtensionFactory): Promise<void> {
+		if (mode) {
+			mode.stop();
+			await session.dispose();
+		}
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
-
 		eventBus = new EventBus();
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		let extensionRunner: ExtensionRunner | undefined;
@@ -100,8 +74,43 @@ describe("InteractiveMode todo HUD persistence", () => {
 		mode = new InteractiveMode(session, "test", undefined, undefined, undefined, undefined, eventBus);
 	}
 
+	beforeAll(async () => {
+		await initTheme();
+		resetSettingsForTest();
+		tempDir = TempDir.createSync("@pi-todo-clear-");
+		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		modelRegistry = new ModelRegistry(authStorage);
+		await replaceMode();
+	});
+
+	afterEach(async () => {
+		AgentRegistry.global().unregister(FOCUSED_AGENT_ID);
+		await focusedSession?.dispose();
+		focusedSession = undefined;
+		session.setTodoPhases([]);
+		session.clearTodoProjections();
+		mode.setTodos([]);
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	afterAll(async () => {
+		mode?.stop();
+		AgentRegistry.global().unregister(FOCUSED_AGENT_ID);
+		await focusedSession?.dispose();
+		await session?.dispose();
+		authStorage?.close();
+		tempDir?.removeSync();
+		resetSettingsForTest();
+	});
+
+	function setTodoClearDelay(todoClearDelay: number): void {
+		session.settings.override("tasks.todoClearDelay", todoClearDelay);
+	}
+
 	it("renders a projection published by a session_start handler on initial startup", async () => {
-		await createMode(-1, pi => {
+		await replaceMode(-1, pi => {
 			pi.on("session_start", () => {
 				pi.setTodoProjection("startup-projection", [
 					{
@@ -120,8 +129,8 @@ describe("InteractiveMode todo HUD persistence", () => {
 		expect(renderTodos(mode)).toContain("Startup task");
 	});
 
-	it("clears closed todos from the panel instantly without mutating session history", async () => {
-		await createMode(0);
+	it("clears closed todos from the panel instantly without mutating session history", () => {
+		setTodoClearDelay(0);
 		const phases: TodoPhase[] = [
 			{
 				name: "Implementation",
@@ -140,16 +149,58 @@ describe("InteractiveMode todo HUD persistence", () => {
 		expect(session.getTodoPhases()).toEqual(phases);
 	});
 
-	it("leaves closed todos visible when auto-clear is disabled", async () => {
-		await createMode(-1);
+	/**
+	 * Auto-clear used to fire on any list holding a closed task, so a plan the
+	 * agent was mid-way through had its finished tasks deleted from the HUD's
+	 * copy: the phase counter reset, the checked row vanished, and the stage
+	 * renumbered — the panel reported no progress at all until the next `todo`
+	 * call restored the real snapshot. It may only fire on a settled list.
+	 */
+	const unfinishedPlan = (): TodoPhase[] => [
+		{
+			name: "Implementation",
+			tasks: [
+				{ content: "done task", status: "completed" },
+				{ content: "abandoned task", status: "abandoned" },
+				{ content: "current task", status: "in_progress" },
+			],
+		},
+	];
+
+	it("keeps an unfinished plan's progress when the auto-clear delay elapses", () => {
+		setTodoClearDelay(1);
+		vi.useFakeTimers();
+
+		mode.setTodos(unfinishedPlan());
+		vi.advanceTimersByTime(60_000);
+
+		const rendered = renderTodos(mode);
+		// Progress counts every closed task, abandoned included: the walking
+		// viewport hides both, so the counter is the only signal they existed.
+		expect(rendered).toContain("2/3");
+		expect(rendered).toContain("current task");
+	});
+
+	it("keeps an unfinished plan's progress when auto-clear is instant", () => {
+		setTodoClearDelay(0);
+
+		mode.setTodos(unfinishedPlan());
+
+		const rendered = renderTodos(mode);
+		expect(rendered).toContain("2/3");
+		expect(rendered).toContain("current task");
+	});
+
+	it("leaves closed todos visible when auto-clear is disabled", () => {
+		setTodoClearDelay(-1);
 
 		mode.setTodos([{ name: "Implementation", tasks: [{ content: "done task", status: "completed" }] }]);
 
 		expect(renderTodos(mode)).toContain("done task");
 	});
 
-	it("clears closed todos after the configured delay", async () => {
-		await createMode(1);
+	it("clears closed todos after the configured delay", () => {
+		setTodoClearDelay(1);
 		vi.useFakeTimers();
 
 		mode.setTodos([{ name: "Implementation", tasks: [{ content: "done task", status: "completed" }] }]);
@@ -162,8 +213,8 @@ describe("InteractiveMode todo HUD persistence", () => {
 		expect(renderTodos(mode)).not.toContain("done task");
 	});
 
-	it("keeps the anchored todo panel in the live region while visible", async () => {
-		await createMode(-1);
+	it("keeps the anchored todo panel in the live region while visible", () => {
+		setTodoClearDelay(-1);
 
 		mode.setTodos([{ name: "Implementation", tasks: [{ content: "pending task", status: "pending" }] }]);
 		const liveRegion = mode.todoContainer as unknown as NativeScrollbackLiveRegion;
@@ -174,7 +225,7 @@ describe("InteractiveMode todo HUD persistence", () => {
 	});
 
 	it("renders projection changes from the session focused through Agent Hub", async () => {
-		await createMode(-1);
+		await replaceMode(-1);
 		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
 		session.setTodoPhases([
 			{ name: "Main native phase", tasks: [{ content: "Main native task", status: "in_progress" }] },
@@ -242,7 +293,7 @@ describe("InteractiveMode todo HUD persistence", () => {
 	});
 
 	it("never persists focused-session todos into the main session during reconciliation", async () => {
-		await createMode(-1);
+		await replaceMode(-1);
 		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
 		session.setTodoPhases([{ name: "Main", tasks: [{ content: "Keep main untouched", status: "pending" }] }]);
 		await mode.init();
@@ -298,7 +349,8 @@ describe("InteractiveMode todo HUD persistence", () => {
 	});
 
 	it("marks todos complete when subagent reconciliation reports a finished agent", async () => {
-		await createMode(-1);
+		await replaceMode();
+		setTodoClearDelay(-1);
 		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
 		session.setTodoPhases([
 			{ name: "Implementation", tasks: [{ content: "Fix review comments", status: "pending" }] },
@@ -323,7 +375,8 @@ describe("InteractiveMode todo HUD persistence", () => {
 	});
 
 	it("completes a blocked todo when the detached subagent it waits on finishes", async () => {
-		await createMode(-1);
+		await replaceMode();
+		setTodoClearDelay(-1);
 		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
 		// A todo blocked while waiting on a detached subagent. Blocked todos are
 		// excluded from the stop reminder, so if reconciliation skipped them this
@@ -363,9 +416,6 @@ describe("InteractiveMode todo HUD anchor", () => {
 
 	beforeAll(async () => {
 		await initTheme();
-	});
-
-	beforeEach(async () => {
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-todo-hud-");
 		await Settings.init({ inMemory: true, cwd: tempDir.path() });
@@ -384,13 +434,17 @@ describe("InteractiveMode todo HUD anchor", () => {
 		mode = new InteractiveMode(session, "test");
 	});
 
-	afterEach(async () => {
+	afterEach(() => {
+		mode.setTodos([]);
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	afterAll(async () => {
 		mode?.stop();
 		await session?.dispose();
 		authStorage?.close();
 		tempDir?.removeSync();
-		vi.useRealTimers();
-		vi.restoreAllMocks();
 		resetSettingsForTest();
 	});
 
@@ -421,13 +475,15 @@ describe("InteractiveMode todo HUD anchor", () => {
 		const root = lines.find(line => line.includes("Todos"));
 		expect(root).toContain("1/2");
 		// Active stage: highlighted header with its own task progress, expanded as a
-		// connector tree; the completed task slid out of the open-task window.
+		// connector tree; the just-completed task stays as the lead row so progress
+		// is visible while the stage still has open work.
 		expect(lines.some(line => line.includes("I. Foundation") && line.includes("1/3"))).toBe(true);
 		const secondLine = lines.find(line => line.includes("second task"));
 		expect(secondLine).toContain(theme.tree.branch);
 		expect(secondLine).toContain(theme.checkbox.unchecked);
 		expect(lines.some(line => line.includes("third task"))).toBe(true);
-		expect(lines.some(line => line.includes("first task"))).toBe(false);
+		const firstLine = lines.find(line => line.includes("first task"));
+		expect(firstLine).toContain(theme.checkbox.checked);
 		// Upcoming stage: header with its own progress, but collapsed (no task rows).
 		expect(lines.some(line => line.includes("II. Verification") && line.includes("0/1"))).toBe(true);
 		expect(lines.some(line => line.includes("run tests"))).toBe(false);

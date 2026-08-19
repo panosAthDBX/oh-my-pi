@@ -23,6 +23,7 @@ import {
 	matchesKey,
 	PtySession,
 	parseKey,
+	pdfToMarkdown,
 	summarizeCode,
 	supportsLanguage,
 	truncateToWidth,
@@ -85,6 +86,30 @@ async function createFifo(fifoPath: string) {
 	}
 
 	throw new Error(await new Response(process.stderr).text());
+}
+
+function textPdf(text: string): Uint8Array {
+	const stream = `BT /F1 12 Tf 72 720 Td (${text}) Tj ET`;
+	const objects = [
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+		`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+	];
+	let document = "%PDF-1.4\n";
+	const offsets: number[] = [];
+	for (const [index, object] of objects.entries()) {
+		offsets.push(document.length);
+		document += `${index + 1} 0 obj\n${object}\nendobj\n`;
+	}
+	const xrefOffset = document.length;
+	document += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+	for (const offset of offsets) {
+		document += `${offset.toString().padStart(10, "0")} 00000 n \n`;
+	}
+	document += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+	return Buffer.from(document);
 }
 
 describe("pi-natives", () => {
@@ -640,7 +665,16 @@ describe("pi-natives", () => {
 			expect(callbackError).toBeNull();
 			expect(result.exitCode).toBe(0);
 			expect(result.timedOut).toBeFalse();
-			expect(JSON.parse(output.trim())).toEqual(expected);
+			// ConPTY interleaves terminal negotiation with the child's own bytes
+			// (`ESC[6n`, SGR reset, an OSC 0 title set, cursor show), so strip the
+			// escape sequences before parsing the payload. The OSC body match is
+			// non-greedy: `[^\u0007]` also matches ESC, so a greedy run would eat
+			// past an ST (`ESC \`) terminator to the last one in the buffer,
+			// over-stripping everything between two ST-terminated OSCs.
+			const payload = output
+				.replace(/\u001b\][^\u0007]*?(?:\u0007|\u001b\\)|\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+				.trim();
+			expect(JSON.parse(payload)).toEqual(expected);
 		});
 
 		it("reports the child PID as soon as the PTY process starts", async () => {
@@ -752,6 +786,19 @@ describe("pi-natives", () => {
 
 			await Bun.sleep(600);
 			expect(await Bun.file(markerPath).exists()).toBe(false);
+		});
+	});
+
+	describe("pdfToMarkdown", () => {
+		it("isolates blocking conversion from later JavaScript buffer mutation", async () => {
+			const input = textPdf("Copied PDF bytes");
+			const conversion = pdfToMarkdown(input);
+			input.fill(0);
+
+			const result = await conversion;
+
+			expect(result.pageCount).toBe(1);
+			expect(result.markdown).toContain("Copied PDF bytes");
 		});
 	});
 	describe("htmlToMarkdown", () => {

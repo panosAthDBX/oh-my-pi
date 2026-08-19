@@ -96,6 +96,32 @@ describe("multiselect settings (array-of-enum)", () => {
 		expect(menu).toContain(secondChoice!.label);
 	});
 
+	it("hides excluded providers from the web search order row summary", () => {
+		const comp = createSelector();
+		settings.set("providers.webSearchOrder", [firstChoice!.value, secondChoice!.value]);
+		settings.set("providers.webSearchExclude", [firstChoice!.value]);
+		for (const ch of "web search provider order") comp.handleInput(ch);
+
+		const row = Bun.stripANSI(comp.render(120).join("\n"))
+			.split("\n")
+			.find(line => line.includes("Web Search Provider Order"));
+		expect(row).not.toContain(firstChoice!.label);
+		expect(row).toContain(secondChoice!.label);
+	});
+
+	it("shows the default web search order when every configured provider is excluded", () => {
+		const comp = createSelector();
+		settings.set("providers.webSearchOrder", [firstChoice!.value]);
+		settings.set("providers.webSearchExclude", [firstChoice!.value]);
+		for (const ch of "web search provider order") comp.handleInput(ch);
+
+		const row = Bun.stripANSI(comp.render(120).join("\n"))
+			.split("\n")
+			.find(line => line.includes("Web Search Provider Order"));
+		expect(row).not.toContain(firstChoice!.label);
+		expect(row).toContain("default");
+	});
+
 	it("splices the hovered option into the pressed digit's position", () => {
 		const [a, b, c] = SEARCH_PROVIDER_CHOICES;
 		const comp = createSelector();

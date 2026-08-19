@@ -7,6 +7,7 @@
 import * as path from "node:path";
 import * as url from "node:url";
 import { isDefinitiveOAuthFailure, type TSchema } from "@oh-my-pi/pi-ai";
+import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { SourceMeta } from "../capability/types";
 import { resolveConfigValue } from "../config/resolve-config-value";
@@ -30,13 +31,15 @@ import { type LoadMCPConfigsResult, loadAllMCPConfigs, validateServerConfig } fr
 import {
 	lookupMcpOAuthCredential,
 	type MCPOAuthCredentialLookup,
+	refreshManagedMcpOAuthCredential,
 	selectMcpOAuthRefreshMaterial,
 } from "./oauth-credentials";
-import { type MCPStoredOAuthCredential, refreshMCPOAuthToken } from "./oauth-flow";
+import type { MCPStoredOAuthCredential } from "./oauth-flow";
 import type { McpConnectionStatusEvent } from "./startup-events";
 import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
+import { setGeneratedHeader } from "./transports/header-policy";
 import type {
 	MCPAuthChallenge,
 	MCPGetPromptResult,
@@ -72,6 +75,12 @@ type TrackedPromise<T> = {
 };
 
 const STARTUP_TIMEOUT_MS = 250;
+
+function createMcpStartupFailure(serverName: string, error: string, source?: SourceMeta): McpConnectionStatusEvent {
+	return source
+		? { type: "failed", serverName, error, sourcePath: source.path }
+		: { type: "failed", serverName, error };
+}
 
 /**
  * Per-server reconnect-storm circuit breaker.
@@ -474,6 +483,7 @@ export class MCPManager {
 			// Save config early so reconnection works even if the initial connect times out
 			// and falls back to cached/deferred tools.
 			this.#serverConfigs.set(name, config);
+			const connectionEpoch = this.#epoch;
 
 			// Resolve auth config before connecting, but do so per-server in parallel.
 			const connectionPromise = (async () => {
@@ -487,18 +497,23 @@ export class MCPManager {
 					},
 				});
 			})().then(
-				connection => {
+				async connection => {
 					// Store original config (without resolved tokens) to keep
 					// cache keys stable and avoid leaking rotating credentials.
 					connection.config = config;
-					this.#serverConfigs.set(name, config);
 					if (sources[name]) {
 						connection._source = sources[name];
 					}
-					if (this.#pendingConnections.get(name) === connectionPromise) {
-						this.#pendingConnections.delete(name);
-						this.#connections.set(name, connection);
+
+					if (this.#epoch !== connectionEpoch || this.#pendingConnections.get(name) !== connectionPromise) {
+						this.#detachConnection(name, connection);
+						void disconnectServer(connection).catch(() => {});
+						throw new Error(`Server "${name}" was disconnected during initial connection`);
 					}
+
+					this.#pendingConnections.delete(name);
+					this.#connections.set(name, connection);
+					this.#serverConfigs.set(name, config);
 
 					// Wire auth refresh for HTTP-like transports so 401s trigger token refresh.
 					// Gate on a resolvable managed credential, not on the auth block:
@@ -536,8 +551,19 @@ export class MCPManager {
 			this.#pendingConnections.set(name, connectionPromise);
 
 			const toolsPromise = connectionPromise.then(async connection => {
-				const serverTools = await listTools(connection);
-				return { connection, serverTools };
+				try {
+					const serverTools = await listTools(connection);
+					return { connection, serverTools };
+				} catch (error) {
+					// Detach and delete synchronously, then close in the background:
+					// awaiting a slow HTTP close (session DELETE) here would keep
+					// toolsPromise pending past the startup race, so connectServers
+					// would return with no error while #pendingToolLoads stayed set
+					// and future connects for this server were skipped.
+					this.#detachConnection(name, connection);
+					void disconnectServer(connection).catch(() => {});
+					throw error;
+				}
 			});
 			this.#pendingToolLoads.set(name, toolsPromise);
 
@@ -562,7 +588,7 @@ export class MCPManager {
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
 					this.#pendingToolLoads.delete(name);
 					const message = error instanceof Error ? error.message : String(error);
-					onStatus?.({ type: "failed", serverName: name, error: message });
+					onStatus?.(createMcpStartupFailure(name, message, sources[name]));
 					if (!allowBackgroundLogging || reportedErrors.has(name)) return;
 					logger.error("MCP tool load failed", { path: `mcp:${name}`, error: message });
 				});
@@ -572,7 +598,7 @@ export class MCPManager {
 		if (statusServerNames.length > 0 && onStatus) {
 			onStatus({ type: "connecting", serverNames: statusServerNames });
 			for (const { name, message } of validationFailures) {
-				onStatus({ type: "failed", serverName: name, error: message });
+				onStatus(createMcpStartupFailure(name, message, sources[name]));
 			}
 		}
 
@@ -854,6 +880,34 @@ export class MCPManager {
 	}
 
 	/**
+	 * Drop a connection from the active map and detach its lifecycle hooks.
+	 *
+	 * Synchronous and identity-guarded: only removes the entry when it is still
+	 * the connection registered under `name`, so a stale cleanup never evicts a
+	 * newer connection for the same server. Detaching `onClose` first prevents
+	 * the transport's own `close()` from re-arming reconnect.
+	 */
+	#detachConnection(name: string, connection: MCPServerConnection): void {
+		connection.transport.onClose = undefined;
+		if (this.#connections.get(name) === connection) {
+			this.#connections.delete(name);
+		}
+	}
+
+	/**
+	 * Detach a connection and await its transport close.
+	 *
+	 * Use only where blocking on the close is acceptable (owned disconnects,
+	 * dispose). On reject-fast paths detach synchronously and close in the
+	 * background so a slow `close()` (HTTP session DELETE) cannot delay the
+	 * rejection — see the `tools/list` failure handler in `connectServers`.
+	 */
+	async #discardConnection(name: string, connection: MCPServerConnection): Promise<void> {
+		this.#detachConnection(name, connection);
+		await disconnectServer(connection);
+	}
+
+	/**
 	 * Disconnect from a specific server.
 	 */
 	async disconnectServer(name: string): Promise<void> {
@@ -874,10 +928,7 @@ export class MCPManager {
 		this.#subscribedResources.delete(name);
 
 		if (connection) {
-			// Detach onClose to prevent spurious reconnect from close()
-			connection.transport.onClose = undefined;
-			await disconnectServer(connection);
-			this.#connections.delete(name);
+			await this.#discardConnection(name, connection);
 		}
 
 		// Remove tools from this server and notify consumers
@@ -896,11 +947,7 @@ export class MCPManager {
 		// Invalidate any in-flight reconnection attempts that outlive this call.
 		// They captured the old epoch; after increment they'll detect staleness.
 		this.#epoch++;
-		// Detach onClose before closing to prevent spurious reconnect attempts
-		for (const conn of this.#connections.values()) {
-			conn.transport.onClose = undefined;
-		}
-		const promises = Array.from(this.#connections.values()).map(conn => disconnectServer(conn));
+		const promises = Array.from(this.#connections, ([name, connection]) => this.#discardConnection(name, connection));
 		await Promise.allSettled(promises);
 
 		this.#pendingConnections.clear();
@@ -909,7 +956,6 @@ export class MCPManager {
 		this.#pendingResourceRefresh.clear();
 		this.#sources.clear();
 		this.#serverConfigs.clear();
-		this.#connections.clear();
 		this.#tools = [];
 		this.#subscribedResources.clear();
 		this.#reconnectHistory.clear();
@@ -977,9 +1023,7 @@ export class MCPManager {
 			// transport's own `close()` cannot re-arm this path.
 			const stale = this.#connections.get(name);
 			if (stale) {
-				stale.transport.onClose = undefined;
-				void stale.transport.close().catch(() => {});
-				this.#connections.delete(name);
+				void this.#discardConnection(name, stale).catch(() => {});
 			}
 			this.#pendingConnections.delete(name);
 			this.#pendingToolLoads.delete(name);
@@ -1021,10 +1065,7 @@ export class MCPManager {
 		// reconnect loop by that amount on every server restart.
 		const reconnectEpoch = this.#epoch;
 		if (oldConnection) {
-			// Detach onClose to prevent re-entrant reconnect from the close itself
-			oldConnection.transport.onClose = undefined;
-			void oldConnection.transport.close().catch(() => {});
-			this.#connections.delete(name);
+			void this.#discardConnection(name, oldConnection).catch(() => {});
 		}
 		this.#pendingConnections.delete(name);
 		this.#pendingToolLoads.delete(name);
@@ -1097,7 +1138,8 @@ export class MCPManager {
 		// Bail out if the server was disconnected or the manager was reset
 		// while we were connecting (e.g. /mcp reload called disconnectAll).
 		if (!this.#serverConfigs.has(name) || this.#epoch !== reconnectEpoch) {
-			await connection.transport.close().catch(() => {});
+			this.#detachConnection(name, connection);
+			void disconnectServer(connection).catch(() => {});
 			throw new Error(`Server "${name}" was disconnected during reconnection`);
 		}
 
@@ -1128,10 +1170,10 @@ export class MCPManager {
 			void this.#loadServerResourcesAndPrompts(name, connection);
 			return connection;
 		} catch (error) {
-			// Clean up the connection to avoid zombie transports
-			connection.transport.onClose = undefined;
-			await connection.transport.close().catch(() => {});
-			this.#connections.delete(name);
+			// Detach synchronously and close in the background so a slow close
+			// cannot delay the rejection (and the retry backoff that follows).
+			this.#detachConnection(name, connection);
+			void disconnectServer(connection).catch(() => {});
 			throw error;
 		}
 	}
@@ -1365,6 +1407,36 @@ export class MCPManager {
 	}
 
 	/**
+	 * Refresh a broker-redacted MCP OAuth credential through the auth-broker.
+	 *
+	 * When running in broker mode the client only ever holds the redacted
+	 * refresh sentinel; the real refresh token lives on the broker. Delegating
+	 * to {@link AuthStorage.forceRefreshCredentialById} makes the broker run the
+	 * `refresh_token` grant and return a fresh access token, which the client
+	 * uses while keeping {@link REMOTE_REFRESH_SENTINEL} in the refresh slot.
+	 */
+	async #refreshBrokeredMcpCredential(credentialId: string, signal?: AbortSignal): Promise<OAuthCredentials> {
+		const storage = this.#authStorage;
+		if (!storage) throw new Error("MCP OAuth broker refresh requires an auth storage");
+		const row = storage.listStoredCredentials(credentialId).find(entry => entry.credential.type === "oauth");
+		if (!row) throw new Error(`No broker credential row for ${credentialId}`);
+		const entry = await storage.forceRefreshCredentialById(row.id, signal);
+		if (entry.credential.type !== "oauth") {
+			throw new Error(`Broker returned non-OAuth credential for ${credentialId}`);
+		}
+		const refreshed = entry.credential;
+		return {
+			access: refreshed.access,
+			refresh: REMOTE_REFRESH_SENTINEL,
+			expires: refreshed.expires,
+			accountId: refreshed.accountId,
+			email: refreshed.email,
+			projectId: refreshed.projectId,
+			enterpriseUrl: refreshed.enterpriseUrl,
+		};
+	}
+
+	/**
 	 * Resolve OAuth credentials and shell commands in config.
 	 * `oauth: false` skips credential injection (reauth's unauthenticated probe);
 	 * `forceRefresh` bypasses the expiry buffer (401/403 auth-error hook).
@@ -1395,24 +1467,15 @@ export class MCPManager {
 							return Boolean(current.refresh && material?.tokenUrl);
 						},
 						refresh: (current, signal) => {
+							// Broker-backed credentials redact the refresh token
+							// (REMOTE_REFRESH_SENTINEL); the broker holds the real one, so
+							// route the refresh through it instead of failing locally.
 							if (current.refresh === REMOTE_REFRESH_SENTINEL) {
-								throw new Error("MCP OAuth refresh token is broker-redacted; local refresh is unavailable");
+								return this.#refreshBrokeredMcpCredential(credentialId, signal);
 							}
-							const material = selectMcpOAuthRefreshMaterial(current, auth);
-							const tokenUrl = material?.tokenUrl;
-							if (!current.refresh || !tokenUrl) {
-								throw new Error("MCP OAuth credential is missing refresh material");
-							}
-							const clientId = material?.clientId;
-							const clientSecret = material?.clientSecret;
-							const authorizationUrl =
-								material && "authorizationUrl" in material ? material.authorizationUrl : undefined;
-							const resourceIsFallback =
-								!material?.resource && (config.type === "http" || config.type === "sse") && Boolean(config.url);
-							const resource = material?.resource ?? (resourceIsFallback ? config.url : undefined);
-							return refreshMCPOAuthToken(tokenUrl, current.refresh, clientId, clientSecret, resource, {
-								authorizationUrl,
-								stripSameOriginResource: resourceIsFallback,
+							return refreshManagedMcpOAuthCredential(current, {
+								serverUrl: config.type === "http" || config.type === "sse" ? config.url : undefined,
+								auth,
 								signal,
 							});
 						},
@@ -1440,10 +1503,8 @@ export class MCPManager {
 							isDefinitiveOAuthFailure(error instanceof Error ? error.message : String(error)),
 						disabledCause: error =>
 							`oauth refresh failed: ${error instanceof Error ? error.message : String(error)}`,
-						keepCredentialOnRefreshFailure: error =>
-							!(error instanceof Error && error.message.includes("broker-redacted")),
+						keepCredentialOnRefreshFailure: true,
 						onRefreshFailure: refreshError => {
-							if (refreshError instanceof Error && refreshError.message.includes("broker-redacted")) return;
 							logger.warn("MCP OAuth refresh failed, using existing token", {
 								credentialId,
 								error: refreshError,
@@ -1458,13 +1519,11 @@ export class MCPManager {
 
 				if (credential) {
 					if (resolved.type === "http" || resolved.type === "sse") {
-						resolved = {
-							...resolved,
-							headers: {
-								...resolved.headers,
-								Authorization: `Bearer ${credential.access}`,
-							},
-						};
+						// Client-generated authorization wins over any configured header
+						// with the same case-insensitive name (Agent Plugins §7.2.1).
+						const headers = { ...resolved.headers };
+						setGeneratedHeader(headers, "Authorization", `Bearer ${credential.access}`);
+						resolved = { ...resolved, headers };
 					} else {
 						resolved = {
 							...resolved,
@@ -1481,7 +1540,9 @@ export class MCPManager {
 		}
 
 		if (resolved.type !== "http" && resolved.type !== "sse") {
-			if (resolved.env) {
+			// Literal env values (Agent Plugins §§4.1/9.2) are opaque package data:
+			// no env-name lookup, no `!command` execution, no dropping empty values.
+			if (resolved.env && resolved.envPolicy !== "literal") {
 				const nextEnv: Record<string, string> = {};
 				for (const [key, value] of Object.entries(resolved.env)) {
 					const resolvedValue = await resolveConfigValue(value);
@@ -1490,7 +1551,9 @@ export class MCPManager {
 				resolved = { ...resolved, env: nextEnv };
 			}
 		} else {
-			if (resolved.headers) {
+			// Origin-locked servers (Agent Plugins §9.2) carry literal header
+			// values: no placeholder or environment-variable expansion.
+			if (resolved.headers && resolved.headerPolicy !== "origin-locked") {
 				const nextHeaders: Record<string, string> = {};
 				for (const [key, value] of Object.entries(resolved.headers)) {
 					const resolvedValue = await resolveConfigValue(value);

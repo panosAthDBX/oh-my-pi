@@ -5,7 +5,7 @@ import type {
 	ToolCallContent,
 	ToolCallLocation,
 	ToolKind,
-} from "@agentclientprotocol/sdk";
+} from "@oh-my-pi/pi-utils/acp";
 import type { NamespacedTodoProjection, TodoProjectionStatus } from "../../extensibility/extensions/todo-projection";
 import { parseXdUrl } from "../../internal-urls/xd-protocol";
 import type { AgentSessionEvent } from "../../session/agent-session";

@@ -1,5 +1,4 @@
 export { type Type, type } from "@oh-my-pi/omptype";
-export { type ZodType, z } from "zod/v4";
 export * from "./api-registry";
 export type * from "./auth-broker";
 export type { AuthGatewayBootOptions, ModelResolver } from "./auth-gateway/server";
@@ -7,6 +6,7 @@ export * from "./auth-gateway/types";
 export * from "./auth-retry";
 export * from "./auth-storage";
 export * from "./error/rate-limit";
+export * from "./oneshot-retry";
 export * from "./provider-details";
 export * from "./providers/anthropic";
 export * from "./providers/anthropic-client";

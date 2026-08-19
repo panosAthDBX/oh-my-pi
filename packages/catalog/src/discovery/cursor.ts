@@ -29,6 +29,15 @@ const CURSOR_MAX_MODE_1M_ID_PATTERN = /claude|gemini/;
 const CURSOR_KIMI_K3_BARE_ID_PATTERN = /(^|\/)k3$/i;
 
 /**
+ * Versioned Cursor Grok ids (`cursor-grok-4.5`, `cursor-grok-4.6-high`) are
+ * reasoning models whose effort is carried in the per-tier sibling id.
+ * `GetUsableModels` ships no `thinkingDetails` and the bundled references read
+ * `reasoning: false`, so classification falls back to the id. The non-reasoning
+ * `grok-code-*` coding models lack the version digit and stay out.
+ */
+const CURSOR_GROK_REASONING_ID_PATTERN = /^cursor-grok-\d/i;
+
+/**
  * Model-id families whose native catalogs (anthropic, openai/openai-codex,
  * google) are multimodal. Cursor-only or text-only families (`composer-*`,
  * `grok-code-*`) intentionally stay outside this pattern.
@@ -297,7 +306,11 @@ function normalizeCursorModel(
 
 	const name = pickModelDisplayName(details, id);
 	const reference = references.get(id);
-	const reasoning = isKimiK3ModelId(id) || Boolean(details.thinkingDetails) || reference?.reasoning === true;
+	const reasoning =
+		isKimiK3ModelId(id) ||
+		CURSOR_GROK_REASONING_ID_PATTERN.test(id) ||
+		Boolean(details.thinkingDetails) ||
+		reference?.reasoning === true;
 
 	if (reference) {
 		return {

@@ -30,10 +30,15 @@ function yieldEmittingSession(
 ): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	let activeTools = initialTools;
+	// `servingModel` mirrors the real session: attribution names the model that
+	// produced output, so a prewalk hand-off moves it along with `model`.
+	const serving = (model: Model | undefined): { selector: string; isFallback: boolean } | undefined =>
+		model ? { selector: `${model.provider}/${model.id}`, isFallback: false } : undefined;
 	const session = {
 		state: { messages: [] },
 		agent: { state: { systemPrompt: ["test"] } },
 		model: modelSwitch?.from,
+		servingModel: serving(modelSwitch?.from),
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
 		getTodoProjections: () => [],
@@ -53,6 +58,7 @@ function yieldEmittingSession(
 		prompt: async (_text: string, _options?: PromptOptions) => {
 			if (modelSwitch) {
 				session.model = modelSwitch.to;
+				session.servingModel = serving(modelSwitch.to);
 				for (const listener of listeners) {
 					listener({ type: "notice", level: "info", message: "Prewalk switched", source: "prewalk" });
 				}
@@ -75,6 +81,7 @@ function yieldEmittingSession(
 		abort: async () => {},
 		dispose: async () => {},
 		setIrcWakeTurnObserver: () => {},
+		subscribeRunState: () => () => {},
 	};
 	return session as unknown as AgentSession;
 }

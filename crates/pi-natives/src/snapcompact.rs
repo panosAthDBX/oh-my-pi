@@ -1354,6 +1354,35 @@ mod tests {
 	}
 
 	#[test]
+	fn digit_zero_is_disambiguated_from_letter_o() {
+		// Regression for #8713: the default snapcompact bitmap fonts drew digit
+		// `0` and letter `O` as bare ovals that OCR back ambiguously, corrupting
+		// compacted identifiers. Each `0` now carries an interior slash/bar the
+		// `O` lacks, so it inks strictly more of the glyph's vertical middle even
+		// though it is the narrower oval (its wider top/bottom arcs sit outside
+		// the sampled band). unscii-8 already shipped a slashed zero.
+		for font in [&*FONT_5X8, &*FONT_6X12, &*FONT_8X13] {
+			let (cw, ch) = (font.cell_w, font.cell_h);
+			let width = cw * 2;
+			let grid = Grid { cols: 2, rows: 1, repeat: 1, cell_w: cw, cell_h: ch };
+			let px = render_bitmap("0O", width, ch, font, &grid, true);
+			let band = ch / 4..ch - ch / 4;
+			let mid_ink = |col0: usize| -> usize {
+				band
+					.clone()
+					.flat_map(|y| (col0..col0 + cw).map(move |x| (x, y)))
+					.filter(|&(x, y)| px[y * width + x] != 0)
+					.count()
+			};
+			let (zero, oh) = (mid_ink(0), mid_ink(cw));
+			assert!(
+				zero > oh,
+				"cell {cw}x{ch}: zero must ink its middle more than O (zero={zero}, O={oh})"
+			);
+		}
+	}
+
+	#[test]
 	fn bitmap_inks_sentences_and_caps_capacity() {
 		// 40px -> 8 cols x 5 rows = 40 cells (5x8 font).
 		let grid = Grid { cols: 8, rows: 5, repeat: 1, cell_w: 5, cell_h: 8 };

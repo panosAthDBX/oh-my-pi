@@ -9,6 +9,7 @@ import {
 } from "./classes";
 import {
 	isAccountScopedCapText,
+	isDashScopeTokenLimitText,
 	isOpaqueStatusBody,
 	isUsageLimitStatus,
 	matchesUsageLimitText,
@@ -24,7 +25,10 @@ export const Flag = {
 	StaleResponsesItem: 0x0010_0000,
 	MalformedFunctionCall: 0x0020_0000,
 	ProviderFinishError: 0x0040_0000,
+	EmptyResponse: 0x0000_2000,
 	ContentBlocked: 0x0000_8000,
+	/** Account-scoped provider policy denial that may succeed with another credential. */
+	AccountPolicy: 0x0000_4000,
 	ContextOverflow: 0x0080_0000,
 	AuthFailed: 0x0100_0000,
 	SilentAbort: 0x0200_0000,
@@ -48,7 +52,9 @@ const KIND_MASK =
 	Flag.StaleResponsesItem |
 	Flag.MalformedFunctionCall |
 	Flag.ProviderFinishError |
+	Flag.EmptyResponse |
 	Flag.ContentBlocked |
+	Flag.AccountPolicy |
 	Flag.ContextOverflow |
 	Flag.AuthFailed |
 	Flag.SilentAbort |
@@ -59,7 +65,12 @@ const KIND_MASK =
 	Flag.OAuthExpiry;
 
 const RETRIABLE_KINDS =
-	Flag.Transient | Flag.UsageLimit | Flag.ThinkingLoop | Flag.StaleResponsesItem | Flag.ProviderFinishError;
+	Flag.Transient |
+	Flag.UsageLimit |
+	Flag.ThinkingLoop |
+	Flag.StaleResponsesItem |
+	Flag.ProviderFinishError |
+	Flag.EmptyResponse;
 
 const OVERFLOW_PATTERNS = [
 	/prompt is too long/i, // Anthropic
@@ -96,12 +107,44 @@ const TRANSIENT_ENVELOPE_PATTERN = /anthropic stream envelope error:/i;
 const TRANSIENT_ENVELOPE_BEFORE_START_PATTERN = /before message_start/i;
 export const STREAM_READ_ERROR_PATTERN = /stream[_ -]?read[_ -]?error/i;
 export const TRANSIENT_TRANSPORT_PATTERN =
-	/\b(?:no[_ -]?capacity|(?:high|peak)[ _-]?demand|(?:at|over|insufficient)[ _-]?capacity|capacity[ _-]?(?:exceeded|exhausted)|peak[ _-]?load)\b|overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|retry your request|network.?error|connection.?error|connection.?refused|unable.?to.?connect\.\s*is the computer able to access the url\?|other side closed|fetch failed|upstream.?connect|upstream.?request.?failed|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay|stream stall|no error details in response|HTTP2(?:StreamReset|RefusedStream|EnhanceYourCalm)|malformed.?function.?call/i;
+	/\b(?:no[_ -]?capacity|(?:high|peak)[ _-]?demand|(?:at|over|insufficient)[ _-]?capacity|capacity[ _-]?(?:exceeded|exhausted)|peak[ _-]?load)\b|overloaded|provider.?returned.?error|rate.?limit|too many requests|\b(?:429|500|502|503|504)\b|service.?unavailable|server.?error|internal.?error|retry your request|network.?error|connection.?error|connection.?refused|unable.?to.?connect\.\s*is the computer able to access the url\?|other side closed|fetch failed|upstream.?connect|upstream.?request.?failed|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay|stream stall|no error details in response|HTTP2(?:StreamReset|RefusedStream|EnhanceYourCalm)|nghttp2_(?:internal_error|refused_stream)|stream closed with error code nghttp2_(?:internal_error|refused_stream)|malformed.?function.?call/i;
 const AUTH_FAILURE_PATTERN =
 	/\b(?:401|403|unauthorized|forbidden|authentication|auth[_ ]?unavailable|no auth available|(?:invalid|no)[_ ]?api[_ ]?key)\b/i;
 const MALFORMED_FUNCTION_CALL_PATTERN = /\bmalformed.?function.?call\b/i;
 const PROVIDER_FINISH_ERROR_PATTERN = /\bProvider (?:returned error finish_reason|finish_reason:\s*error)\b/i;
+const EMPTY_RESPONSE_PATTERN = /\bthought-only response without final output\b/i;
 const CONTENT_FILTER_PATTERN = /\b(?:incomplete:\s*)?content_filter\b/i;
+const ACCOUNT_POLICY_PATTERN = /\bcyber_policy\b|trusted access for cyber/i;
+const CODEX_CHATGPT_ACCOUNT_MODEL_POLICY_PATTERN =
+	/\bThe ['"]([^'"\r\n]+)['"] model is not supported when using Codex with a ChatGPT account\./i;
+const CODEX_CHATGPT_ACCOUNT_MODEL_MAX_LENGTH = 256;
+
+function normalizeCodexChatGPTAccountPolicyModel(modelId: string | undefined): string | undefined {
+	if (typeof modelId !== "string") return undefined;
+	const separator = modelId.lastIndexOf("/");
+	const bareModelId = (separator === -1 ? modelId : modelId.slice(separator + 1)).trim().toLowerCase();
+	if (!bareModelId || bareModelId.length > CODEX_CHATGPT_ACCOUNT_MODEL_MAX_LENGTH || bareModelId.includes("\0")) {
+		return undefined;
+	}
+	return bareModelId;
+}
+
+function codexChatGPTAccountPolicyModelFromText(text: string): string | undefined {
+	const modelId = CODEX_CHATGPT_ACCOUNT_MODEL_POLICY_PATTERN.exec(text)?.[1]?.trim();
+	return normalizeCodexChatGPTAccountPolicyModel(modelId) === undefined ? undefined : modelId;
+}
+
+function isCodexChatGPTAccountPolicyText(
+	text: string,
+	provider: string | undefined,
+	modelId: string | undefined,
+): boolean {
+	if (provider !== "openai-codex") return false;
+	const deniedModel = codexChatGPTAccountPolicyModelFromText(text);
+	const deniedIdentity = normalizeCodexChatGPTAccountPolicyModel(deniedModel);
+	const requestedIdentity = normalizeCodexChatGPTAccountPolicyModel(modelId);
+	return deniedIdentity !== undefined && deniedIdentity === requestedIdentity;
+}
 const STALE_RESPONSE_ITEM_PATTERNS = [/\bItem with id ['"][^'"]+['"] not found\.?/i, /previous[ _]?response/i] as const;
 const STALE_RESPONSE_ITEM_DETAIL_PATTERN = /not[ _]?found|invalid|expired|stale|zero[ _-]?data[ _-]?retention/i;
 /**
@@ -113,17 +156,15 @@ const STALE_RESPONSE_ITEM_DETAIL_PATTERN = /not[ _]?found|invalid|expired|stale|
 export const LLAMA_CPP_TOOL_CALL_PARSE_PATTERN =
 	/failed to parse tool call arguments as json|\[json\.exception\.parse_error\.101\]/i;
 
-// Copilot fleet skew: HTTP 400 rejecting a model that `/models` advertised on
-// the very same host. Two codes appear in the wild — `model_not_supported`
-// (per-OAuth-client rollout gap) and `model_not_available_for_integrator`
-// (replicas whose integrator allowlist predates the model). Both flap
-// request-to-request, so a retry usually lands on a backend that has the model.
+// Copilot fleet skew: HTTP 400 `model_not_supported` can reject a model that
+// `/models` advertised on the same host when the request lands on a stale
+// replica. `model_not_available_for_integrator` is deliberately excluded:
+// GitHub also uses it for stable per-integrator entitlement denials and includes
+// that integrator's actionable `Available models` list in the response.
 const COPILOT_TRANSIENT_MODEL_CODES: Record<string, true> = {
 	model_not_supported: true,
-	model_not_available_for_integrator: true,
 };
-const COPILOT_MODEL_UNAVAILABLE_PATTERN =
-	/model_not_supported|model_not_available_for_integrator|not available for integrator/i;
+const COPILOT_TRANSIENT_MODEL_PATTERN = /model_not_supported/i;
 // Anthropic strict-tool grammar too large / schema too complex (400 invalid_request_error).
 // Feature-gated deployments (Azure Foundry, Baseten, …) reject `strict: true`
 // tools outright when the hosted model lacks structured outputs, e.g.
@@ -195,7 +236,9 @@ const ERROR_KIND_LABELS: readonly [Flag, string][] = [
 	[Flag.StaleResponsesItem, "stale-responses-item"],
 	[Flag.MalformedFunctionCall, "malformed-function-call"],
 	[Flag.ProviderFinishError, "provider-finish-error"],
+	[Flag.EmptyResponse, "empty-response"],
 	[Flag.ContentBlocked, "content-blocked"],
+	[Flag.AccountPolicy, "account-policy"],
 	[Flag.ContextOverflow, "context-overflow"],
 	[Flag.AuthFailed, "auth-failed"],
 	[Flag.SilentAbort, "silent-abort"],
@@ -331,13 +374,26 @@ function matchesOverflowText(text: string): boolean {
 	return OVERFLOW_PATTERNS.some(p => p.test(text)) || OVERFLOW_NO_BODY_PATTERN.test(text);
 }
 
-function classifyText(errorMessage: string | undefined, errorStatus: number | undefined, api?: Api): number {
+function classifyText(
+	errorMessage: string | undefined,
+	errorStatus: number | undefined,
+	api?: Api,
+	provider?: string,
+	modelId?: string,
+): number {
 	let kinds = 0;
 	if (errorMessage) {
 		if (matchesOverflowText(errorMessage)) kinds |= Flag.ContextOverflow;
 		if (isMalformedFunctionCallText(errorMessage)) kinds |= Flag.MalformedFunctionCall;
 		if (isProviderFinishErrorText(errorMessage)) kinds |= Flag.ProviderFinishError;
+		if (EMPTY_RESPONSE_PATTERN.test(errorMessage)) kinds |= Flag.EmptyResponse | Flag.Transient;
 		if (isContentBlockedText(errorMessage)) kinds |= Flag.ContentBlocked;
+		if (
+			ACCOUNT_POLICY_PATTERN.test(errorMessage) ||
+			isCodexChatGPTAccountPolicyText(errorMessage, provider, modelId)
+		) {
+			kinds |= Flag.AccountPolicy | Flag.ContentBlocked;
+		}
 		if (isAuthFailureText(errorMessage)) kinds |= Flag.AuthFailed;
 
 		const statusClean = errorStatus ? errorStatus : (status({ message: errorMessage }) ?? undefined);
@@ -377,8 +433,8 @@ function classifyText(errorMessage: string | undefined, errorStatus: number | un
 			kinds |= Flag.StaleResponsesItem;
 		}
 
-		// Copilot fleet-skew model rejection is transient.
-		if (statusClean === 400 && COPILOT_MODEL_UNAVAILABLE_PATTERN.test(cleanMessage)) kinds |= Flag.Transient;
+		// Copilot's `model_not_supported` fleet-skew rejection is transient.
+		if (statusClean === 400 && COPILOT_TRANSIENT_MODEL_PATTERN.test(cleanMessage)) kinds |= Flag.Transient;
 		if (matchesStrictToolsRejection(cleanMessage, statusClean)) kinds |= Flag.Grammar;
 		if (matchesFastModeUnsupported(cleanMessage, statusClean)) kinds |= Flag.FastModeUnsupported;
 	}
@@ -399,6 +455,9 @@ export function classify(error: unknown, api?: Api): number {
 
 			if ("errorId" in link && typeof (link as { errorId: unknown }).errorId === "number") {
 				kinds |= (link as { errorId: number }).errorId & KIND_MASK;
+			}
+			if ("code" in link && typeof link.code === "string" && ACCOUNT_POLICY_PATTERN.test(link.code)) {
+				kinds |= Flag.AccountPolicy | Flag.ContentBlocked;
 			}
 		}
 
@@ -424,7 +483,10 @@ export function classify(error: unknown, api?: Api): number {
 		} else if (link instanceof ProviderHttpError) {
 			let linkKinds = 0;
 			const { status: codeStatus, code } = link;
-			if (code === "usage_limit_reached" || code === "insufficient_quota") {
+			if (
+				code === "usage_limit_reached" ||
+				(code === "insufficient_quota" && !isDashScopeTokenLimitText(link.message))
+			) {
 				linkKinds |= Flag.UsageLimit;
 			}
 			if (code === "overloaded_error" || code === "rate_limit_error") {
@@ -477,6 +539,41 @@ export function isUsageLimit(error: unknown, api?: Api): boolean {
 	return is(classify(error, api), Flag.UsageLimit);
 }
 
+/** Whether an upstream rejection is an account-scoped policy denial worth retrying with a sibling credential. */
+export function isAccountPolicyError(error: unknown, api?: Api): boolean {
+	return is(classify(error, api), Flag.AccountPolicy);
+}
+
+/**
+ * Model id from Codex's exact ChatGPT-account entitlement denial. Generic
+ * unsupported-model invalid requests deliberately do not match.
+ */
+export function codexChatGPTAccountPolicyModel(error: unknown, depth = 0): string | undefined {
+	if (depth > 6) return undefined;
+	if (typeof error === "string") return codexChatGPTAccountPolicyModelFromText(error);
+	if (!error || typeof error !== "object") return undefined;
+	const errorMessage =
+		"errorMessage" in error && typeof error.errorMessage === "string" ? error.errorMessage : undefined;
+	const message = "message" in error && typeof error.message === "string" ? error.message : undefined;
+	const direct =
+		(errorMessage ? codexChatGPTAccountPolicyModelFromText(errorMessage) : undefined) ??
+		(message ? codexChatGPTAccountPolicyModelFromText(message) : undefined);
+	if (direct !== undefined) return direct;
+	return "cause" in error ? codexChatGPTAccountPolicyModel(error.cause, depth + 1) : undefined;
+}
+
+/** Whether the exact Codex entitlement denial applies to this provider and requested model. */
+export function isCodexChatGPTAccountPolicyError(
+	error: unknown,
+	provider: string,
+	modelId: string | undefined,
+): boolean {
+	const deniedModel = codexChatGPTAccountPolicyModel(error);
+	const deniedIdentity = normalizeCodexChatGPTAccountPolicyModel(deniedModel);
+	const requestedIdentity = normalizeCodexChatGPTAccountPolicyModel(modelId);
+	return provider === "openai-codex" && deniedIdentity !== undefined && deniedIdentity === requestedIdentity;
+}
+
 /**
  * Strict-tool rejection: grammar too large, schema too complex, or structured
  * outputs unsupported by the model/endpoint.
@@ -513,10 +610,10 @@ function providerErrorCode(error: object): string | undefined {
 }
 
 /**
- * GitHub Copilot 400 rejecting a model its own `/models` catalog advertises —
- * transient fleet skew, not a malformed request. Reads the structural `code`
- * through the SDK/body envelopes, then falls back to the stringified body both
- * SDK families put in `message` (shapes drift; the wire text does not).
+ * GitHub Copilot 400 `model_not_supported` response for a model advertised by
+ * `/models` — transient fleet skew, not a malformed request. Reads the
+ * structural `code` through the SDK/body envelopes, then falls back to the
+ * stringified body both SDK families put in `message`.
  */
 export function isCopilotTransientModelError(error: unknown): boolean {
 	if (!error || typeof error !== "object" || status(error) !== 400) return false;
@@ -525,18 +622,20 @@ export function isCopilotTransientModelError(error: unknown): boolean {
 	// prototype key (`__proto__`, `toString`, …) would otherwise read truthy.
 	if (code !== undefined && Object.hasOwn(COPILOT_TRANSIENT_MODEL_CODES, code)) return true;
 	const message: unknown = "message" in error ? error.message : undefined;
-	return typeof message === "string" && COPILOT_MODEL_UNAVAILABLE_PATTERN.test(message);
+	return typeof message === "string" && COPILOT_TRANSIENT_MODEL_PATTERN.test(message);
 }
 
 export function classifyMessage(message: {
 	api?: Api;
+	provider?: string;
+	model?: string;
 	errorId?: number;
 	errorMessage?: string;
 	errorStatus?: number;
 }): number {
 	const existingId = message.errorId;
 	const currentStatus = message.errorStatus ?? statusFromId(existingId);
-	const textId = classifyText(message.errorMessage, currentStatus, message.api);
+	const textId = classifyText(message.errorMessage, currentStatus, message.api, message.provider, message.model);
 
 	let kinds = ((existingId ?? 0) | textId) & KIND_MASK;
 	if (message.errorMessage && LLAMA_CPP_TOOL_CALL_PARSE_PATTERN.test(message.errorMessage)) {

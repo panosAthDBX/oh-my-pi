@@ -25,8 +25,13 @@ export interface AggregatedStats {
 	totalCacheReadTokens: number;
 	/** Total cache write tokens */
 	totalCacheWriteTokens: number;
-	/** Cache hit rate (0-1) */
+	/** Percentage of prompt input tokens served from cache (0-1). */
 	cacheRate: number;
+	/**
+	 * Prompt-input cost saved relative to billing the same tokens uncached
+	 * (0-1; negative when cache writes cost more than reads save).
+	 */
+	cacheSavings: number;
 	/** Total cost */
 	totalCost: number;
 	/** Total premium requests */
@@ -381,8 +386,9 @@ export interface UsageWindowSeries {
 	accountKey: string;
 	/** Email/account id when known, else the stable account key. */
 	accountLabel: string;
-	/** Groups the same limit window across accounts (window label or limit id). */
+	/** Groups the same limit window across accounts (the provider limit id). */
 	windowKey: string;
+	/** Human label of the limit (distinguishes same-duration windows). */
 	windowLabel: string;
 	points: UsageWindowPoint[];
 }
@@ -394,7 +400,9 @@ export interface UsageWindowSeries {
  */
 export interface ProviderWindowInsight {
 	provider: string;
+	/** Groups the same limit window across accounts (the provider limit id). */
 	windowKey: string;
+	/** Human label of the limit (distinguishes same-duration windows). */
 	windowLabel: string;
 	/** Accounts with at least one snapshot for this window in range. */
 	accounts: number;

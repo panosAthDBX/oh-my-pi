@@ -18,7 +18,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
-import { resolveAgentModelPatterns } from "../config/model-resolver";
+import { resolveAgentModelSelection } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
@@ -43,7 +43,7 @@ export type VibeCli = "fast" | "good";
  * CLI flavor → bundled agent type. This IS the model-tier mapping: `sonic`
  * carries `model: "@smol"` (the configured fast/low-latency role) and `task`
  * carries `model: "@task"` (inherits the session's strong model).
- * Resolution goes through {@link resolveAgentModelPatterns} exactly like a
+ * Resolution goes through {@link resolveAgentModelSelection} exactly like a
  * `task` spawn, so `task.agentModelOverrides` and model-role settings apply.
  */
 export const VIBE_CLI_AGENT: Record<VibeCli, string> = {
@@ -144,6 +144,8 @@ interface VibeRestoreCandidate {
 interface ResolvedVibeWorker {
 	agent: AgentDefinition;
 	modelOverride?: string | string[];
+	/** Pre-expansion role alias behind {@link modelOverride}, when the worker agent named one. */
+	modelRole?: string;
 }
 
 interface VibeTurn {
@@ -165,6 +167,8 @@ interface VibeRecord {
 	childSessionFile?: string;
 	agent: AgentDefinition;
 	modelOverride?: string | string[];
+	/** Pre-expansion role alias behind {@link modelOverride}, when the worker agent named one. */
+	modelRole?: string;
 	state: VibeSessionState;
 	createdAt: number;
 	lastActivityAt: number;
@@ -417,11 +421,17 @@ export class VibeSessionRegistry {
 	}
 
 	/**
-	 * Insert a bare worker record without the spawn/job machinery. Test-only —
-	 * lets {@link aggregateVibeWorkerTokensPerSecond} be exercised against a
-	 * fake roster + AgentRegistry session without driving a real turn.
+	 * Insert a bare worker record without the spawn machinery. Test-only —
+	 * lets focused runtime tests attach an optional synthetic in-flight job.
 	 */
-	registerRecordForTests(record: { id: string; cli?: VibeCli; ownerId: string; state?: VibeSessionState }): void {
+	registerRecordForTests(record: {
+		id: string;
+		cli?: VibeCli;
+		ownerId: string;
+		state?: VibeSessionState;
+		jobId?: string;
+	}): void {
+		const now = Date.now();
 		this.#records.set(record.id, {
 			id: record.id,
 			cli: record.cli ?? "fast",
@@ -430,8 +440,11 @@ export class VibeSessionRegistry {
 			parentSessionFile: null,
 			agent: getBundledAgent("sonic")!,
 			state: record.state ?? "running",
-			createdAt: Date.now(),
-			lastActivityAt: Date.now(),
+			createdAt: now,
+			lastActivityAt: now,
+			turn: record.jobId
+				? { jobId: record.jobId, message: "test turn", startedAt: now, trace: [], toolCount: 0 }
+				: undefined,
 			queue: [],
 			turnCount: 0,
 			killed: false,
@@ -490,16 +503,17 @@ export class VibeSessionRegistry {
 			throw new ToolError(`Bundled agent "${agentName}" for vibe cli "${cli}" is unavailable.`);
 		}
 		const agentModelOverrides = session.settings.get("task.agentModelOverrides");
-		return {
-			agent,
-			modelOverride: resolveAgentModelPatterns({
-				settingsOverride: agentModelOverrides[agentName],
-				agentModel: agent.model,
-				settings: session.settings,
-				activeModelPattern: session.getActiveModelString?.(),
-				fallbackModelPattern: session.getModelString?.(),
-			}),
-		};
+		// Same contract as the task spawn path: the expansion discards the role
+		// alias (`@task`, `@smol`), so patterns and role identity come from one
+		// call — the child's inherited retry-fallback chain is keyed off the role.
+		const { patterns, role } = resolveAgentModelSelection({
+			settingsOverride: agentModelOverrides[agentName],
+			agentModel: agent.model,
+			settings: session.settings,
+			activeModelPattern: session.getActiveModelString?.(),
+			fallbackModelPattern: session.getModelString?.(),
+		});
+		return { agent, modelOverride: patterns, modelRole: role };
 	}
 
 	async #appendLifecycleEvent(
@@ -890,7 +904,7 @@ export class VibeSessionRegistry {
 				existing.sessionFile === childSessionFile &&
 				(existing.status === "idle" || existing.status === "parked");
 			const blockedByCollision = Boolean(existing && !existingIsResumable);
-			const { agent, modelOverride } = this.#resolveWorker(session, spawn.cli);
+			const { agent, modelOverride, modelRole } = this.#resolveWorker(session, spawn.cli);
 			if (!existing) {
 				AgentRegistry.global().register({
 					id: spawn.id,
@@ -911,6 +925,7 @@ export class VibeSessionRegistry {
 				childSessionFile,
 				agent,
 				modelOverride,
+				modelRole,
 				state: "idle",
 				createdAt: spawn.createdAt,
 				lastActivityAt: candidate.lastActivityAt,
@@ -945,7 +960,7 @@ export class VibeSessionRegistry {
 			throw new ToolError("Vibe mode has exited; enter Vibe mode again before spawning a worker.");
 		}
 		const manager = this.#manager(session);
-		const { agent, modelOverride } = this.#resolveWorker(session, args.cli);
+		const { agent, modelOverride, modelRole } = this.#resolveWorker(session, args.cli);
 		if (!session.agentOutputManager) {
 			session.agentOutputManager = new AgentOutputManager(session.getArtifactsDir ?? (() => null));
 		}
@@ -969,6 +984,7 @@ export class VibeSessionRegistry {
 			childSessionFile,
 			agent,
 			modelOverride,
+			modelRole,
 			state: "starting",
 			createdAt,
 			lastActivityAt: createdAt,
@@ -1106,25 +1122,31 @@ export class VibeSessionRegistry {
 			if (job?.status === "running") runningJobs.push(job);
 		}
 
-		let waited = false;
+		let waitEndedByTimeout = false;
 		if (runningJobs.length > 0 && collectSettled().length === 0) {
-			waited = true;
 			const timeoutMs = Math.max(1, Math.trunc(args.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS));
 			const watchedJobIds = runningJobs.map(job => job.id);
 			manager.watchJobs(watchedJobIds);
-			const { promise: timeoutPromise, resolve: timeoutResolve } = Promise.withResolvers<void>();
-			const timeoutHandle = setTimeout(() => timeoutResolve(), timeoutMs);
-			const racePromises: Promise<unknown>[] = [...runningJobs.map(job => job.promise), timeoutPromise];
+			const { promise: timeoutPromise, resolve: timeoutResolve } = Promise.withResolvers<"timeout">();
+			const timeoutHandle = setTimeout(() => timeoutResolve("timeout"), timeoutMs);
+			const racePromises: Array<Promise<"settled" | "timeout" | "aborted">> = [
+				...runningJobs.map(job => job.promise.then(() => "settled" as const)),
+				timeoutPromise,
+			];
 			let abortCleanup: (() => void) | undefined;
 			if (args.signal) {
-				const { promise: abortPromise, resolve: abortResolve } = Promise.withResolvers<void>();
-				const onAbort = () => abortResolve();
-				args.signal.addEventListener("abort", onAbort, { once: true });
-				abortCleanup = () => args.signal?.removeEventListener("abort", onAbort);
+				const { promise: abortPromise, resolve: abortResolve } = Promise.withResolvers<"aborted">();
+				const onAbort = () => abortResolve("aborted");
+				if (args.signal.aborted) {
+					onAbort();
+				} else {
+					args.signal.addEventListener("abort", onAbort, { once: true });
+					abortCleanup = () => args.signal?.removeEventListener("abort", onAbort);
+				}
 				racePromises.push(abortPromise);
 			}
 			try {
-				await Promise.race(racePromises);
+				waitEndedByTimeout = (await Promise.race(racePromises)) === "timeout";
 			} finally {
 				manager.unwatchJobs(watchedJobIds);
 				clearTimeout(timeoutHandle);
@@ -1137,7 +1159,7 @@ export class VibeSessionRegistry {
 		// Current in-flight state, independent of the snapshot: a session whose
 		// watched turn settled may already be mid queued follow-up.
 		const stillRunning = watched.filter(record => record.turn !== undefined).map(record => record.id);
-		return { settled, stillRunning, timedOut: waited && settled.length === 0 };
+		return { settled, stillRunning, timedOut: waitEndedByTimeout && settled.length === 0 };
 	}
 
 	/** Detach one parent's process-local workers without tombstoning their persisted conversations. */
@@ -1418,6 +1440,7 @@ export class VibeSessionRegistry {
 			taskDepth: session.taskDepth ?? 0,
 			detached: true,
 			modelOverride: record.modelOverride,
+			modelRole: record.modelRole,
 			parentActiveModelPattern: session.getActiveModelString?.(),
 			thinkingLevel: record.agent.thinkingLevel,
 			sessionFile,

@@ -11,7 +11,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { loadSlashCommands } from "@oh-my-pi/pi-coding-agent/extensibility/slash-commands";
 import { discoverAgents } from "@oh-my-pi/pi-coding-agent/task/discovery";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import "@oh-my-pi/pi-coding-agent/discovery/claude-plugins";
 import { type MCPServer, mcpCapability } from "@oh-my-pi/pi-coding-agent/capability/mcp";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/capability/skill";
@@ -35,7 +35,6 @@ describe("parseClaudePluginsRegistry", () => {
 		});
 
 		const result = parseClaudePluginsRegistry(content);
-		expect(result).not.toBeNull();
 		expect(result?.version).toBe(2);
 		expect(result?.plugins["my-plugin@marketplace"]).toHaveLength(1);
 	});
@@ -60,29 +59,57 @@ describe("parseClaudePluginsRegistry", () => {
 	});
 });
 
+function restoreEnvValue(key: string, value: string | undefined): void {
+	if (value === undefined) {
+		delete process.env[key];
+		delete Bun.env[key];
+		return;
+	}
+	process.env[key] = value;
+	Bun.env[key] = value;
+}
+
 describe("listClaudePluginRoots", () => {
 	let tempDir: string;
+	let testAgentDir: string;
 	let originalHome: string | undefined;
+	let originalAgentDirEnv: string | undefined;
+	let originalOmpProfileEnv: string | undefined;
+	let originalPiProfileEnv: string | undefined;
+	let originalClaudeConfigDir: string | undefined;
 
 	beforeEach(async () => {
 		clearClaudePluginRootsCache();
 		clearFsCache();
 		originalHome = process.env.HOME;
+		originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
+		originalOmpProfileEnv = process.env.OMP_PROFILE;
+		originalPiProfileEnv = process.env.PI_PROFILE;
+		originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+		delete process.env.CLAUDE_CONFIG_DIR;
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "claude-plugins-test-"));
+		testAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "claude-plugins-test-agent-"));
 		process.env.HOME = tempDir;
 		vi.spyOn(os, "homedir").mockReturnValue(tempDir);
+		// Point the agent dir at a temp dir so user-scope discovery (native MCP
+		// config, skills, etc.) cannot read the real ~/.omp/agent profile.
+		setAgentDir(testAgentDir);
 	});
 
 	afterEach(async () => {
 		clearClaudePluginRootsCache();
 		clearFsCache();
 		vi.restoreAllMocks();
-		if (originalHome === undefined) {
-			delete process.env.HOME;
-		} else {
-			process.env.HOME = originalHome;
-		}
+		// setAgentDir() clears the profile env vars and snapshots the agent dir,
+		// so restore every env var it can touch before rebuilding the resolver.
+		restoreEnvValue("HOME", originalHome);
+		restoreEnvValue("OMP_PROFILE", originalOmpProfileEnv);
+		restoreEnvValue("PI_PROFILE", originalPiProfileEnv);
+		restoreEnvValue("PI_CODING_AGENT_DIR", originalAgentDirEnv);
+		restoreEnvValue("CLAUDE_CONFIG_DIR", originalClaudeConfigDir);
+		__resetDirsFromEnvForTests();
 		await removeWithRetries(tempDir);
+		await removeWithRetries(testAgentDir);
 	});
 
 	test("returns empty roots when no registry file exists", async () => {
@@ -124,6 +151,41 @@ describe("listClaudePluginRoots", () => {
 		});
 	});
 
+	test("reads the user plugin registry from CLAUDE_CONFIG_DIR", async () => {
+		const relocated = path.join(tempDir, "relocated-claude");
+		const pluginsDir = path.join(relocated, "plugins");
+		process.env.CLAUDE_CONFIG_DIR = relocated;
+		await fs.mkdir(pluginsDir, { recursive: true });
+		await fs.writeFile(
+			path.join(pluginsDir, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"relocated@market": [
+						{
+							scope: "user",
+							installPath: "/path/to/relocated",
+							version: "1.0.0",
+						},
+					],
+				},
+			}),
+		);
+
+		const result = await listClaudePluginRoots(tempDir);
+
+		expect(result.roots).toEqual([
+			{
+				id: "relocated@market",
+				marketplace: "market",
+				plugin: "relocated",
+				version: "1.0.0",
+				path: "/path/to/relocated",
+				scope: "user",
+			},
+		]);
+	});
+
 	test("isolates local plugins to their canonical project", async () => {
 		const pluginsDir = path.join(tempDir, ".claude", "plugins");
 		const projectA = path.join(tempDir, "project-a");
@@ -160,6 +222,103 @@ describe("listClaudePluginRoots", () => {
 
 		expect(result.roots.map(root => root.id)).toEqual(["user-plugin@market", "active-plugin@market"]);
 		expect(result.roots.find(root => root.id === "active-plugin@market")?.scope).toBe("project");
+	});
+
+	test("hides a plugin the user switched off with enabledPlugins in project settings", async () => {
+		// Contract: a plugin Claude Code would not load in this project (enabledPlugins:false in
+		// .claude/settings.local.json) must not contribute skills/MCP/commands here either.
+		const pluginsDir = path.join(tempDir, ".claude", "plugins");
+		const project = path.join(tempDir, "project");
+		await Promise.all([
+			fs.mkdir(pluginsDir, { recursive: true }),
+			fs.mkdir(path.join(project, ".claude"), { recursive: true }),
+			fs.mkdir(path.join(project, ".git"), { recursive: true }),
+		]);
+		const entry = (installPath: string) => ({
+			scope: "user",
+			installPath,
+			version: "1.0.0",
+			installedAt: "2025-01-01T00:00:00Z",
+			lastUpdated: "2025-01-01T00:00:00Z",
+		});
+		await fs.writeFile(
+			path.join(pluginsDir, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"kept@market": [entry("/plugins/kept")],
+					"muted@market": [entry("/plugins/muted")],
+					"muted-then-restored@market": [entry("/plugins/restored")],
+				},
+			}),
+		);
+		// settings.json turns two off; settings.local.json turns one of them back on (local wins).
+		await fs.writeFile(
+			path.join(project, ".claude", "settings.json"),
+			JSON.stringify({ enabledPlugins: { "muted@market": false, "muted-then-restored@market": false } }),
+		);
+		await fs.writeFile(
+			path.join(project, ".claude", "settings.local.json"),
+			JSON.stringify({ enabledPlugins: { "muted-then-restored@market": true } }),
+		);
+
+		const inProject = await listClaudePluginRoots(tempDir, project);
+		expect(inProject.roots.map(root => root.id).sort()).toEqual(["kept@market", "muted-then-restored@market"]);
+
+		// The switch is per project: elsewhere the same user-scope install still loads.
+		const elsewhere = path.join(tempDir, "elsewhere");
+		await fs.mkdir(path.join(elsewhere, ".git"), { recursive: true });
+		const outside = await listClaudePluginRoots(tempDir, elsewhere);
+		expect(outside.roots.map(root => root.id).sort()).toEqual([
+			"kept@market",
+			"muted-then-restored@market",
+			"muted@market",
+		]);
+	});
+
+	test("enabledPlugins:true opts a local-scope install into a project with a different projectPath", async () => {
+		// Contract: Claude Code loads a plugin wherever enabledPlugins says true, regardless of
+		// which directory the local-scope install was recorded under. Without this, a plugin
+		// installed from a parent directory never loads from the child project it is enabled in.
+		const pluginsDir = path.join(tempDir, ".claude", "plugins");
+		const parent = path.join(tempDir, "clients");
+		const child = path.join(parent, "acme");
+		await Promise.all([
+			fs.mkdir(pluginsDir, { recursive: true }),
+			fs.mkdir(path.join(child, ".claude"), { recursive: true }),
+			fs.mkdir(path.join(child, ".git"), { recursive: true }),
+		]);
+		await fs.writeFile(
+			path.join(pluginsDir, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"acme@market": [
+						{
+							scope: "local",
+							installPath: "/plugins/acme",
+							projectPath: parent,
+							version: "1.0.0",
+							installedAt: "2025-01-01T00:00:00Z",
+							lastUpdated: "2025-01-01T00:00:00Z",
+						},
+					],
+				},
+			}),
+		);
+
+		const before = await listClaudePluginRoots(tempDir, child);
+		expect(before.roots).toEqual([]);
+
+		clearClaudePluginRootsCache();
+		clearFsCache();
+		await fs.writeFile(
+			path.join(child, ".claude", "settings.local.json"),
+			JSON.stringify({ enabledPlugins: { "acme@market": true } }),
+		);
+		const after = await listClaudePluginRoots(tempDir, child);
+		expect(after.roots.map(root => root.id)).toEqual(["acme@market"]);
+		expect(after.roots[0]?.scope).toBe("project");
 	});
 
 	test("parses plugin with project scope", async () => {
@@ -332,6 +491,41 @@ describe("listClaudePluginRoots", () => {
 		expect(result3.roots).toHaveLength(2);
 	});
 
+	test("isolates cached OMP plugin roots by home when Claude config is shared", async () => {
+		const sharedClaudeConfig = path.join(tempDir, "shared-claude");
+		const firstHome = path.join(tempDir, "first-home");
+		const secondHome = path.join(tempDir, "second-home");
+		process.env.CLAUDE_CONFIG_DIR = sharedClaudeConfig;
+		for (const [home, pluginId] of [
+			[firstHome, "first@market"],
+			[secondHome, "second@market"],
+		] as const) {
+			const pluginsDir = path.join(home, ".omp", "plugins");
+			await fs.mkdir(pluginsDir, { recursive: true });
+			await fs.writeFile(
+				path.join(pluginsDir, "installed_plugins.json"),
+				JSON.stringify({
+					version: 2,
+					plugins: {
+						[pluginId]: [
+							{
+								scope: "user",
+								installPath: `/path/to/${pluginId.split("@")[0]}`,
+								version: "1.0.0",
+							},
+						],
+					},
+				}),
+			);
+		}
+
+		const first = await listClaudePluginRoots(firstHome);
+		const second = await listClaudePluginRoots(secondHome);
+
+		expect(first.roots.map(root => root.id)).toEqual(["first@market"]);
+		expect(second.roots.map(root => root.id)).toEqual(["second@market"]);
+	});
+
 	test("defaults scope to user when not specified", async () => {
 		const pluginsDir = path.join(tempDir, ".claude", "plugins");
 		await fs.mkdir(pluginsDir, { recursive: true });
@@ -390,10 +584,8 @@ describe("listClaudePluginRoots", () => {
 
 		const result = await loadCapability<Skill>("skills", { cwd: tempDir });
 		expect(result.warnings).toEqual([]);
-		expect(result.all.length).toBeGreaterThan(0);
 		const found = result.all.find(skill => skill.name === "manifest-skill");
 
-		expect(found).toBeDefined();
 		expect(found?.path).toContain(path.join(".claude", "skills", "manifest-skill", "SKILL.md"));
 	});
 	test("keeps plugin skills out of slash commands while loading them as skills", async () => {
@@ -480,7 +672,6 @@ describe("listClaudePluginRoots", () => {
 			});
 			const server = result.all.find(item => item.name === "context7:context7");
 
-			expect(server).toBeDefined();
 			expect(server?.url).toBe("https://mcp.context7.example/mcp");
 			expect(server?.headers).toEqual({ CONTEXT7_API_KEY: "ctx7sk-test-key" });
 		} finally {
@@ -601,7 +792,6 @@ describe("listClaudePluginRoots", () => {
 
 		expect(result.warnings).toEqual([]);
 		const server = result.all.find(item => item.name === "inline-mcp:local");
-		expect(server).toBeDefined();
 		expect(server?.command).toBe(path.join(pluginPath, "bin", "server"));
 		expect(server?.args).toEqual(["run"]);
 	});
@@ -776,10 +966,8 @@ describe("listClaudePluginRoots", () => {
 
 		const result = await loadCapability<SlashCommand>("slash-commands", { cwd: tempDir });
 		expect(result.warnings).toEqual([]);
-		expect(result.all.length).toBeGreaterThan(0);
 		const found = result.all.find(command => command.name === "manifest-commands:ship");
 
-		expect(found).toBeDefined();
 		expect(found?.path).toContain(path.join(".claude", "commands", "ship.md"));
 	});
 
@@ -816,7 +1004,6 @@ describe("listClaudePluginRoots", () => {
 		expect(result.warnings).toEqual([]);
 		const found = result.all.find(command => command.name === "manifest-commands-key:plan");
 
-		expect(found).toBeDefined();
 		expect(found?.path).toContain(path.join(".claude", "commands", "plan.md"));
 	});
 
@@ -1289,15 +1476,19 @@ describe("listClaudePluginRoots", () => {
 
 describe("discoverAgents plugin precedence", () => {
 	let tempDir: string;
+	let originalClaudeConfigDir: string | undefined;
 
 	beforeEach(async () => {
 		clearClaudePluginRootsCache();
 		clearFsCache();
+		originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+		delete process.env.CLAUDE_CONFIG_DIR;
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "claude-plugins-precedence-test-"));
 	});
 
 	afterEach(async () => {
 		clearClaudePluginRootsCache();
+		restoreEnvValue("CLAUDE_CONFIG_DIR", originalClaudeConfigDir);
 		await removeWithRetries(tempDir);
 	});
 
@@ -1344,7 +1535,6 @@ describe("discoverAgents plugin precedence", () => {
 		const result = await discoverAgents(tempDir, tempDir);
 		const found = result.agents.find(agent => agent.name === agentName);
 
-		expect(found).toBeDefined();
 		expect(found?.source).toBe("project");
 		expect(found?.filePath).toContain(projectPluginPath);
 	});

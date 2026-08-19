@@ -298,9 +298,12 @@ function overflowFrame(frame: object): object {
 	};
 }
 
-/** Serialize a complete JSONL frame while enforcing the transport byte ceiling. */
-export function encodeRpcFrame(frame: object, streamedMessageCount = 0, streamedMessages?: readonly unknown[]): string {
-	let json = JSON.stringify(frame);
+function encodeRpcFrameFromJson(
+	frame: object,
+	json: string,
+	streamedMessageCount: number,
+	streamedMessages?: readonly unknown[],
+): string {
 	if (serializedFrameBytes(json) <= MAX_RPC_FRAME_BYTES) return `${json}\n`;
 	if (isRecord(frame) && (frame.type === "response" || frame.type === "todo_projection_changed")) {
 		// Projection arrays are schema-bearing snapshots. Generic v1 shrinking
@@ -318,6 +321,11 @@ export function encodeRpcFrame(frame: object, streamedMessageCount = 0, streamed
 	}
 
 	return `${JSON.stringify(overflowFrame(compacted))}\n`;
+}
+
+/** Serialize a complete JSONL frame while enforcing the transport byte ceiling. */
+export function encodeRpcFrame(frame: object, streamedMessageCount = 0, streamedMessages?: readonly unknown[]): string {
+	return encodeRpcFrameFromJson(frame, JSON.stringify(frame), streamedMessageCount, streamedMessages);
 }
 
 /** Stateful encoder that tracks which messages a client has already received. */
@@ -353,14 +361,14 @@ export class RpcFrameEncoder {
 				frames = [singleFrame];
 			}
 		} else {
-			singleFrame = encodeRpcFrame(frame, this.#streamedMessages.length, this.#streamedMessages);
+			singleFrame = encodeRpcFrameFromJson(frame, json, this.#streamedMessages.length, this.#streamedMessages);
 			frames = [singleFrame];
 		}
 		if (!isRecord(frame)) return frames;
 		if (frame.type === "message_end") {
 			const snapshot =
 				this.#protocolVersion === 2 && Object.hasOwn(frame, "message")
-					? { message: jsonSnapshot(frame.message) }
+					? (encodedMessageSnapshot(json) ?? { message: jsonSnapshot(frame.message) })
 					: singleFrame !== undefined
 						? encodedMessageSnapshot(singleFrame)
 						: undefined;

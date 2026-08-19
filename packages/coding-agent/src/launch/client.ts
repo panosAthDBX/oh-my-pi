@@ -367,7 +367,17 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			try {
 				message = parseDaemonWireMessage(decoded);
 			} catch (error) {
-				this.#rejectPending(error instanceof Error ? error : new Error(String(error)));
+				const parseError = error instanceof Error ? error : new Error(String(error));
+				if (
+					typeof decoded === "object" &&
+					decoded !== null &&
+					"event" in decoded &&
+					decoded.event === "daemon-completed"
+				) {
+					logger.warn("Ignoring malformed daemon completion", { error: parseError.message });
+					continue;
+				}
+				this.#rejectPending(parseError);
 				continue;
 			}
 			if ("event" in message) {
@@ -506,8 +516,14 @@ export async function closeDaemonClients(): Promise<void> {
 
 /** Exercise worker-host broker startup and authenticated RPC for distribution smoke tests. */
 export async function smokeTestDaemonBroker(): Promise<void> {
-	const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-daemon-smoke-project-"));
-	const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-daemon-smoke-run-"));
+	// Keep the broker's runtime dir under a private parent this process owns, so
+	// the broker's dead-scope sweep (pruneDeadDaemonRuntimeDirs, fired on startup)
+	// can only ever reclaim siblings inside it — never unrelated neighbours in
+	// os.tmpdir() such as tmux/ssh sockets or build trees (issue #8721).
+	const smokeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-daemon-smoke-"));
+	const projectDir = path.join(smokeRoot, "project");
+	const runtimeDir = path.join(smokeRoot, "run");
+	await fs.mkdir(projectDir, { recursive: true });
 	const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
 	try {
 		const ping = await client.request({ op: "ping" });
@@ -515,7 +531,6 @@ export async function smokeTestDaemonBroker(): Promise<void> {
 		await client.request({ op: "shutdown" });
 	} finally {
 		client.close();
-		await fs.rm(projectDir, { recursive: true, force: true });
-		await fs.rm(runtimeDir, { recursive: true, force: true });
+		await fs.rm(smokeRoot, { recursive: true, force: true });
 	}
 }

@@ -49,7 +49,7 @@ import {
 	previewWindowRows,
 	replaceTabs,
 } from "./render-utils";
-import { tokenizeShellSegments } from "./shell-tokenize";
+import { extractLeadingCdTarget, tokenizeShellSegments } from "./shell-tokenize";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
@@ -166,7 +166,13 @@ function shellBuiltinsDisabled(settings: Settings): boolean {
  */
 export const CRITICAL_BASH_PATTERNS = [
 	// Recursive destruction.
-	/\brm\s+-[a-z]*[rRfF][a-z]*\s+\//i, // rm -rf /, rm -fr /, rm -r /, rm -f /…
+	// Options may sit on either side of the recursive/force flag, so only that flag is pinned and
+	// any other options are skipped: `rm -rf /`, `rm -rf -- /`, `rm --recursive --force /`,
+	// `rm -rf -v /`, `rm -v -rf /`. An absolute target is still required.
+	/\brm\s+(?:-\S+\s+)*(?:-[a-z]*[rRfF][a-z]*|--recursive|--force)\s+(?:-\S+\s+)*\//i,
+	// `--no-preserve-root` defeats coreutils' own refusal to recurse on `/`, so it is critical
+	// wherever it appears — including forms this list would otherwise reach only via the target.
+	/\brm\s+(?:-\S+\s+)*--no-preserve-root\b/i,
 	/\bsudo\s+rm\b/i, // any `sudo rm`.
 	/\bchmod\s+-R\s+[0-7]+\s+\//i, // `chmod -R 777 /`.
 	/\bchmod\s+-R\s+[ugoa+\-=rwxXst,]+\s+\//, // `chmod -R u+x /`, `chmod -R u+rwx,o+w /etc` (symbolic mode, root target).
@@ -384,8 +390,8 @@ function normalizeBashEnv(env: Record<string, string> | undefined): Record<strin
 	return normalized;
 }
 
-function escapeBashEnvValueForDisplay(value: string): string {
-	return value
+function escapeBashEnvValueForDisplay(value: unknown): string {
+	return String(value)
 		.replaceAll("\\", "\\\\")
 		.replaceAll("\n", "\\n")
 		.replaceAll("\r", "\\r")
@@ -395,7 +401,7 @@ function escapeBashEnvValueForDisplay(value: string): string {
 		.replaceAll("`", "\\`");
 }
 
-function formatBashEnvAssignments(env: Record<string, string> | undefined): string {
+function formatBashEnvAssignments(env: Record<string, unknown> | undefined): string {
 	if (!env || Object.keys(env).length === 0) return "";
 	return Object.entries(env)
 		.sort(([a], [b]) => a.localeCompare(b))
@@ -960,17 +966,16 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		let command = rawCommand;
 		const env = normalizeBashEnv(rawEnv);
 
-		// Extract leading `cd <path> && ...` into cwd when the model ignores the cwd parameter.
-		// Constrained to a single line so a `&&` that sits on a later line of a multiline
-		// script can't pull the entire script into the "cwd" capture.
+		// Extract a leading `cd <path> && ...` into cwd when the model ignores the
+		// cwd parameter. The scanner captures only a single path token and defers
+		// to the shell for anything else (redirects, extra args, shell expansion),
+		// so it never absorbs shell syntax like `cd /tmp 2>/dev/null && ...` into
+		// the structured cwd. Constrained to a top-level `&&` on the first line.
 		if (!cwd) {
-			const cdMatch = command.match(/^cd[ \t]+((?:[^&\\\n\r]|\\.)+?)[ \t]*&&[ \t]*/);
-			// Skip extraction when the path needs shell expansion ($VAR, $(...),
-			// backticks) — resolveToCwd only expands `~`, so routing those through
-			// cwd would reject commands the shell itself handles fine.
-			if (cdMatch && !/[$`(]/.test(cdMatch[1])) {
-				cwd = cdMatch[1].trim().replace(/^["']|["']$/g, "");
-				command = command.slice(cdMatch[0].length);
+			const cd = extractLeadingCdTarget(command);
+			if (cd) {
+				cwd = cd.path;
+				command = cd.rest;
 			}
 		}
 		if (asyncRequested && !this.#asyncEnabled) {
@@ -1498,7 +1503,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 // =============================================================================
 export interface BashRenderArgs {
 	command?: string;
-	env?: Record<string, string>;
+	env?: Record<string, unknown>;
 	timeout?: number;
 	cwd?: string;
 	__partialJson?: string;
@@ -1522,7 +1527,7 @@ export interface ShellRendererConfig<TArgs> {
 	resolveTitle: (args: TArgs | undefined, options: RenderResultOptions) => string;
 	resolveCommand?: (args: TArgs | undefined) => string | undefined;
 	resolveCwd?: (args: TArgs | undefined) => string | undefined;
-	resolveEnv?: (args: TArgs | undefined) => Record<string, string> | undefined;
+	resolveEnv?: (args: TArgs | undefined) => Record<string, unknown> | undefined;
 	showHeader?: boolean;
 }
 
@@ -1532,7 +1537,7 @@ function getPartialJson<TArgs>(args: TArgs | undefined): string | undefined {
 	return typeof value === "string" ? value : undefined;
 }
 
-export function getBashEnvForDisplay(args: BashRenderArgs): Record<string, string> | undefined {
+export function getBashEnvForDisplay(args: BashRenderArgs): Record<string, unknown> | undefined {
 	// The parsed args don't always mirror the exact current stream prefix, so recover
 	// env from the raw JSON buffer to surface `NAME="..." cmd` in the preview as it
 	// streams rather than only once the args object finishes.

@@ -22,7 +22,11 @@ import {
 	createOpenAICodexCompatibilityMetadata,
 	getCodexAttestationHeader,
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
-import { parseAzureDeploymentNameMap, parseTextSignature } from "@oh-my-pi/pi-ai/providers/openai-shared";
+import {
+	hoistInterleavedResponsesToolBatchMessages,
+	parseAzureDeploymentNameMap,
+	parseTextSignature,
+} from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import type {
 	Api,
@@ -37,6 +41,7 @@ import {
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
 	normalizeResponsesToolCallId,
+	stripOpenAIResponsesOutputOnlyStatusesForReplay,
 } from "@oh-my-pi/pi-ai/utils";
 import { captureOpenAIHttpError } from "@oh-my-pi/pi-ai/utils/openai-http";
 import {
@@ -739,7 +744,7 @@ export function buildOpenAiNativeHistory(
 		msgIndex++;
 	}
 
-	return input;
+	return stripOpenAIResponsesOutputOnlyStatusesForReplay(hoistInterleavedResponsesToolBatchMessages(input));
 }
 
 // ============================================================================

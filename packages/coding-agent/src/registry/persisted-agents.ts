@@ -1,7 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { ADVISOR_TRANSCRIPT_FILENAME, isAdvisorTranscriptName } from "../advisor/transcript-recorder";
 import { resolveExplicitModelRole } from "../config/model-resolver";
+import { assistantTurnProducedOutput } from "../session/messages";
 import { EPHEMERAL_MODEL_CHANGE_ROLE } from "../session/session-entries";
 import { visitEntriesFromFileStream } from "../session/session-loader";
 import { loadBundledAgents } from "../task/agents";
@@ -23,6 +25,8 @@ interface PersistedAgentMetadata {
 	createdAt?: number;
 	lastActivity?: number;
 	history?: AgentHistorySummary;
+	/** True when the file is only a SessionManager header (no session_init, no messages). */
+	incomplete?: boolean;
 }
 
 interface PersistedTranscript {
@@ -90,6 +94,12 @@ interface AssistantMetrics {
 	cost: number;
 	contextTokens?: number;
 	resolvedModel?: string;
+	/**
+	 * True when this turn produced output, making its model the run's. Uses the
+	 * same predicate as the live session, so replaying a transcript reaches the
+	 * same verdict the session reached while running it.
+	 */
+	served: boolean;
 }
 
 function assistantMetrics(message: Record<string, unknown>): AssistantMetrics {
@@ -104,6 +114,10 @@ function assistantMetrics(message: Record<string, unknown>): AssistantMetrics {
 		cost: finiteNumber(cost?.total),
 		contextTokens: finiteNumber(usage.totalTokens) || undefined,
 		resolvedModel: provider && model ? `${provider}/${model}` : undefined,
+		served: assistantTurnProducedOutput({
+			stopReason: message.stopReason,
+			content,
+		} as Pick<AssistantMessage, "stopReason" | "content">),
 	};
 }
 
@@ -159,33 +173,56 @@ async function readPersistedAgentHistory(
 		),
 		durationKind: "span",
 	};
+	// Attribution walks leaf → root and stops at the newest turn that actually
+	// produced output: that model did this run's work. A `model_change` newer
+	// than it was never served (a fallback the session died on), so crediting the
+	// run to it would report work the previous model did.
 	let resolvedModel: string | undefined;
 	let resolvedModelIsFallback: boolean | undefined;
 	let modelRole: string | undefined;
 	let contextTokens: number | undefined;
-	let modelChangeFound = false;
+	let servedModel: string | undefined;
+	let latestModelChange: { model: string; resolvedModelIsFallback: boolean } | undefined;
 	const visited = new Set<string>();
 	for (let id = leafId; id && !visited.has(id); id = parents.get(id)) {
 		visited.add(id);
 		const modelChange = modelChangeById.get(id);
-		if (modelChange && !modelChangeFound) {
-			modelChangeFound = true;
-			resolvedModel = modelChange.model;
-			resolvedModelIsFallback = modelChange.resolvedModelIsFallback;
+		if (modelChange) {
+			latestModelChange ??= modelChange;
 			if (modelChange.role && modelChange.role !== EPHEMERAL_MODEL_CHANGE_ROLE) {
-				modelRole = modelChange.role;
+				modelRole ??= modelChange.role;
+			}
+			// The transition that installed the serving model: it carries the
+			// fallback flag the raw message lacks. Every writer records the selector
+			// through `formatModelStringWithRouting`, which appends an `@upstream`
+			// gateway route the message's bare `provider/model` never has.
+			if (
+				servedModel !== undefined &&
+				resolvedModel === undefined &&
+				(modelChange.model === servedModel || modelChange.model.startsWith(`${servedModel}@`))
+			) {
+				resolvedModel = modelChange.model;
+				resolvedModelIsFallback = modelChange.resolvedModelIsFallback;
 			}
 		}
 		const assistant = assistantById.get(id);
 		if (!assistant) continue;
-		if (!modelChangeFound && resolvedModel === undefined && assistant.resolvedModel) {
-			resolvedModel = assistant.resolvedModel;
+		if (servedModel === undefined && assistant.served && assistant.resolvedModel) {
+			servedModel = assistant.resolvedModel;
 		}
 		metrics.requests++;
 		metrics.tokens += assistant.tokens;
 		metrics.tools += assistant.tools;
 		metrics.cost += assistant.cost;
 		contextTokens ??= assistant.contextTokens;
+	}
+	// No transition described the serving model (pre-`model_change` transcript, or
+	// the spawn record was pruned) — the message's own model still beats a
+	// transition that never ran. Nothing served at all leaves only the last
+	// transition to report.
+	if (resolvedModel === undefined) {
+		resolvedModel = servedModel ?? latestModelChange?.model;
+		resolvedModelIsFallback = servedModel !== undefined ? false : latestModelChange?.resolvedModelIsFallback;
 	}
 	if (contextTokens !== undefined) metrics.contextTokens = contextTokens;
 	return {
@@ -209,6 +246,8 @@ async function readPersistedAgentMetadata(sessionFile: string): Promise<Persiste
 	let createdAt: number | undefined;
 	let activity: string | undefined;
 	let history: AgentHistorySummary = {};
+	let hasSessionInit = false;
+	let hasConversation = false;
 	try {
 		await visitEntriesFromFileStream(
 			sessionFile,
@@ -229,7 +268,12 @@ async function readPersistedAgentMetadata(sessionFile: string): Promise<Persiste
 					}
 					return;
 				}
+				if (record.type === "message" || record.type === "custom_message") {
+					hasConversation = true;
+					return;
+				}
 				if (record.type !== "session_init") return;
+				hasSessionInit = true;
 				createdAt ??= timestampOf(record.timestamp);
 				if (typeof record.task === "string") activity = summarizePersistedTask(record.task);
 				const inferred = typeof record.systemPrompt === "string" ? inferBundledAgent(record.systemPrompt) : {};
@@ -255,6 +299,7 @@ async function readPersistedAgentMetadata(sessionFile: string): Promise<Persiste
 		activity,
 		createdAt: createdAt ?? file?.birthtimeMs,
 		lastActivity: file?.mtimeMs,
+		incomplete: !hasSessionInit && !hasConversation,
 		history: {
 			...history,
 			...(hasOutput ? { outputPath } : {}),
@@ -390,26 +435,36 @@ async function registerPersistedSubagentsFromDir(
 		if (!registry.get(id)) {
 			const metadata = await readPersistedAgentMetadata(sessionFile);
 			if (!shouldContinue()) return;
-			registry.register({
-				id,
-				displayName: id,
-				kind: "sub",
-				parentId: parentId ?? MAIN_AGENT_ID,
-				session: null,
-				sessionFile,
-				activity: metadata.activity,
-				createdAt: metadata.createdAt,
-				lastActivity: metadata.lastActivity,
-				history: metadata.history,
-				status: tombstoned ? "aborted" : "parked",
-			});
-			const ref = registry.get(id);
-			transcripts.push({
-				id,
-				sessionFile,
-				createdAt: ref?.createdAt,
-				lastActivity: ref?.lastActivity,
-			});
+			// Metadata reads yield. A spawn may claim the id while this scan is
+			// inspecting the file; never replace that live generation with a
+			// transcript-derived parked ref.
+			const unclaimed = !registry.get(id);
+			// SessionManager.open writes title+session before createAgentSession
+			// claims the id. Parking that stub makes the spawn's expectedAgentRef:null
+			// CAS fail with "already owned by another session generation".
+			if (unclaimed && metadata.incomplete && !tombstoned) continue;
+			if (unclaimed) {
+				registry.register({
+					id,
+					displayName: id,
+					kind: "sub",
+					parentId: parentId ?? MAIN_AGENT_ID,
+					session: null,
+					sessionFile,
+					activity: metadata.activity,
+					createdAt: metadata.createdAt,
+					lastActivity: metadata.lastActivity,
+					history: metadata.history,
+					status: tombstoned ? "aborted" : "parked",
+				});
+				const ref = registry.get(id);
+				transcripts.push({
+					id,
+					sessionFile,
+					createdAt: ref?.createdAt,
+					lastActivity: ref?.lastActivity,
+				});
+			}
 		}
 		await registerPersistedSubagentsFromDir(
 			registry,

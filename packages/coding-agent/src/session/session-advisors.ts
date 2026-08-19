@@ -242,7 +242,6 @@ export interface SessionAdvisorsHost {
 	onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
-	agentKind(): "main" | "sub";
 	isDisposed(): boolean;
 	abortInProgress(): boolean;
 	allowAgentInitiatedTurns(): boolean;
@@ -263,7 +262,11 @@ export interface SessionAdvisorsHost {
 		signal: AbortSignal,
 	): Promise<Model | undefined>;
 	resolveCompactionModelCandidates(preferredModel: Model | null | undefined, availableModels: Model[]): Model[];
-	resolveRetryFallbackRole(currentSelector: string, currentModel?: Model | null): string | undefined;
+	resolveRetryFallbackRole(
+		currentSelector: string,
+		currentModel?: Model | null,
+		roleHint?: string,
+	): string | undefined;
 	findRetryFallbackCandidates(
 		role: string,
 		currentSelector: string,
@@ -418,8 +421,8 @@ export class SessionAdvisors {
 	}
 
 	/** Re-primes advisor transcript views after an in-conversation history rewrite. */
-	resetAllRuntimes(): void {
-		this.#resetAllAdvisorRuntimes();
+	resetAllRuntimes(reason?: string): void {
+		this.#resetAllAdvisorRuntimes(reason);
 	}
 
 	/** Whether live runtimes still match the resolved advisor configuration. */
@@ -535,7 +538,7 @@ export class SessionAdvisors {
 		for (const a of this.#advisors) {
 			a.agentUnsubscribe?.();
 			a.agentUnsubscribe = undefined;
-			a.runtime.reset();
+			a.runtime.reset("conversation-boundary");
 			a.adviseTool.resetDeliveredNotes();
 			a.emissionGuard.reset();
 			this.#attachAdvisorRecorderFeed(a);
@@ -653,7 +656,6 @@ export class SessionAdvisors {
 		if (this.#host.isDisposed()) return false;
 		if (this.#advisors.length > 0) return true;
 		if (!this.#advisorEnabled) return false;
-		if (this.#host.agentKind() !== "main" && !this.#host.settings.get("advisor.subagents")) return false;
 
 		// Rebuild the status map from scratch so removed/renamed advisors don't
 		// leave stale entries. #resolveAdvisorRuntimeDescriptors populates every
@@ -785,14 +787,22 @@ export class SessionAdvisors {
 				mcpResources: this.#advisorMcpResources,
 			});
 			const baseAdvisorStreamFn = this.#advisorStreamFn ?? streamSimple;
-			const advisorStreamFn: StreamFn = (requestModel, context, options) =>
-				baseAdvisorStreamFn(
-					requestModel,
-					context,
-					requestModel.api === "openai-codex-responses"
-						? { ...options, codexSseMaxAttempts: ADVISOR_CODEX_SSE_MAX_ATTEMPTS }
-						: options,
-				);
+			const advisorStreamFn: StreamFn = (requestModel, context, options) => {
+				if (requestModel.api === "openai-codex-responses") {
+					return baseAdvisorStreamFn(requestModel, context, {
+						...options,
+						codexSseMaxAttempts: ADVISOR_CODEX_SSE_MAX_ATTEMPTS,
+					});
+				}
+				if (
+					requestModel.api === "google-generative-ai" ||
+					requestModel.api === "google-gemini-cli" ||
+					requestModel.api === "google-vertex"
+				) {
+					return baseAdvisorStreamFn(requestModel, context, { ...options, acceptEmptyResponse: true });
+				}
+				return baseAdvisorStreamFn(requestModel, context, options);
+			};
 			const advisorAgent = new Agent({
 				initialState: {
 					systemPrompt,
@@ -832,8 +842,17 @@ export class SessionAdvisors {
 					let quarantined: string | undefined;
 					try {
 						quarantinedAdvisorOutput = undefined;
-						currentAdvisorInput = input;
-						await advisorAgent.prompt(input);
+						// Multi-message input (candidate 4) must serialize deterministically
+						// for quarantine source text; reuse the session history formatter
+						// rather than ad-hoc joins so all message kinds (text/tool/
+						// custom/structured) are preserved exactly as rendered.
+						currentAdvisorInput = Array.isArray(input)
+							? formatSessionHistoryMarkdown(input, { watchedRoles: true })
+							: input;
+						// Agent.prompt's overloads accept string OR AgentMessage[] but not
+						// the union, so narrow first; both branches intentionally identical.
+						if (Array.isArray(input)) await advisorAgent.prompt(input);
+						else await advisorAgent.prompt(input);
 						quarantined = quarantinedAdvisorOutput;
 					} finally {
 						quarantinedAdvisorOutput = undefined;
@@ -1057,8 +1076,8 @@ export class SessionAdvisors {
 	}
 
 	/** Re-prime every advisor's transcript view after an in-conversation history rewrite. */
-	#resetAllAdvisorRuntimes(): void {
-		for (const a of this.#advisors) a.runtime.reset();
+	#resetAllAdvisorRuntimes(reason?: string): void {
+		for (const a of this.#advisors) a.runtime.reset(reason);
 	}
 
 	#stopAdvisorRuntime(): void {
@@ -1167,47 +1186,42 @@ export class SessionAdvisors {
 		const failedMessage = failedMessages.findLast(
 			(message): message is AssistantMessage => message.role === "assistant",
 		);
-		if (failedMessage?.stopReason !== "error") {
-			// Stream setup can reject before any assistant turn is recorded (e.g.
-			// an HTTP 429 thrown from prompt()); classify the raw error so a
-			// structural usage limit still marks the exhausted credential.
-			const message = error instanceof Error ? error.message : String(error);
-			if (!AIError.isUsageLimit(error) && !isUsageLimitOutcome(extractHttpStatusFromError(error), message)) {
-				return false;
-			}
-			const currentModel = advisor.agent.state.model;
-			const outcome = await this.#host.modelRegistry.authStorage.markUsageLimitReached(
-				currentModel.provider,
-				advisor.providerSessionId,
-				{
-					retryAfterMs: extractRetryHint(undefined, message),
-					baseUrl: currentModel.baseUrl,
-					modelId: currentModel.id,
-					signal,
-				},
-			);
-			return outcome.switched;
-		}
-		if (failedMessage.content.some(block => block.type === "toolCall")) return false;
+		const assistantFailure = failedMessage?.stopReason === "error" ? failedMessage : undefined;
+		if (assistantFailure?.content.some(block => block.type === "toolCall")) return false;
 
 		const currentModel = advisor.agent.state.model;
-		const message = failedMessage.errorMessage ?? (error instanceof Error ? error.message : String(error));
-		const errorId = AIError.classifyMessage({
-			api: currentModel.api,
-			errorId: failedMessage.errorId,
-			errorMessage: message,
-			errorStatus: failedMessage.errorStatus,
-		});
+		const message = assistantFailure?.errorMessage ?? (error instanceof Error ? error.message : String(error));
+		const errorId = assistantFailure
+			? AIError.classifyMessage({
+					api: currentModel.api,
+					errorId: assistantFailure.errorId,
+					errorMessage: message,
+					errorStatus: assistantFailure.errorStatus,
+				})
+			: AIError.classify(error, currentModel.api);
 		if (AIError.is(errorId, AIError.Flag.Abort) || AIError.is(errorId, AIError.Flag.UserInterrupt)) return false;
-		if (AIError.isContextOverflow(failedMessage, currentModel.contextWindow ?? 0)) return false;
+		if (
+			AIError.is(errorId, AIError.Flag.ContextOverflow) ||
+			(assistantFailure && AIError.isContextOverflow(assistantFailure, currentModel.contextWindow ?? 0))
+		) {
+			return false;
+		}
 
-		const currentSelector = formatRetryFallbackSelector(currentModel, advisor.thinkingLevel);
+		const accountPolicyDenial = AIError.is(errorId, AIError.Flag.AccountPolicy);
+		if (accountPolicyDenial) {
+			const switched = await this.#host.modelRegistry.authStorage.rotateSessionCredential(
+				currentModel.provider,
+				advisor.providerSessionId,
+				{ error: message, modelId: currentModel.id, signal },
+			);
+			if (switched) return true;
+		}
 
 		const retryAfterMs = extractRetryHint(undefined, message);
-		if (
+		const usageLimit =
 			AIError.is(errorId, AIError.Flag.UsageLimit) ||
-			isUsageLimitOutcome(extractHttpStatusFromError(error), message)
-		) {
+			isUsageLimitOutcome(extractHttpStatusFromError(error), message);
+		if (usageLimit) {
 			const outcome = await this.#host.modelRegistry.authStorage.markUsageLimitReached(
 				currentModel.provider,
 				advisor.providerSessionId,
@@ -1220,10 +1234,14 @@ export class SessionAdvisors {
 			);
 			if (outcome.switched) return true;
 		}
+		if (!assistantFailure && !accountPolicyDenial && !usageLimit) return false;
+
+		const currentSelector = formatRetryFallbackSelector(currentModel, advisor.thinkingLevel);
 
 		const retrySettings = this.#host.settings.getGroup("retry");
 		if (!retrySettings.enabled || !retrySettings.modelFallback) return false;
-		const role = advisor.retryFallback?.role ?? this.#host.resolveRetryFallbackRole(currentSelector, currentModel);
+		const role =
+			advisor.retryFallback?.role ?? this.#host.resolveRetryFallbackRole(currentSelector, currentModel, "advisor");
 		if (!role || this.#host.findRetryFallbackCandidates(role, currentSelector, currentModel).length === 0)
 			return false;
 
@@ -1606,9 +1624,10 @@ export class SessionAdvisors {
 
 	/**
 	 * Whether a live advisor agent is attached to this session. True only when
-	 * `advisor.enabled` is set AND a model resolved for the `advisor` role AND
-	 * the advisor applies to this agent kind — i.e. the actual runtime exists,
-	 * not merely the setting. Drives the status-line badge and `/dump advisor`.
+	 * `advisor.enabled` is set for this session (subagents opt in per agent via
+	 * frontmatter `advisor` / `task.agentAdvisor`) AND a model resolved for the
+	 * `advisor` role — i.e. the actual runtime exists, not merely the setting.
+	 * Drives the status-line badge and `/dump advisor`.
 	 */
 	isAdvisorActive(): boolean {
 		return this.#advisors.length > 0;

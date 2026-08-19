@@ -2,14 +2,19 @@ import { describe, expect, test } from "bun:test";
 import {
 	hasOpus47ApiRestrictions,
 	isClaudeModelId,
+	isGeminiModelId,
 	isGlmVisionModelId,
+	isGrokModelId,
+	isGrokMultiAgentModelId,
 	isGrokReasoningEffortCapable,
+	isGrokXHighEffortCapable,
 	isKimiK26ModelId,
 	isKimiModelId,
 	isMinimaxM2FamilyModelId,
 	isMinimaxM3FamilyModelId,
 	isOpenAIGptOssModelId,
 	isOpenAIModelId,
+	isQwen38PlusTemplateEffortModelId,
 	isReasoningGlmModelId,
 	modelFamilyToken,
 	parseAnthropicModel,
@@ -23,6 +28,27 @@ describe("isKimiModelId", () => {
 		expect(isKimiModelId("kimi-k2.6")).toBe(true);
 		expect(isKimiModelId("vendor/kimi.x")).toBe(true);
 		expect(isKimiModelId("akimbo-model")).toBe(false);
+	});
+});
+
+describe("isQwen38PlusTemplateEffortModelId", () => {
+	test("matches Qwen 3.8+ open-weight ids across id shapes and versions", () => {
+		expect(isQwen38PlusTemplateEffortModelId("qwen3.8-27b")).toBe(true);
+		expect(isQwen38PlusTemplateEffortModelId("qwen3.8-2.4t-a95b")).toBe(true);
+		expect(isQwen38PlusTemplateEffortModelId("qwen/qwen3.8-27b")).toBe(true);
+		expect(isQwen38PlusTemplateEffortModelId("Qwen3.8-27B-UD-Q6_K_XL")).toBe(true);
+		expect(isQwen38PlusTemplateEffortModelId("qwen3.8-27b:thinking")).toBe(true);
+		// Component-wise version compare: 3.10 sorts after 3.8.
+		expect(isQwen38PlusTemplateEffortModelId("qwen3.10-27b")).toBe(true);
+	});
+	test("rejects pre-3.8 versions, parameter-count lookalikes, and API-only Max SKUs", () => {
+		expect(isQwen38PlusTemplateEffortModelId("qwen3-8b")).toBe(false);
+		expect(isQwen38PlusTemplateEffortModelId("qwen-3.6-27b")).toBe(false);
+		expect(isQwen38PlusTemplateEffortModelId("qwen3.7-plus")).toBe(false);
+		expect(isQwen38PlusTemplateEffortModelId("qwen2.5-coder-7b")).toBe(false);
+		expect(isQwen38PlusTemplateEffortModelId("qwen-3.8b")).toBe(false);
+		expect(isQwen38PlusTemplateEffortModelId("qwen3.8-max")).toBe(false);
+		expect(isQwen38PlusTemplateEffortModelId("qwen3.8-max-preview")).toBe(false);
 	});
 });
 
@@ -75,6 +101,21 @@ describe("parseAnthropicModel", () => {
 			version: { major: 4, minor: 6, patch: 0 },
 		});
 		expect(parseAnthropicModel("anthropic--claude-4.8-haiku")).toBeNull();
+	});
+
+	test("parses versions past the precompute table instead of classifying the model unknown", () => {
+		// The semver precompute table gates parsing; a too-small bound silently
+		// downgraded `claude-opus-5-11`-shaped ids to unknown (#8256 class).
+		expect(parseAnthropicModel("claude-opus-5-11")).toEqual({
+			family: "anthropic",
+			kind: "opus",
+			version: { major: 5, minor: 11, patch: 0 },
+		});
+		expect(parseAnthropicModel("claude-sonnet-4.25")).toEqual({
+			family: "anthropic",
+			kind: "sonnet",
+			version: { major: 4, minor: 25, patch: 0 },
+		});
 	});
 });
 
@@ -227,6 +268,17 @@ describe("isReasoningGlmModelId", () => {
 		expect(isReasoningGlmModelId("glm-4.5v")).toBe(false);
 		expect(isReasoningGlmModelId("qwen3.5")).toBe(false);
 	});
+
+	test("matches uppercase provider-prefixed GLM ids", () => {
+		// Baseten, CoreWeave, HuggingFace, etc. serve GLM under uppercase ids.
+		expect(isReasoningGlmModelId("zai-org/GLM-5.2")).toBe(true);
+		expect(isReasoningGlmModelId("zai-org/GLM-5.2-Fast")).toBe(true);
+		expect(isReasoningGlmModelId("zai-org/GLM-4.7")).toBe(true);
+		expect(isReasoningGlmModelId("zai-org/GLM-4.5-Air")).toBe(true);
+		expect(isReasoningGlmModelId("zai-org/GLM-5-Turbo")).toBe(true);
+		// Vision SKUs are still excluded even in uppercase.
+		expect(isReasoningGlmModelId("zai-org/GLM-4.5V")).toBe(false);
+	});
 });
 
 describe("isGlmVisionModelId", () => {
@@ -268,8 +320,12 @@ describe("modelFamilyToken", () => {
 	test("classifies non-first-party families", () => {
 		expect(modelFamilyToken("moonshotai/kimi-k2")).toBe("kimi");
 		expect(modelFamilyToken("qwen/qwen3-coder")).toBe("qwen");
+		expect(modelFamilyToken("google/gemini-2.5-flash")).toBe("gemini");
+		expect(modelFamilyToken("xai/grok-4.6")).toBe("grok");
+		expect(modelFamilyToken("openai/gemini-pro")).toBe("gemini");
+		expect(modelFamilyToken("openai/deepseek-r1")).toBe("deepseek");
+		expect(modelFamilyToken("openai/grok-4.6")).toBe("grok");
 	});
-
 	test("classifies GLM across provider mirrors so same-lineage SKUs fold together", () => {
 		expect(modelFamilyToken("glm-5.2")).toBe("glm");
 		expect(modelFamilyToken("zai/glm-5.2")).toBe(modelFamilyToken("zhipu-coding-plan/glm-5.2"));
@@ -280,6 +336,25 @@ describe("modelFamilyToken", () => {
 		expect(modelFamilyToken("some-unknown-model")).toBe("");
 	});
 });
+describe("isGeminiModelId", () => {
+	test("matches gemini ids across namespaces", () => {
+		expect(isGeminiModelId("gemini-3.5-flash")).toBe(true);
+		expect(isGeminiModelId("google/gemini-3-pro")).toBe(true);
+		expect(isGeminiModelId("openrouter/google/gemini-2.5-flash")).toBe(true);
+		expect(isGeminiModelId("gpt-4o")).toBe(false);
+	});
+});
+
+describe("isGrokModelId", () => {
+	test("matches grok ids across namespaces and delimiters", () => {
+		expect(isGrokModelId("grok-4-6")).toBe(true);
+		expect(isGrokModelId("xai/grok-3")).toBe(true);
+		expect(isGrokModelId("venice/grok-4.5")).toBe(true);
+		expect(isGrokModelId("cursor-grok-4.5-high")).toBe(true);
+		expect(isGrokModelId("notgrok-4.6")).toBe(false);
+		expect(isGrokModelId("gpt-4o")).toBe(false);
+	});
+});
 
 describe("isGrokReasoningEffortCapable", () => {
 	test("matches effort-capable Grok SKUs across namespaces", () => {
@@ -288,6 +363,8 @@ describe("isGrokReasoningEffortCapable", () => {
 		expect(isGrokReasoningEffortCapable("grok-4.20-multi-agent")).toBe(true);
 		expect(isGrokReasoningEffortCapable("xai-oauth/grok-4.3")).toBe(true);
 		expect(isGrokReasoningEffortCapable("xai-oauth/grok-4.5")).toBe(true);
+		expect(isGrokReasoningEffortCapable("xai-oauth/grok-4.6")).toBe(true);
+		expect(isGrokReasoningEffortCapable("grok-4.6")).toBe(true);
 		expect(isGrokReasoningEffortCapable("openrouter/xai/grok-3-mini")).toBe(true);
 	});
 
@@ -296,5 +373,37 @@ describe("isGrokReasoningEffortCapable", () => {
 		expect(isGrokReasoningEffortCapable("grok-4.20-0309-reasoning")).toBe(false);
 		expect(isGrokReasoningEffortCapable("gpt-5")).toBe(false);
 		expect(isGrokReasoningEffortCapable("")).toBe(false);
+	});
+});
+
+describe("isGrokMultiAgentModelId", () => {
+	test("matches grok-4.20-multi-agent SKUs across namespaces", () => {
+		expect(isGrokMultiAgentModelId("grok-4.20-multi-agent")).toBe(true);
+		expect(isGrokMultiAgentModelId("grok-4.20-multi-agent-0309")).toBe(true);
+		expect(isGrokMultiAgentModelId("xai/grok-4.20-multi-agent-beta-latest")).toBe(true);
+	});
+
+	test("rejects other Grok ids", () => {
+		expect(isGrokMultiAgentModelId("grok-4.5")).toBe(false);
+		expect(isGrokMultiAgentModelId("grok-4.6")).toBe(false);
+		expect(isGrokMultiAgentModelId("grok-4.20-0309-reasoning")).toBe(false);
+		expect(isGrokMultiAgentModelId("")).toBe(false);
+	});
+});
+
+describe("isGrokXHighEffortCapable", () => {
+	test("matches grok-4.6 and multi-agent SKUs across namespaces", () => {
+		expect(isGrokXHighEffortCapable("grok-4.6")).toBe(true);
+		expect(isGrokXHighEffortCapable("xai/grok-4.6")).toBe(true);
+		expect(isGrokXHighEffortCapable("xai-oauth/grok-4.6")).toBe(true);
+		expect(isGrokXHighEffortCapable("grok-4.20-multi-agent-0309")).toBe(true);
+	});
+
+	test("rejects Grok SKUs that clamp leftover xhigh to high", () => {
+		expect(isGrokXHighEffortCapable("grok-4.5")).toBe(false);
+		expect(isGrokXHighEffortCapable("grok-4.3")).toBe(false);
+		expect(isGrokXHighEffortCapable("grok-3-mini")).toBe(false);
+		expect(isGrokXHighEffortCapable("grok-build")).toBe(false);
+		expect(isGrokXHighEffortCapable("")).toBe(false);
 	});
 });

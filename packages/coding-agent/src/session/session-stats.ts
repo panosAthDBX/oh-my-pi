@@ -22,6 +22,12 @@ interface PendingContextSnapshot {
 	promptTokens: number;
 	nonMessageTokens: number;
 	cutoffCount: number;
+	/**
+	 * Compaction epoch at rebase time. Distinguishes a genuinely fresh in-turn
+	 * anchor (same epoch) from a post-cutoff anchor that predates a mid-run
+	 * compaction (older epoch) so the latter never out-ranks this snapshot.
+	 */
+	epoch: number;
 }
 
 /** Capabilities the stats tracker borrows from its owning session. */
@@ -44,6 +50,7 @@ export class SessionStatsTracker {
 	readonly #host: SessionStatsTrackerHost;
 	#pendingContextSnapshot: PendingContextSnapshot | undefined;
 	#contextUsageRevision = 0;
+	#compactionEpoch = 0;
 
 	constructor(host: SessionStatsTrackerHost) {
 		this.#host = host;
@@ -162,8 +169,11 @@ export class SessionStatsTracker {
 			}
 		}
 
+		const anchorEpoch = anchorAssistant?.contextSnapshot?.compactionEpoch ?? 0;
 		const useAnchor =
-			anchorAssistant !== undefined && anchorIndex !== -1 && (!pending || anchorIndex >= pending.cutoffCount);
+			anchorAssistant !== undefined &&
+			anchorIndex !== -1 &&
+			(!pending || (anchorIndex >= pending.cutoffCount && anchorEpoch >= pending.epoch));
 		if (useAnchor && anchorAssistant) {
 			const promptTokens = correctedPromptTokens(anchorAssistant);
 			const nonMessageTokens =
@@ -255,6 +265,15 @@ export class SessionStatsTracker {
 		return this.#contextUsageRevision;
 	}
 
+	/**
+	 * Monotonic compaction epoch, bumped whenever history is compacted. Stamped
+	 * onto each assistant snapshot at record time so {@link getContextBreakdown}
+	 * can reject a post-cutoff anchor whose usage predates the last compaction.
+	 */
+	get compactionEpoch(): number {
+		return this.#compactionEpoch;
+	}
+
 	/** Non-message token count captured for the active provider request. */
 	get pendingNonMessageTokens(): number | undefined {
 		return this.#pendingContextSnapshot?.nonMessageTokens;
@@ -292,6 +311,7 @@ export class SessionStatsTracker {
 				assistant.contextSnapshot = {
 					promptTokens: calculatePromptTokens(assistant.usage),
 					nonMessageTokens: computeNonMessageTokens(this.#host.session),
+					compactionEpoch: this.#compactionEpoch,
 				};
 			}
 			const snapshot = assistant.contextSnapshot;
@@ -302,13 +322,14 @@ export class SessionStatsTracker {
 	}
 
 	/** Sets or clears the in-flight context snapshot. */
-	setPendingSnapshot(snapshot: PendingContextSnapshot | undefined): void {
-		this.#pendingContextSnapshot = snapshot;
+	setPendingSnapshot(snapshot: Omit<PendingContextSnapshot, "epoch"> | undefined): void {
+		this.#pendingContextSnapshot = snapshot ? { ...snapshot, epoch: this.#compactionEpoch } : undefined;
 		this.#contextUsageRevision++;
 	}
 
 	/** Recomputes an in-flight snapshot after history is compacted or rewritten. */
 	rebaseAfterCompaction(): void {
+		this.#compactionEpoch++;
 		if (!this.#pendingContextSnapshot) return;
 		const nonMessageTokens = computeNonMessageTokens(this.#host.session);
 		const messages = this.#host.agent.state.messages;

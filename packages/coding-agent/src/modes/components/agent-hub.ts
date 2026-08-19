@@ -36,6 +36,7 @@ import { type AgentRef, AgentRegistry, type AgentStatus, MAIN_AGENT_ID } from ".
 import { registerPersistedSubagents } from "../../registry/persisted-agents";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { shortenPath, truncateToWidth } from "../../tools/render-utils";
+import { formatLocalDateTimeWithOffset } from "../../utils/local-date";
 import type { ObservableSession, SessionObserverRegistry } from "../session-observer-registry";
 import { theme } from "../theme/theme";
 import { matchesSelectDown, matchesSelectUp } from "../utils/keybinding-matchers";
@@ -123,6 +124,8 @@ export interface AgentHubDeps {
 	ui?: TUI;
 	/** Tool lookup for transcript renderers (labels, custom render functions). */
 	getTool?: (name: string) => AgentTool | undefined;
+	/** Whether the active registry entry came from a built-in factory. */
+	isBuiltInTool?: (name: string) => boolean;
 	/** Extension message renderers for custom messages in the transcript. */
 	getMessageRenderer?: (customType: string) => MessageRenderer | undefined;
 	/** Cwd used by tool renderers for path shortening; defaults to the project dir. */
@@ -206,6 +209,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	// Transcript-viewer launch deps (passed through to AgentTranscriptViewer).
 	#ui: TUI;
 	#getTool: ((name: string) => AgentTool | undefined) | undefined;
+	#isBuiltInTool: ((name: string) => boolean) | undefined;
 	#getMessageRenderer: ((customType: string) => MessageRenderer | undefined) | undefined;
 	#cwd: string;
 	#hideThinkingBlock: (() => boolean) | undefined;
@@ -238,6 +242,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 				requestComponentRender: () => deps.requestRender(),
 			} as unknown as TUI);
 		this.#getTool = deps.getTool;
+		this.#isBuiltInTool = deps.isBuiltInTool;
 		this.#getMessageRenderer = deps.getMessageRenderer;
 		this.#cwd = deps.cwd ?? getProjectDir();
 		this.#hideThinkingBlock = deps.hideThinkingBlock;
@@ -364,6 +369,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			lifecycle: this.#remote ? undefined : this.#lifecycle,
 			ui: this.#ui,
 			getTool: this.#getTool,
+			isBuiltInTool: this.#isBuiltInTool,
 			getMessageRenderer: this.#getMessageRenderer,
 			cwd: this.#cwd,
 			hideThinkingBlock: this.#hideThinkingBlock,
@@ -824,7 +830,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			`Spawned by ${sanitizeDisplayText(ref.parentId ?? MAIN_AGENT_ID)}${children.length > 0 ? ` · ${children.length} children` : ""}`,
 		);
 		if (children.length > 0) add(theme.fg("dim", formatChildIds(children, width)));
-		add(theme.fg("dim", `Registered ${new Date(ref.createdAt).toISOString().slice(0, 16).replace("T", " ")}Z`));
+		add(theme.fg("dim", `Registered ${formatLocalDateTimeWithOffset(new Date(ref.createdAt))}`));
 
 		section("Changes");
 		add(

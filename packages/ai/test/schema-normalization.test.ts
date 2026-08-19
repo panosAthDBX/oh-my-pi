@@ -461,91 +461,9 @@ describe("normalizeSchemaForMCP", () => {
 		});
 	});
 
-	// Regression: issue #1101. Some MCP servers ship `JSON.stringify(zodSchema)`
-	// directly as a tool's `inputSchema`. Zod 4 surfaces `.type`, `.enum`,
-	// `.options`, and `.def` on every schema instance — those keys collide with
-	// JSON Schema keywords, producing payloads that fail Anthropic's strict
-	// JSON Schema 2020-12 validator (`"type":"enum"`, `"enum":{...}` as object).
-	// `normalizeSchemaForMCP` must rewrite the offending nodes into clean JSON
-	// Schema so the tool list still ships.
-	it("rewrites a Zod-enum instance leaked as inputSchema", () => {
-		const leaked = {
-			def: { type: "enum", entries: { upstream: "upstream", downstream: "downstream" } },
-			type: "enum",
-			enum: { upstream: "upstream", downstream: "downstream" },
-			options: ["upstream", "downstream"],
-		};
-		expect(normalizeSchemaForMCP(leaked)).toEqual({
-			type: "string",
-			enum: ["upstream", "downstream"],
-		});
-	});
-
-	it("rewrites a numeric Zod-enum (integer values keep integer type)", () => {
-		const leaked = {
-			def: { type: "enum", entries: { ONE: 1, TWO: 2 } },
-			type: "enum",
-			enum: { ONE: 1, TWO: 2 },
-			options: [1, 2],
-		};
-		expect(normalizeSchemaForMCP(leaked)).toEqual({
-			type: "integer",
-			enum: [1, 2],
-		});
-	});
-
-	it("rewrites a Zod-literal instance to a single-element enum", () => {
-		const leaked = {
-			def: { type: "literal", values: ["only"] },
-			type: "literal",
-			values: ["only"],
-		};
-		// Decontamination emits `{const:"only"}`; downstream normalizer collapses
-		// it to the equivalent enum form. End-to-end contract is what callers see.
-		expect(normalizeSchemaForMCP(leaked)).toEqual({ type: "string", enum: ["only"] });
-	});
-
-	it("rewrites a Zod-union of literals (downstream collapses anyOf-of-consts to enum)", () => {
-		const leaked = {
-			def: {
-				type: "union",
-				options: [
-					{ def: { type: "literal", values: ["on"] }, type: "literal", values: ["on"] },
-					{ def: { type: "literal", values: ["off"] }, type: "literal", values: ["off"] },
-				],
-			},
-			type: "union",
-		};
-		expect(normalizeSchemaForMCP(leaked)).toEqual({
-			type: "string",
-			enum: ["on", "off"],
-		});
-	});
-
-	it("strips null-valued JSON Schema keywords that Zod scalars leak (format: null, minLength: null)", () => {
-		const leaked = {
-			def: { type: "string", checks: [] },
-			type: "string",
-			format: null,
-			minLength: null,
-			maxLength: null,
-		};
-		expect(normalizeSchemaForMCP(leaked)).toEqual({ type: "string" });
-	});
-
-	it("drops invalid `type` for unmodelled Zod kinds so the residue stays valid", () => {
-		const leaked = {
-			def: { type: "any" },
-			type: "any",
-			description: "anything",
-		};
-		expect(normalizeSchemaForMCP(leaked)).toEqual({ description: "anything" });
-	});
-
 	it("leaves a genuine JSON Schema that happens to have a `def` property alone", () => {
-		// `def` is not a JSON Schema keyword but it's also not reserved. The
-		// detoxifier must only fire when `def.type` is a known Zod kind AND
-		// `node.type === def.type`, otherwise it would corrupt real schemas.
+		// `def` is not a JSON Schema keyword, so normalization must not corrupt
+		// schemas that use it as an ordinary property name.
 		const schema = {
 			type: "object",
 			properties: { def: { type: "string" } },
@@ -687,6 +605,63 @@ describe("sanitizeSchemaForOpenAIResponses", () => {
 		const properties = (sanitized as { properties: Record<string, unknown> }).properties;
 		expect(properties.self).toBe(sanitized as unknown as object);
 		expect((sanitized as { type: unknown }).type).toBe("object");
+	});
+
+	it("preserves exclusive-required anyOf for provider-specific handling", () => {
+		const schema = {
+			type: "object",
+			properties: {
+				project: { type: "string" },
+				paths: { type: "array", items: { type: "string" } },
+				scopes: { type: "array", items: { type: "string" } },
+			},
+			required: ["project"],
+			anyOf: [{ required: ["paths"] }, { required: ["scopes"] }],
+		};
+
+		expect(sanitizeSchemaForOpenAIResponses(schema)).toEqual({
+			type: "object",
+			properties: {
+				project: { type: "string" },
+				paths: { type: "array", items: { type: "string" } },
+				scopes: { type: "array", items: { type: "string" } },
+			},
+			required: ["project"],
+			anyOf: [{ required: ["paths"] }, { required: ["scopes"] }],
+		});
+	});
+
+	it("does not flatten nested exclusive-required anyOf (xAI only rejects the tool root)", () => {
+		const schema = {
+			type: "object",
+			properties: {
+				outputSchema: {
+					type: "object",
+					properties: {
+						paths: { type: "array", items: { type: "string" } },
+						scopes: { type: "array", items: { type: "string" } },
+					},
+					anyOf: [{ required: ["paths"] }, { required: ["scopes"] }],
+				},
+			},
+			required: ["outputSchema"],
+		};
+		const sanitized = sanitizeSchemaForOpenAIResponses(schema);
+		expect(sanitized.anyOf).toBeUndefined();
+		const outputSchema = (sanitized.properties as Record<string, unknown>).outputSchema as Record<string, unknown>;
+		expect(outputSchema.anyOf).toEqual([{ required: ["paths"] }, { required: ["scopes"] }]);
+	});
+
+	it("does not flatten a root union that constrains existing properties", () => {
+		const schema = {
+			type: "object",
+			properties: { kind: { type: "string" } },
+			anyOf: [{ properties: { kind: { const: "a" } } }, { properties: { kind: { const: "b" } } }],
+		};
+		expect(sanitizeSchemaForOpenAIResponses(schema).anyOf).toEqual([
+			{ properties: { kind: { const: "a" } } },
+			{ properties: { kind: { const: "b" } } },
+		]);
 	});
 });
 
@@ -1096,7 +1071,6 @@ describe("normalizeSchemaForCCA", () => {
 		};
 		(circular.properties as Record<string, unknown>).self = circular;
 
-		expect(() => normalizeSchemaForCCA(circular)).not.toThrow();
 		expect(normalizeSchemaForCCA(circular)).toEqual({
 			type: "object",
 			properties: {

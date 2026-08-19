@@ -73,6 +73,25 @@ export const isQwenModelId = memo((modelId: string): boolean => {
 	return modelId.toLowerCase().includes("qwen");
 });
 
+/**
+ * Open-weight Qwen 3.8+ releases (`qwen3.8-27b`, `qwen3.8-2.4t-a95b`, GGUF
+ * names like `Qwen3.8-27B-UD-Q6_K_XL`) whose chat template steers thinking
+ * depth through a `reasoning_effort` template kwarg (`low`/`medium`/`xhigh`,
+ * template default `xhigh`; thinking itself cannot be disabled). Compared
+ * component-wise so `qwen3.10` sorts after `qwen3.8`. API-only `-max` SKUs are
+ * excluded — Dashscope drives them through OpenAI-style `reasoning_effort`
+ * with curated compat. The trailing guard rejects parameter-count lookalikes
+ * (`qwen-3.8b`) without breaking `qwen3.8-27b`.
+ */
+export const isQwen38PlusTemplateEffortModelId = memo((modelId: string): boolean => {
+	const match = /qwen[-_ ]?(\d+)\.(\d+)(?![\dbB])/i.exec(modelId);
+	if (!match) return false;
+	const major = Number.parseInt(match[1], 10);
+	const minor = Number.parseInt(match[2], 10);
+	if (major < 3 || (major === 3 && minor < 8)) return false;
+	return !/^-max(?:$|[-.:])/i.test(modelId.slice(match.index + match[0].length));
+});
+
 /** Gemma open-weights family (`gemma-3-27b-it`, `google/gemma-4-E2B-it`, `gemma2-9b`). */
 export const isGemmaModelId = memo((modelId: string): boolean => {
 	return /(^|\/)gemma[-.]?\d/i.test(modelId);
@@ -83,22 +102,72 @@ export const isDeepseekModelIdOrName = memo((value: string): boolean => {
 	return value.toLowerCase().includes("deepseek");
 });
 
+/**
+ * DeepSeek V4 Flash SKU in any host/namespace form (`deepseek-v4-flash`, dated
+ * `deepseek-v4-flash-0731`, `deepseek-ai/DeepSeek-V4-Flash`). Both V4 SKUs
+ * (Flash and Pro) accept the `low` reasoning_effort tier; this predicate keeps
+ * Flash distinguishable from Pro where a host quirk splits them (e.g.
+ * OpenRouter exposes `low` on Flash but only `high` on non-Flash V4).
+ * See https://api-docs.deepseek.com/api/create-chat-completion.
+ */
+export const isDeepseekV4FlashModelId = memo((modelId: string): boolean => {
+	return bareModelId(modelId).toLowerCase().includes("deepseek-v4-flash");
+});
+
 /** Xiaomi MiMo family by id or display name. */
 export const isMimoModelIdOrName = memo((value: string): boolean => {
 	return value.toLowerCase().includes("mimo");
 });
 
-const GROK_EFFORT_CAPABLE_PREFIXES = ["grok-3-mini", "grok-4.20-multi-agent", "grok-4.3", "grok-4.5"] as const;
+/** Gemini family ids in any namespace form (`gemini-*`, `google/gemini-*`, `openrouter/google/gemini-…`). */
+export const isGeminiModelId = memo((modelId: string): boolean => {
+	return /(^|\/)gemini[-.]?/i.test(modelId);
+});
+
+/** Grok family ids across namespace and delimiter forms (`grok-*`, `cursor-grok-*`, `xai/grok-*`). */
+export const isGrokModelId = memo((modelId: string): boolean => {
+	return /(?:^|[./_-])grok(?:[-.]|$)/i.test(modelId);
+});
+
+const GROK_EFFORT_CAPABLE_PREFIXES = [
+	"grok-3-mini",
+	"grok-4.20-multi-agent",
+	"grok-4.3",
+	"grok-4.5",
+	"grok-4.6",
+] as const;
 
 /**
  * Grok SKUs that expose the wire `reasoning.effort` dial. Other Grok reasoners
  * (e.g. `grok-build`, `grok-4.20-0309-reasoning`) think natively but reject the
- * param, so callers must omit reasoning effort for them.
+ * param, so callers must omit reasoning effort for them. `grok-4.6` accepts
+ * `low`/`medium`/`high`/`xhigh` and 400s on `max`.
  */
 export const isGrokReasoningEffortCapable = memo((modelId: string): boolean => {
 	const bare = bareModelId(modelId).trim().toLowerCase();
 	if (!bare) return false;
 	return GROK_EFFORT_CAPABLE_PREFIXES.some(prefix => bare.startsWith(prefix));
+});
+
+/**
+ * `grok-4.20-multi-agent*` uses `reasoning.effort` to pick agent count
+ * (`xhigh` is the 16-agent mode). Other first-party Grok effort SKUs stay on
+ * `low|medium|high` unless {@link isGrokXHighEffortCapable} (currently
+ * `grok-4.6*` plus multi-agent).
+ * https://docs.x.ai/developers/model-capabilities/text/reasoning
+ */
+export const isGrokMultiAgentModelId = memo((modelId: string): boolean => {
+	return bareModelId(modelId).trim().toLowerCase().startsWith("grok-4.20-multi-agent");
+});
+
+/**
+ * First-party Grok SKUs whose Responses wire accepts `reasoning.effort: "xhigh"`.
+ * `grok-4.6*` documents xhigh as a reasoning depth; multi-agent uses it as
+ * 16-agent mode. `grok-4.5` / `grok-4.3` / `grok-3-mini` do not.
+ */
+export const isGrokXHighEffortCapable = memo((modelId: string): boolean => {
+	if (isGrokMultiAgentModelId(modelId)) return true;
+	return bareModelId(modelId).trim().toLowerCase().startsWith("grok-4.6");
 });
 
 /**
@@ -229,6 +298,25 @@ export const isGlm52ReasoningEffortModelId = memo((modelId: string): boolean => 
 	return semverGte(glm.version, "5.2");
 });
 
+/**
+ * GLM-5.3+ coding SKUs. Unlike GLM-5.2 (whose reasoning_effort dialect is
+ * host-specific), GLM-5.3+ exposes a uniform wire-exact `low`/`high`/`max`
+ * ladder on every host, and thinking can no longer be disabled —
+ * `thinking.type` must always be `enabled`. Matching the family keeps future
+ * bumps (`glm-5.4`, `glm-6`, …) covered while excluding the vision (`…v`)
+ * shape and the non-reasoning `-flash`/`-flashx`/`-preview` variants.
+ */
+export const isGlm53ReasoningEffortModelId = memo((modelId: string): boolean => {
+	const glm = parseGlmModel(bareModelId(modelId));
+	if (!glm || glm.vision) {
+		return false;
+	}
+	if (glm.variant !== "base" && glm.variant !== "air" && glm.variant !== "turbo") {
+		return false;
+	}
+	return semverGte(glm.version, "5.3");
+});
+
 /** GLM vision SKUs — the `v` that attaches to the version (`glm-4v`, `glm-4.5v`). */
 export const isGlmVisionModelId = memo((modelId: string): boolean => {
 	return parseGlmModel(bareModelId(modelId))?.vision === true;
@@ -249,12 +337,14 @@ export const modelFamilyToken = memo((modelId: string): string => {
 	const parsed = parseKnownModel(modelId);
 	if (parsed.family !== "unknown") return parsed.family;
 	if (isClaudeModelId(modelId) || isAnthropicNamespacedModelId(modelId)) return "anthropic";
+	if (isGeminiModelId(modelId)) return "gemini";
+	if (isGrokModelId(modelId)) return "grok";
+	if (isDeepseekModelIdOrName(modelId)) return "deepseek";
 	if (isOpenAIModelId(modelId)) return "openai";
 	if (isKimiModelId(modelId)) return "kimi";
 	if (isQwenModelId(modelId)) return "qwen";
 	if (isMinimaxM2FamilyModelId(modelId) || isMinimaxM3FamilyModelId(modelId)) return "minimax";
 	if (isOpenAIGptOssModelId(modelId)) return "gpt-oss";
-	if (isDeepseekModelIdOrName(modelId)) return "deepseek";
 	if (isMimoModelIdOrName(modelId)) return "mimo";
 	if (isGemmaModelId(modelId)) return "gemma";
 	if (parseGlmModel(bareModelId(modelId))) return "glm";

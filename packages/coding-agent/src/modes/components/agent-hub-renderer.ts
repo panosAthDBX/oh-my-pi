@@ -16,7 +16,7 @@ export interface RosterRender {
 }
 
 /** Legacy progress snapshots may omit counters; snapshot absence remains distinct. */
-export function metricNumber(value: number | undefined): number {
+function metricNumber(value: number | undefined): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
@@ -67,7 +67,7 @@ export function statusText(status: AgentRef["status"], text: string): string {
 }
 
 /** Model id + thinking level (`sonnet-4-6 ◒ high`), level colored per theme. */
-export function formatModelBadge(modelId: string, level: ThinkingLevel | undefined): string {
+function formatModelBadge(modelId: string, level: ThinkingLevel | undefined): string {
 	const model = theme.fg("muted", sanitizeDisplayText(modelId));
 	if (!level || level === ThinkingLevel.Off || level === ThinkingLevel.Inherit) return model;
 	const display = theme.thinking[level as keyof typeof theme.thinking] ?? level;
@@ -81,11 +81,7 @@ export function formatRoleBadge(role: string, settings: Settings): string {
 }
 
 /** Format a resolved selector, preserving provider identity when requested. */
-export function formatResolvedModelBadge(
-	resolved: string,
-	preserveProvider = false,
-	fallbackLevel?: ThinkingLevel,
-): string {
+function formatResolvedModelBadge(resolved: string, preserveProvider = false, fallbackLevel?: ThinkingLevel): string {
 	const cleanResolved = sanitizeDisplayText(resolved);
 	// Model ids may themselves contain colons (`qwen3:14b`), so only treat the
 	// suffix as a thinking level when it parses as one.
@@ -99,19 +95,25 @@ export function formatResolvedModelBadge(
 /**
  * Resolved model + reasoning level for a hub row. Exact executor progress is
  * authoritative (and survives completion); direct live sessions are the
- * fallback for agents without an observer snapshot.
+ * fallback for agents without an observer snapshot — the main session has no
+ * snapshot at all, so its row is read straight off the live session.
+ *
+ * Every source reports the model that produced the row's work, never the one
+ * the session merely points at: an armed fallback that has not served yet stays
+ * attributed to whichever model last actually spoke.
  */
 export function modelBadge(ref: AgentRef, observed: ObservableSession | undefined): string | undefined {
 	const progress = observed?.progress;
 	const liveThinkingLevel = ref.session?.thinkingLevel;
+	const serving = ref.session?.servingModel;
 	const fallbackSelector =
-		ref.session?.retryFallbackModel ??
+		(serving?.isFallback ? serving.selector : undefined) ??
 		(progress?.resolvedModelIsFallback ? progress.resolvedModel : undefined) ??
 		(ref.history?.resolvedModelIsFallback ? ref.history.resolvedModel : undefined);
 	if (fallbackSelector) {
 		return `${theme.fg("warning", "fallback →")} ${formatResolvedModelBadge(fallbackSelector, true, liveThinkingLevel)}`;
 	}
-	const resolvedModel = progress?.resolvedModel ?? ref.history?.resolvedModel;
+	const resolvedModel = progress?.resolvedModel ?? ref.history?.resolvedModel ?? serving?.selector;
 	if (resolvedModel) return formatResolvedModelBadge(resolvedModel, false, liveThinkingLevel);
 	const model = ref.session?.model;
 	if (!model) return undefined;

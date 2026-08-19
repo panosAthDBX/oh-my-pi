@@ -53,6 +53,7 @@ function lineContaining(lines: string[], marker: string): number {
 
 function createFixture(hideToolActivity = false) {
 	const chatContainer = new TranscriptContainer();
+	chatContainer.setToolActivityVisible(!hideToolActivity);
 	const pendingTools = new Map();
 	const ui = {
 		requestRender: vi.fn(),
@@ -61,6 +62,7 @@ function createFixture(hideToolActivity = false) {
 	} as unknown as TUI;
 	const viewSession = {
 		getToolByName: () => undefined,
+		hasBuiltInTool: () => true,
 		extensionRunner: undefined,
 		isTtsrAbortPending: false,
 		retryAttempt: 0,

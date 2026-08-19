@@ -4,6 +4,14 @@ import { StatusLineComponent } from "../../../../src/modes/components/status-lin
 import { getThemeByName, setThemeInstance } from "../../../../src/modes/theme/theme";
 import type { AgentSession } from "../../../../src/session/agent-session";
 
+// The cost assertions below care about how the two costs are rendered, not about
+// terminal width. The status line also shows the cwd and git branch, so a long
+// checkout path or branch name eats the budget and pushes the cost segment out
+// at a realistic 120 columns. Render these two cases wide enough that the
+// segment always fits, and let the width-sensitive behavior stay covered by the
+// truncation tests that target it directly.
+const WIDE_ENOUGH_FOR_COST_SEGMENT = 400;
+
 function makeSessionWithLastMessage(
 	lastMessage: unknown,
 	prewalkArmed: boolean = false,
@@ -102,7 +110,7 @@ describe("StatusLineComponent", () => {
 			}) as unknown as AgentSession,
 		);
 
-		const stripped = statusLine.getTopBorder(120).content.replace(/\x1b\[[0-9;]*m/g, "");
+		const stripped = statusLine.getTopBorder(WIDE_ENOUGH_FOR_COST_SEGMENT).content.replace(/\x1b\[[0-9;]*m/g, "");
 		expect(stripped).toContain("$2.67 (sub) + $0.41 (adv)");
 	});
 
@@ -114,7 +122,7 @@ describe("StatusLineComponent", () => {
 			}) as unknown as AgentSession,
 		);
 
-		const stripped = statusLine.getTopBorder(120).content.replace(/\x1b\[[0-9;]*m/g, "");
+		const stripped = statusLine.getTopBorder(WIDE_ENOUGH_FOR_COST_SEGMENT).content.replace(/\x1b\[[0-9;]*m/g, "");
 		expect(stripped).toContain("$2.67 (sub)");
 		expect(stripped).not.toContain("(adv)");
 	});
