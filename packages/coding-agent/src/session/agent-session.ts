@@ -186,6 +186,10 @@ import {
 } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import {
+	clearTrustedTaskInvocationModelOverride,
+	validateTrustedTaskInvocationEnvelope,
+} from "../task/invocation-model-override";
+import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
 	parseConfiguredThinkingLevel,
@@ -3712,22 +3716,37 @@ export class AgentSession {
 		const eventArgs = computer
 			? { actions: computer.actions, pendingSafetyChecks: computer.pendingSafetyChecks }
 			: ctx.args;
+		const trustedTaskScopeId = this.sessionManager.getSessionId();
 		runner.markToolCallEmitted(ctx.toolCall.id, ctx.tool.name);
-		const callResult = await runner.emitToolCall(
-			{
-				type: "tool_call",
-				toolName: ctx.tool.name,
-				toolCallId: ctx.toolCall.id,
-				input: normalizeToolEventInput(ctx.tool.name, resolveToolEventInput(ctx.tool, eventArgs)),
-			},
-			signal,
-		);
+		let callResult: { block?: boolean; reason?: string; input?: Record<string, unknown> } | undefined;
+		try {
+			callResult = await runner.emitToolCall(
+				{
+					type: "tool_call",
+					toolName: ctx.tool.name,
+					toolCallId: ctx.toolCall.id,
+					input: normalizeToolEventInput(ctx.tool.name, resolveToolEventInput(ctx.tool, eventArgs)),
+				},
+				signal,
+			);
+		} catch (error) {
+			if (ctx.tool.name === "task") clearTrustedTaskInvocationModelOverride(trustedTaskScopeId, ctx.toolCall.id);
+			throw error;
+		}
 		if (callResult?.block) {
+			if (ctx.tool.name === "task") clearTrustedTaskInvocationModelOverride(trustedTaskScopeId, ctx.toolCall.id);
 			return { block: true, reason: callResult.reason || "Tool execution was blocked by an extension" };
 		}
 		// A computer call's event input is a synthetic {actions, pendingSafetyChecks}
 		// view, not the execution params — a revision cannot map back onto them.
 		if (callResult?.input !== undefined && !computer) {
+			if (
+				ctx.tool.name === "task" &&
+				validateTrustedTaskInvocationEnvelope(trustedTaskScopeId, ctx.toolCall.id, callResult.input) === false
+			) {
+				clearTrustedTaskInvocationModelOverride(trustedTaskScopeId, ctx.toolCall.id);
+				return { block: true, reason: "Trusted task invocation was mutated after model authorization" };
+			}
 			return { args: callResult.input };
 		}
 		return undefined;

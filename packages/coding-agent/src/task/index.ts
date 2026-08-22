@@ -46,6 +46,7 @@ import type { AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { AgentRegistry } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
+import { consumeTrustedTaskInvocationModelOverride } from "./invocation-model-override";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
@@ -293,6 +294,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
  */
 function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string): TaskParams {
 	const spawn: TaskParams = { agent: item.agent?.trim() || defaultAgent };
+	if (params.modelOverride !== undefined) spawn.modelOverride = params.modelOverride;
 	if (item.name !== undefined) spawn.name = item.name;
 	if (item.task !== undefined) spawn.task = item.task;
 	if (params.context !== undefined) spawn.context = params.context;
@@ -652,6 +654,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			assignment: (params.task ?? "").trim(),
 			context: this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined,
 			agent: params.agent,
+			...(params.modelOverride !== undefined ? { model: params.modelOverride } : {}),
 			...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 			...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 			...(params.effort !== undefined ? { effort: params.effort } : {}),
@@ -678,18 +681,38 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const params = repairTaskParams(rawParams as TaskParams);
+		// Serialized/model-authored hidden fields carry no authority. Only a
+		// trusted extension grant keyed to this exact tool call can restore one.
+		delete params.modelOverride;
 		// Schema defaults fill `agent` for model calls, but internal callers
 		// and stale transcripts can bypass arktype. `spawnParamsFor` resolves each
 		// item's agent type against the session's actual default agent.
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
 		const batchEnabled = this.#isBatchEnabled();
+		const spawnItems = resolveSpawnItems(params);
+		const normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
+		try {
+			const scopeId = this.session.getSessionId?.();
+			const trustedModelOverride = scopeId
+				? consumeTrustedTaskInvocationModelOverride(
+						scopeId,
+						toolCallId,
+						normalizedSpawnParams[0] ?? {},
+						normalizedSpawnParams.length,
+						params,
+					)
+				: undefined;
+			if (trustedModelOverride !== undefined) {
+				params.modelOverride = trustedModelOverride;
+				normalizedSpawnParams[0]!.modelOverride = trustedModelOverride;
+			}
+		} catch (error) {
+			return createTaskModeError(error instanceof Error ? error.message : String(error));
+		}
 		const validationError = validateShapeParams(batchEnabled, params) ?? validateSpawnParams(params, batchEnabled);
 		if (validationError) {
 			return createTaskModeError(validationError);
 		}
-
-		const spawnItems = resolveSpawnItems(params);
-		const normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
 		const resolvedAgents = normalizedSpawnParams.map(spawn => spawn.agent ?? defaultAgent);
 		// Resolve every item before choosing an execution path. No executor or
 		// job manager may observe a batch unless every effective policy is valid.
@@ -1421,6 +1444,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				assignment,
 				context,
 				agent: params.agent,
+				...(params.modelOverride !== undefined ? { model: params.modelOverride } : {}),
 				...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 				...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 				...(params.effort !== undefined ? { effort: params.effort } : {}),
