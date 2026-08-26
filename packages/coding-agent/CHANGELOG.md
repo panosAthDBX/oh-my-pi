@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `setTodoProjection()` coding-agent extension API for namespaced, display-only lifecycle progress that stays isolated from native session todos and transcript state; RPC clients receive defensive projection snapshots, including projections published by `session_start` handlers ([#6522](https://github.com/can1357/oh-my-pi/pull/6522) by [@panosAthDBX](https://github.com/panosAthDBX)).
+
 ### Changed
 
 - `/settings` rows can now carry a risk note: a warning glyph on the row plus a warning-colored line above the description. `External Thinking` (`externalThinking`, `--external-thinking`) is the first user — providers have flagged the request shape it produces as abuse, up to account-level enforcement, so both the settings entry and `--help` now say so.
@@ -896,7 +900,6 @@
 
 ### Added
 
-- Added the `setTodoProjection()` coding-agent extension API for namespaced, display-only lifecycle progress that stays isolated from native session todos and transcript state; RPC clients receive defensive projection snapshots, including projections published by `session_start` handlers ([#6522](https://github.com/can1357/oh-my-pi/pull/6522) by [@panosAthDBX](https://github.com/panosAthDBX)).
 - `omp usage` now surfaces auto-disabled credentials as red `✗` tombstone rows (identity, how long ago, the shortened upstream cause — e.g. `Refresh token expired` — and a re-login hint), including a provider section when no active credential remains. User-driven tombstones (`replaced by newer credential`, `deleted by user`) and API-key rows stay hidden. Requires a broker with `GET /v1/credentials/disabled`; older brokers degrade to no tombstone rows.
 - `omp usage` warns about Anthropic's ~30-day OAuth grant lifetime: accounts whose interactive login (`authorizedAt`) is within a week of the deadline get a yellow `⚠ re-login within <time>` line, and past-deadline accounts a red one. Grants die server-side exactly ~30 days after login regardless of refresh rotation, so this is the only warning before the broker auto-disables the row.
 
