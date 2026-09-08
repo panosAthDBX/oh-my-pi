@@ -15,7 +15,7 @@ import {
 	testSetExtensionHandlerTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
-import * as memoryBackendModule from "@oh-my-pi/pi-coding-agent/memory-backend";
+
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import {
 	type CreateAgentSessionOptions,
@@ -2392,13 +2392,13 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			let deactivation: Promise<void> | undefined;
 			try {
 				const handlers = await captureCursorExecHandlers(session, cursorModel);
-				vi.spyOn(memoryBackendModule, "resolveMemoryBackend").mockResolvedValue({
-					buildDeveloperInstructions: async () => {
-						rebuildStarted.resolve();
-						await releaseRebuild.promise;
-						return undefined;
-					},
-				} as never);
+				const memoryBackend = session.getMemoryBackend();
+				if (!memoryBackend) throw new Error("expected session-owned memory backend");
+				vi.spyOn(memoryBackend, "buildDeveloperInstructions").mockImplementation(async () => {
+					rebuildStarted.resolve();
+					await releaseRebuild.promise;
+					return undefined;
+				});
 
 				deactivation = session.setActiveToolsByName(["read"]);
 				try {

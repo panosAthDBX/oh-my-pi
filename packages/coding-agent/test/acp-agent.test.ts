@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type {
@@ -146,6 +147,7 @@ class FakeAgentSession {
 	customMessageOptions: Array<{ streamingBehavior?: "steer" | "followUp"; queueChipText?: string } | undefined> = [];
 	skillsSettings = { enableSkillCommands: true };
 	skills: Array<{ name: string; description: string; filePath: string; baseDir: string; source: string }> = [];
+	effectiveExtensionRoots: EffectiveExtensionRoots | undefined;
 	refreshSkillsCalls = 0;
 	async refreshSkills(): Promise<void> {
 		this.refreshSkillsCalls++;
@@ -1837,6 +1839,12 @@ describe("ACP agent", () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
+		session.effectiveExtensionRoots = {
+			explicit: [],
+			mode: "explicit-only",
+			configured: [],
+			configuredLevel: "user",
+		};
 		const skillDir = path.join(harness.cwdA, ".skills", "sample");
 		const skillPath = path.join(skillDir, "SKILL.md");
 		await fs.promises.mkdir(skillDir, { recursive: true });
