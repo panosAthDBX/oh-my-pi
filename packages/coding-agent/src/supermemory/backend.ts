@@ -368,7 +368,7 @@ function serializeScopeTransition<T>(state: SupermemorySessionState, transition:
 }
 
 async function waitForDocumentWrites(container: SupermemoryContainerState): Promise<void> {
-	while (container.documentWrites.size > 0) await Promise.allSettled([...container.documentWrites]);
+	while (container.documentWrites.size > 0) await Promise.allSettled(container.documentWrites);
 }
 
 async function refreshStateForOperation(

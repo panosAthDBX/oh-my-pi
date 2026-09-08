@@ -81,7 +81,7 @@ function makeSession(
 			return () => listeners.delete(listener);
 		},
 		emit(event: Parameters<AgentSessionEventListener>[0]) {
-			for (const listener of [...listeners]) listener(event);
+			for (const listener of Array.from(listeners)) listener(event);
 		},
 		setCwd(nextCwd: string) {
 			cwd = nextCwd;
