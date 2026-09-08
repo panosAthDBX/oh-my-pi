@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { Settings } from "../config/settings";
-import * as git from "../utils/git";
 
 export type SupermemoryScoping = "global" | "per-project";
 export type SupermemorySearchMode = "hybrid" | "memories";
@@ -89,7 +89,7 @@ export function isSupermemoryConfigured(config: SupermemoryConfig): config is Su
  */
 export async function resolveSupermemoryContainerTag(cwd: string, scoping: SupermemoryScoping): Promise<string> {
 	if (scoping === "global") return "omp-global";
-	const repositoryIdentity = git.repo.primaryRootSync(cwd);
+	const repositoryIdentity = vcs.git(cwd)?.primaryRoot();
 	let canonicalIdentity = path.resolve(repositoryIdentity ?? cwd);
 	try {
 		canonicalIdentity = await fs.realpath(canonicalIdentity);

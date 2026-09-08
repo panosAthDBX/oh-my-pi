@@ -693,26 +693,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// item's agent type against the session's actual default agent.
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
 		const batchEnabled = this.#isBatchEnabled();
-		const spawnItems = resolveSpawnItems(params);
-		const normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
-		try {
-			const scopeId = this.session.getSessionId?.();
-			const trustedModelOverride = scopeId
-				? consumeTrustedTaskInvocationModelOverride(
-						scopeId,
-						toolCallId,
-						normalizedSpawnParams[0] ?? {},
-						normalizedSpawnParams.length,
-						params,
-					)
-				: undefined;
-			if (trustedModelOverride !== undefined) {
-				params.modelOverride = trustedModelOverride;
-				normalizedSpawnParams[0]!.modelOverride = trustedModelOverride;
-			}
-		} catch (error) {
-			return createTaskModeError(error instanceof Error ? error.message : String(error));
-		}
 		const validationError = validateShapeParams(batchEnabled, params) ?? validateSpawnParams(params, batchEnabled);
 		if (validationError) {
 			return createTaskModeError(validationError);
@@ -732,6 +712,24 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 		}
 		const normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
+		try {
+			const scopeId = this.session.getSessionId?.();
+			const trustedModelOverride = scopeId
+				? consumeTrustedTaskInvocationModelOverride(
+						scopeId,
+						toolCallId,
+						normalizedSpawnParams[0] ?? {},
+						normalizedSpawnParams.length,
+						params,
+					)
+				: undefined;
+			if (trustedModelOverride !== undefined) {
+				params.modelOverride = trustedModelOverride;
+				normalizedSpawnParams[0]!.modelOverride = trustedModelOverride;
+			}
+		} catch (error) {
+			return createTaskModeError(error instanceof Error ? error.message : String(error));
+		}
 		const resolvedAgents = normalizedSpawnParams.map(spawn => spawn.agent ?? defaultAgent);
 		// Resolve every item before choosing an execution path. No executor or
 		// job manager may observe a batch unless every effective policy is valid.
