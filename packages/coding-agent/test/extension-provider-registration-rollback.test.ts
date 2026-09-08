@@ -209,6 +209,7 @@ describe("extension provider registration rollback", () => {
 					setThinkingLevel: () => {},
 					getSessionName: () => undefined,
 					setSessionName: async () => {},
+					setTodoProjection: () => {},
 				},
 				{
 					getModel: () => undefined,

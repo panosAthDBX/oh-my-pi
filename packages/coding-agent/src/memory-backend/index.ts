@@ -6,6 +6,7 @@ export type {
 	MnemopiSessionState,
 	MnemopiSessionStateOptions,
 } from "../mnemopi/state";
+export * from "../supermemory/config";
 export * from "./local-backend";
 export * from "./messages";
 export * from "./off-backend";

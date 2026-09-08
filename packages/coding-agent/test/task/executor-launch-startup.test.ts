@@ -49,6 +49,7 @@ it("overlaps registry refresh with session-file opening and session setup", asyn
 		sessionManager: { appendSessionInit: () => {} },
 		getActiveToolNames: () => ["yield"],
 		getEnabledToolNames: () => ["yield"],
+		getTodoProjections: () => [],
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
 			return () => {};

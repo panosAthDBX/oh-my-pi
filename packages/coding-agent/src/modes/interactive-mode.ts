@@ -78,6 +78,7 @@ import type {
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
+import type { NamespacedTodoProjection, TodoProjectionItem } from "../extensibility/extensions/todo-projection";
 import type { CompactOptions } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
@@ -132,6 +133,7 @@ import {
 	formatFeedModelBadge,
 	formatMoreItems,
 	isFeedModelBadgeEnabled,
+	PREVIEW_LIMITS,
 	replaceTabs,
 	shortenPath,
 	TRUNCATE_LENGTHS,
@@ -586,6 +588,82 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 	];
 }
 
+/** Sanitize and bound extension-owned projection text for every interactive render path. */
+function formatTodoProjectionText(value: string, maxWidth: number): string {
+	const sanitized = replaceTabs(sanitizeText(value)).replace(/[\r\n]+/g, " ");
+	return truncateToWidth(shortenPath(sanitized), Math.max(1, maxWidth));
+}
+
+function formatTodoProjectionTask(task: TodoProjectionItem, maxWidth: number): string {
+	const checkbox = theme.checkbox;
+	const content = formatTodoProjectionText(
+		task.content,
+		Math.min(TRUNCATE_LENGTHS.CONTENT, maxWidth - visibleWidth(`${checkbox.unchecked} `)),
+	);
+	switch (task.status) {
+		case "in_progress":
+			return theme.fg("accent", `${checkbox.unchecked} ${content}`);
+		case "completed":
+			return theme.fg("success", `${checkbox.checked} ${chalk.strikethrough(content)}`);
+		case "failed":
+			return theme.fg("error", `× ${content}`);
+		case "cancelled":
+			return theme.fg("error", `− ${chalk.strikethrough(content)}`);
+		case "abandoned":
+			return theme.fg("dim", `− ${chalk.strikethrough(content)}`);
+		default:
+			return theme.fg("dim", `${checkbox.unchecked} ${content}`);
+	}
+}
+
+/** Format allowlisted projection fields for the anchored interactive todo HUD. */
+export function renderTodoProjectionLines(projections: readonly NamespacedTodoProjection[], columns: number): string[] {
+	let totalRows = 0;
+	for (const projection of projections) {
+		let hasVisiblePhase = false;
+		for (const phase of projection.phases) {
+			if (phase.tasks.length === 0) continue;
+			hasVisiblePhase = true;
+			totalRows += 1 + phase.tasks.length;
+		}
+		if (hasVisiblePhase) totalRows++;
+	}
+	const lines: string[] = [];
+	let visibleRows = 0;
+	for (const projection of projections) {
+		if (visibleRows >= PREVIEW_LIMITS.COLLAPSED_ITEMS) break;
+		if (!projection.phases.some(phase => phase.tasks.length > 0)) continue;
+		const namespace = formatTodoProjectionText(projection.namespace, Math.min(TRUNCATE_LENGTHS.TITLE, columns));
+		lines.push("", theme.bold(theme.fg("accent", namespace)));
+		visibleRows++;
+		for (const phase of projection.phases) {
+			if (visibleRows >= PREVIEW_LIMITS.COLLAPSED_ITEMS) break;
+			if (phase.tasks.length === 0) continue;
+			let done = 0;
+			for (const task of phase.tasks) {
+				if (task.status === "completed") done++;
+			}
+			const progress = ` · ${done}/${phase.tasks.length}`;
+			const phaseName = formatTodoProjectionText(
+				phase.name,
+				Math.min(TRUNCATE_LENGTHS.TITLE, columns - 1 - visibleWidth(progress)),
+			);
+			lines.push(` ${theme.fg("muted", phaseName)}${theme.fg("dim", progress)}`);
+			visibleRows++;
+			for (const task of phase.tasks) {
+				if (visibleRows >= PREVIEW_LIMITS.COLLAPSED_ITEMS) break;
+				lines.push(`   ${formatTodoProjectionTask(task, columns - 3)}`);
+				visibleRows++;
+			}
+		}
+	}
+	const hiddenRows = totalRows - visibleRows;
+	if (hiddenRows > 0) {
+		const label = `… ${hiddenRows} more projected row${hiddenRows === 1 ? "" : "s"}`;
+		lines.push(theme.fg("dim", formatTodoProjectionText(label, columns)));
+	}
+	return lines;
+}
 const CTRL_L_APPEARANCE_RESPONSE_DEADLINE_MS = 2000;
 
 export class InteractiveMode implements InteractiveModeContext {
@@ -1337,6 +1415,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		// Initialize hooks with TUI-based UI context
 		await logger.time("InteractiveMode.init:hooks", () => this.initHooksAndCustomTools());
+		this.refreshTodoProjections();
 
 		// Restore mode from session (e.g. plan mode on resume)
 		this.session.setSessionBeforeSwitchReconciler?.(async () => {
@@ -2643,7 +2722,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	#renderTodoList(): void {
 		this.todoContainer.clear();
 		const phases = this.todoPhases.filter(phase => phase.tasks.length > 0);
-		if (phases.length === 0) return;
+		const projections = this.viewSession
+			.getTodoProjections()
+			.filter(projection => projection.phases.some(phase => phase.tasks.length > 0));
+		if (phases.length === 0) {
+			const projectionLines = renderTodoProjectionLines(projections, this.ui.terminal.columns);
+			if (projectionLines.length > 0) this.todoContainer.addChild(new Text(projectionLines.join("\n"), 1, 0));
+			return;
+		}
 		const expanded = this.todoExpanded;
 		const multiPhase = phases.length > 1;
 		const activeIdx = phases.indexOf(this.#getActivePhase(phases) ?? phases[0]);
@@ -2753,6 +2839,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		const tailFilled = Math.max(0, Math.min(filled - contentLines.length, tail.length));
 		lines.push(` ${theme.fg("accent", tail.slice(0, tailFilled))}${theme.fg("dim", tail.slice(tailFilled))}`);
+		lines.push(...renderTodoProjectionLines(projections, this.ui.terminal.columns));
 		this.todoContainer.addChild(new Text(lines.join("\n"), 1, 0));
 	}
 
@@ -2761,26 +2848,90 @@ export class InteractiveMode implements InteractiveModeContext {
 		return rows < TODO_COMPACT_TERMINAL_ROWS_THRESHOLD;
 	}
 
+	#renderCompactProjectionSummary(width: number): string | undefined {
+		const projections = this.viewSession.getTodoProjections();
+		let fallback: { projection: NamespacedTodoProjection; task: TodoProjectionItem } | undefined;
+		let pending: { projection: NamespacedTodoProjection; task: TodoProjectionItem } | undefined;
+		let active: { projection: NamespacedTodoProjection; task: TodoProjectionItem } | undefined;
+		let nonEmptyProjectionCount = 0;
+
+		for (const projection of projections) {
+			let hasTasks = false;
+			for (const phase of projection.phases) {
+				for (const task of phase.tasks) {
+					hasTasks = true;
+					fallback ??= { projection, task };
+					if (task.status === "pending") pending ??= { projection, task };
+					if (task.status === "in_progress") active ??= { projection, task };
+				}
+			}
+			if (hasTasks) nonEmptyProjectionCount++;
+		}
+
+		const selected = active ?? pending ?? fallback;
+		if (!selected) return undefined;
+
+		let completed = 0;
+		let total = 0;
+		for (const phase of selected.projection.phases) {
+			for (const task of phase.tasks) {
+				total++;
+				if (task.status === "completed") completed++;
+			}
+		}
+
+		const namespace = formatTodoProjectionText(
+			selected.projection.namespace,
+			Math.min(TRUNCATE_LENGTHS.TITLE, width),
+		);
+		const hiddenNamespaces = nonEmptyProjectionCount - 1;
+		const progress = `${completed}/${total}${hiddenNamespaces > 0 ? ` +${hiddenNamespaces}` : ""}`;
+		const header = `${theme.bold(theme.fg("accent", namespace))} ${theme.fg("dim", progress)}`;
+		const task = formatTodoProjectionTask(selected.task, Math.min(TRUNCATE_LENGTHS.CONTENT, width));
+		return `${header} ${theme.fg("dim", "·")} ${task}`;
+	}
+
 	renderCompactStatusLine(width: number, childLines: readonly string[]): readonly string[] {
 		const phases = this.todoPhases.filter(phase => phase.tasks.length > 0);
-		if (phases.length === 0) return childLines;
+		const summaries: string[] = [];
 
-		const activeDescs = this.#getActiveSubagentDescriptions();
-		const isMatched = (todo: TodoItem): boolean =>
-			activeDescs.length > 0 && todoMatchesAnyDescription(todo.content, activeDescs);
+		if (phases.length > 0) {
+			const activeDescs = this.#getActiveSubagentDescriptions();
+			const isMatched = (todo: TodoItem): boolean =>
+				activeDescs.length > 0 && todoMatchesAnyDescription(todo.content, activeDescs);
 
-		const totalTasks = phases.reduce((sum, phase) => sum + phase.tasks.length, 0);
-		const closedTasks = phases.reduce((sum, phase) => sum + phase.tasks.filter(isClosedTodo).length, 0);
-		const activeTask = nextActionableTask(phases);
+			const totalTasks = phases.reduce((sum, phase) => sum + phase.tasks.length, 0);
+			const closedTasks = phases.reduce((sum, phase) => sum + phase.tasks.filter(isClosedTodo).length, 0);
+			const activeTask = nextActionableTask(phases);
 
-		const header = `${theme.bold(theme.fg("accent", "TODO"))} ${theme.fg("dim", `${closedTasks}/${totalTasks}`)}`;
-		const taskStr = activeTask
-			? this.#formatTodoLine(activeTask, "", isMatched(activeTask))
-			: theme.fg("success", `${theme.checkbox.checked} done`);
-		const rightLine = `${header} ${theme.fg("dim", "·")} ${taskStr}`;
+			const header = `${theme.bold(theme.fg("accent", "TODO"))} ${theme.fg("dim", `${closedTasks}/${totalTasks}`)}`;
+			const task = activeTask
+				? this.#formatTodoLine(activeTask, "", isMatched(activeTask))
+				: theme.fg("success", `${theme.checkbox.checked} done`);
+			summaries.push(`${header} ${theme.fg("dim", "·")} ${task}`);
+		}
 
+		const projectionSummary = this.#renderCompactProjectionSummary(width);
+		if (projectionSummary) summaries.unshift(projectionSummary);
+		if (summaries.length === 0) return childLines;
+		const summarySeparator = ` ${theme.fg("dim", "·")} `;
+		const composeRightLine = (maxWidth: number): string => {
+			if (summaries.length === 1) return truncateToWidth(summaries[0]!, maxWidth);
+			const separatorWidth = visibleWidth(summarySeparator);
+			if (maxWidth <= separatorWidth + 2) {
+				return truncateToWidth(summaries.join(summarySeparator), maxWidth);
+			}
+			const availableWidth = maxWidth - separatorWidth;
+			const projectionWidth = Math.max(1, Math.floor(availableWidth / 2));
+			const nativeWidth = Math.max(1, availableWidth - projectionWidth);
+			return `${truncateToWidth(summaries[0]!, projectionWidth)}${summarySeparator}${truncateToWidth(
+				summaries[1]!,
+				nativeWidth,
+			)}`;
+		};
+		const fullRightLine = summaries.join(summarySeparator);
 		const rightPad = " ";
-		const rightWidth = visibleWidth(rightLine) + 1;
+		const fullRightWidth = visibleWidth(fullRightLine) + 1;
 
 		let leftLine = "";
 		if (childLines.length > 0) {
@@ -2792,36 +2943,30 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		let combinedLine: string;
 		if (leftWidth === 0) {
-			if (rightWidth <= width) {
-				const gap = Math.max(0, width - rightWidth);
+			if (fullRightWidth <= width) {
+				const gap = Math.max(0, width - fullRightWidth);
+				combinedLine = " ".repeat(gap) + fullRightLine + rightPad;
+			} else {
+				const rightLine = composeRightLine(Math.max(4, width - 1));
+				const gap = Math.max(0, width - visibleWidth(rightLine) - 1);
 				combinedLine = " ".repeat(gap) + rightLine + rightPad;
-			} else {
-				const maxRight = Math.max(4, width - 1);
-				const truncatedRight = truncateToWidth(rightLine, maxRight);
-				const gap = Math.max(0, width - visibleWidth(truncatedRight) - 1);
-				combinedLine = " ".repeat(gap) + truncatedRight + rightPad;
 			}
+		} else if (leftWidth + minGap + fullRightWidth <= width) {
+			const gap = width - leftWidth - fullRightWidth;
+			combinedLine = leftLine + " ".repeat(gap) + fullRightLine + rightPad;
 		} else {
-			if (leftWidth + minGap + rightWidth <= width) {
-				const gap = width - leftWidth - rightWidth;
-				combinedLine = leftLine + " ".repeat(gap) + rightLine + rightPad;
-			} else {
-				const maxRight = Math.min(rightWidth, Math.max(10, Math.floor(width * 0.45)));
-				const truncatedRight = truncateToWidth(rightLine, maxRight);
-				const truncatedRightWidth = visibleWidth(truncatedRight) + 1;
-				const availableLeft = Math.max(4, width - truncatedRightWidth - minGap);
-				const truncatedLeft = truncateToWidth(leftLine, availableLeft);
-				const gap = Math.max(minGap, width - visibleWidth(truncatedLeft) - truncatedRightWidth);
-				combinedLine = truncatedLeft + " ".repeat(gap) + truncatedRight + rightPad;
-			}
+			const maxRight = Math.min(fullRightWidth - 1, Math.max(10, Math.floor(width * 0.45)));
+			const rightLine = composeRightLine(maxRight);
+			const rightWidth = visibleWidth(rightLine) + 1;
+			const availableLeft = Math.max(4, width - rightWidth - minGap);
+			const truncatedLeft = truncateToWidth(leftLine, availableLeft);
+			const gap = Math.max(minGap, width - visibleWidth(truncatedLeft) - rightWidth);
+			combinedLine = truncatedLeft + " ".repeat(gap) + rightLine + rightPad;
 		}
 
 		const leadingLines = childLines.length > 1 ? childLines.slice(0, -1) : [""];
 		return [...leadingLines, combinedLine];
 	}
-
-	/**
-	 * Anchored HUD of in-flight subagents, mirroring the Todos block above the
 
 	/**
 	 * Anchored HUD of in-flight subagents, mirroring the Todos block above the
@@ -5999,6 +6144,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.#todoPhasesOwner = this.viewSession;
 		this.#syncTodoAutoClearTimer();
+		this.#renderTodoList();
+		this.ui.requestRender();
+	}
+
+	refreshTodoProjections(): void {
 		this.#renderTodoList();
 		this.ui.requestRender();
 	}

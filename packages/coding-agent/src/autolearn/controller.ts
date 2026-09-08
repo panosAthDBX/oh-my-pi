@@ -6,8 +6,8 @@
  * prompt-cache neutral: the standing system guidance remains available, but no
  * hidden mid-session reminder is inserted into the conversation.
  *
- * Installed once per top-level session (taskDepth 0). The subscription lives
- * for the session's lifetime — `newSession` resets the session in place
+ * Installed once per effective primary session. The subscription lives for the
+ * session's lifetime — `newSession` resets the session in place
  * without re-running startup — so the controller needs no disposal.
  */
 import { logger } from "@oh-my-pi/pi-utils";
@@ -25,11 +25,11 @@ const DEFAULT_MIN_TOOL_CALLS = 5;
  * actually present in the active set, or null when `manage_skill` is absent.
  *
  * Driven by tool presence rather than live settings: the `learn`/`manage_skill`
- * registry is built ONCE at session start (and only for top-level sessions), so
- * keying the guidance on `autolearn.enabled` would let a mid-session enable — or
- * a subagent that filtered the tools out — inject guidance pointing at tools the
- * session never built. The `learn` addendum is included only when the `learn`
- * tool is present (it requires a memory backend).
+ * registry is built ONCE at session start (and only for effective primary
+ * sessions), so keying the guidance on `autolearn.enabled` would let a
+ * mid-session enable — or a subagent that filtered the tools out — inject
+ * guidance pointing at tools the session never built. The `learn` addendum is
+ * included only when the `learn` tool is present (it requires a memory backend).
  */
 export function buildAutoLearnInstructions(available: { manageSkill: boolean; learn: boolean }): string | null {
 	if (!available.manageSkill) return null;

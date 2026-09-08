@@ -52,6 +52,7 @@ function createYieldingSession(
 		servingModel: { selector: "primary/bad-runtime-model", isFallback: false } as ServingModel | undefined,
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
+		getTodoProjections: () => [],
 		getActiveToolNames: () => ["yield"],
 		getEnabledToolNames: () => ["yield"],
 		subscribe: (listener: (event: { type: string; [key: string]: unknown }) => void) => {

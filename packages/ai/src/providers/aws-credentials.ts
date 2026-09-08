@@ -121,6 +121,10 @@ export async function resolveAwsCredentials(opts: CredentialResolveOptions = {})
 		}
 	})();
 	inflight.set(cacheKey, promise);
+	// A caller may abort its race while this detached resolution keeps running.
+	// Explicitly own a later rejection so an abandoned shared promise cannot
+	// surface as an unhandled rejection; active waiters still observe `promise`.
+	void promise.catch(() => {});
 	return raceWithSignal(promise, opts.signal);
 }
 
