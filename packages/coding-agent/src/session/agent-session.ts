@@ -5548,10 +5548,6 @@ export class AgentSession {
 		return this.#tools.getSelectedMCPToolNames();
 	}
 
-	#applyActiveToolsByName(toolNames: string[]): Promise<void> {
-		return this.#tools.applyActiveToolsByName(toolNames);
-	}
-
 	/** Replace the durable system prompt and invalidate staged memory context. */
 	#replaceBaseSystemPrompt(systemPrompt: string[], invalidateMemoryContext = true): void {
 		if (invalidateMemoryContext) this.#memoryContextGeneration += 1;

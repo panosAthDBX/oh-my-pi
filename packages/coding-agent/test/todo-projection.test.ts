@@ -69,7 +69,8 @@ describe("TodoProjectionStore", () => {
 	it("rejects leading, middle, and trailing holes in phase and task arrays", () => {
 		const store = new TodoProjectionStore();
 		const sparseArray = <T>(length: number, entries: ReadonlyArray<readonly [number, T]>): T[] => {
-			const values = new Array<T>(length);
+			const values: T[] = [];
+			values.length = length;
 			for (const [index, value] of entries) values[index] = value;
 			return values;
 		};
