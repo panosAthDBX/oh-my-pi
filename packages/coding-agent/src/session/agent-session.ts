@@ -444,7 +444,7 @@ export type PreCoreQueuedMessageInput =
 	| {
 			kind: "userMessage";
 			content: string | (TextContent | ImageContent)[];
-			deliverAs: "prompt" | "steer" | "followUp";
+			deliverAs: "prompt" | "steer" | "followUp" | "aside";
 	  }
 	| {
 			kind: "customPrompt";
@@ -460,7 +460,7 @@ export type PreCoreQueuedMessageInput =
 			message: CustomMessage;
 			options: {
 				triggerTurn?: boolean;
-				deliverAs?: "steer" | "followUp" | "nextTurn";
+				deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
 				queueChipText?: string;
 				acceptTerminalEmptyStop?: boolean;
 			};
@@ -4064,7 +4064,7 @@ export class AgentSession {
 					return;
 				}
 
-				this.#beginInFlight();
+				const reservation = this.#beginInFlight();
 				const coalescedSources = new Set([options.source]);
 				const promise = this.#runAgentContinue(signal, request, coalescedSources);
 				const attempt: ActiveAgentContinue = {
@@ -6804,6 +6804,7 @@ export class AgentSession {
 				!options?.synthetic && !hasPendingUserDirective
 					? this.#todo.createEagerTaskPrelude(expandedText)
 					: undefined;
+			const videoAttachmentNotices = this.#createVideoAttachmentNotices(options?.images, submittedAt);
 			const normalizedImages = await this.#normalizeImagesForModel(options?.images);
 
 			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
@@ -6944,7 +6945,7 @@ export class AgentSession {
 					queueOnly: options?.queueOnly,
 				},
 			});
-			return;
+			return false;
 		}
 
 		if (options?.queueOnly) {
@@ -6999,7 +7000,7 @@ export class AgentSession {
 		const reservation = options?.inFlightReservation ?? this.#beginInFlight();
 		const ownsInFlightReservation = options?.inFlightReservation === undefined;
 		const generation = this.#promptGeneration;
-	this.#promptSequence++;
+		this.#promptSequence++;
 		let memoryContextGeneration: number;
 		const priorLegacyMemoryPromptCleanup = this.#legacyMemoryPromptCleanup;
 		this.#agentStartPromptAbortController?.abort();

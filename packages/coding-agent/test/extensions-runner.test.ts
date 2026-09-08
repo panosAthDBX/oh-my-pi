@@ -185,6 +185,7 @@ describe("ExtensionRunner", () => {
 				setModel: async () => false,
 				getThinkingLevel: () => undefined,
 				setThinkingLevel: () => {},
+				setTodoProjection: () => {},
 				getSessionName: () => undefined,
 				setSessionName: async () => {},
 			},
