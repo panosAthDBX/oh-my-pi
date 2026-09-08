@@ -11,6 +11,7 @@ import type {
 
 interface PendingTool {
 	runId: string;
+	settled: boolean;
 	resolve(value: unknown): void;
 	reject(error: Error): void;
 }
@@ -19,6 +20,10 @@ interface ActiveRun {
 	runId: string;
 	filename: string;
 	pendingTools: Map<string, PendingTool>;
+	/** Wake the run after its current bridge calls have settled. */
+	wakeToolDrain?: () => void;
+	/** Close/dispose owns terminal cleanup once set; the run must not emit a result. */
+	closed: boolean;
 	/** Rejections floated by this run's cell code, captured before its result was sent. */
 	floatingRejections: unknown[];
 }
@@ -298,7 +303,7 @@ export class WorkerCore {
 	}
 
 	async #runOne(runId: string, code: string, filename: string, snapshot: SessionSnapshot): Promise<void> {
-		const active: ActiveRun = { runId, filename, pendingTools: new Map(), floatingRejections: [] };
+		const active: ActiveRun = { runId, filename, pendingTools: new Map(), closed: false, floatingRejections: [] };
 		this.#runs.set(runId, active);
 		const hooks: RuntimeHooks = {
 			onText: chunk => this.#transport.send({ type: "text", runId, chunk }),
@@ -317,15 +322,15 @@ export class WorkerCore {
 			result = { type: "result", runId, ok: false, error: errorPayload(error) };
 		}
 		try {
-			// One event-loop turn so rejections the cell already floated surface
-			// while this run can still own them (rejection callbacks run before
-			// timers fire).
-			await Bun.sleep(0);
+			await this.#drainTools(active);
+			if (active.closed) return;
 			result = foldFloatingRejections(active, result, hooks);
 		} finally {
-			this.#runs.delete(runId);
-			this.#rememberCellFile(filename);
-			this.#transport.send(result);
+			if (!active.closed) {
+				this.#runs.delete(runId);
+				this.#rememberCellFile(filename);
+				this.#transport.send(result);
+			}
 		}
 	}
 
@@ -334,6 +339,7 @@ export class WorkerCore {
 			runId: msg.runId,
 			filename: `tool-${msg.runId}`,
 			pendingTools: new Map(),
+			closed: false,
 			floatingRejections: [],
 		};
 		this.#runs.set(msg.runId, active);
@@ -399,36 +405,63 @@ export class WorkerCore {
 	async #callTool(active: ActiveRun, name: string, args: unknown): Promise<unknown> {
 		const id = `tc-${active.runId}-${crypto.randomUUID()}`;
 		const { promise, resolve, reject } = Promise.withResolvers<unknown>();
-		active.pendingTools.set(id, { runId: active.runId, resolve, reject });
+		const pending: PendingTool = { runId: active.runId, settled: false, resolve, reject };
+		active.pendingTools.set(id, pending);
 		try {
-			this.#transport.send({ type: "tool-call", id, runId: active.runId, name, args });
-		} catch (error) {
-			// Non-serializable args (DataCloneError from postMessage / IPC send).
-			// No reply will ever arrive; fail this call instead of stranding a
-			// pending entry until close.
+			try {
+				this.#transport.send({ type: "tool-call", id, runId: active.runId, name, args });
+			} catch (error) {
+				// Non-serializable args (DataCloneError from postMessage / IPC send).
+				// No reply will ever arrive; fail this call instead of stranding a
+				// pending entry until close.
+				pending.settled = true;
+				reject(error);
+			}
+			return await promise;
+		} finally {
 			active.pendingTools.delete(id);
-			reject(error);
+			if (active.pendingTools.size === 0) active.wakeToolDrain?.();
 		}
-		return await promise;
+	}
+
+	async #drainTools(active: ActiveRun): Promise<void> {
+		do {
+			const waitedForTool = active.pendingTools.size > 0;
+			if (waitedForTool) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				active.wakeToolDrain = resolve;
+				await promise;
+				active.wakeToolDrain = undefined;
+			}
+			// Preserve the existing settle turn for ordinary floated rejections. A
+			// bridge reply needs one additional turn for its promise continuation to
+			// reach Bun's unhandled-rejection checkpoint.
+			await Bun.sleep(0);
+			if (waitedForTool) await Bun.sleep(0);
+		} while (!active.closed && active.pendingTools.size > 0);
 	}
 
 	#deliverToolReply(id: string, reply: ToolReply): void {
 		for (const active of this.#runs.values()) {
 			const pending = active.pendingTools.get(id);
 			if (!pending) continue;
-			active.pendingTools.delete(id);
+			if (pending.settled) break;
+			pending.settled = true;
 			if (reply.ok) pending.resolve(reply.value);
 			else pending.reject(errorFromPayload(reply.error));
 			return;
 		}
+		this.#transport.send({ type: "log", level: "warn", msg: "Ignored unmatched JS eval tool reply", meta: { id } });
 	}
 
 	#close(): void {
 		for (const active of this.#runs.values()) {
+			active.closed = true;
 			for (const pending of active.pendingTools.values()) {
 				pending.reject(new ToolError("JS worker closed"));
 			}
 			active.pendingTools.clear();
+			active.wakeToolDrain?.();
 		}
 		this.#runs.clear();
 		this.#runtime?.dispose?.();
@@ -441,10 +474,12 @@ export class WorkerCore {
 
 	dispose(): void {
 		for (const active of this.#runs.values()) {
+			active.closed = true;
 			for (const pending of active.pendingTools.values()) {
 				pending.reject(new ToolError("JS worker closed"));
 			}
 			active.pendingTools.clear();
+			active.wakeToolDrain?.();
 		}
 		this.#runs.clear();
 		this.#runtime?.dispose?.();

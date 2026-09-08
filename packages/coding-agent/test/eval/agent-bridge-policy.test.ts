@@ -617,6 +617,38 @@ describe("agent() through eval runtimes", () => {
 		expect(output.node.handle).toBe(`agent://${output.node.id}`);
 	});
 
+	it("settles an agent() promise floated in one JavaScript cell and awaited with its handle in the next", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-agent-js-floated-");
+		const { session, sessionFile } = makeEvalSession(tempDir, "js-agent-floated");
+		mockAgents();
+		const childStarted = Promise.withResolvers<void>();
+		const releaseChild = Promise.withResolvers<void>();
+		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => {
+			childStarted.resolve();
+			await releaseChild.promise;
+			return singleResult(options, { output: "floated child result" });
+		});
+
+		const first = await executeJs("globalThis.__floated_agent_regression = agent('work'); 'cell one returned';", {
+			cwd: tempDir.path(),
+			sessionId: sharedJsSessionId,
+			session,
+			sessionFile,
+		});
+		expect(first.exitCode).toBe(0);
+		await childStarted.promise;
+
+		const second = executeJs(
+			"const handle = await globalThis.__floated_agent_regression; return await handle.wait();",
+			{ cwd: tempDir.path(), sessionId: sharedJsSessionId, session, sessionFile },
+		);
+		releaseChild.resolve();
+		const result = await second;
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("floated child result");
+		expect(runSpy).toHaveBeenCalledTimes(1);
+	});
+
 	it("runs JavaScript agent handles concurrently and returns results in input order", async () => {
 		using tempDir = TempDir.createSync("@omp-eval-agent-js-handles-");
 		const { session, sessionFile } = makeEvalSession(tempDir, "js-agent-handles");
