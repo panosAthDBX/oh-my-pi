@@ -26,7 +26,7 @@ export class MemoryEditTool implements AgentTool<typeof memoryEditSchema> {
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): MemoryEditTool | null {
-		const backend = session.settings.get("memory.backend");
+		const backend = session.getMemoryBackend?.()?.id ?? session.settings.get("memory.backend");
 		if (backend !== "mnemopi") return null;
 		return new MemoryEditTool(session);
 	}

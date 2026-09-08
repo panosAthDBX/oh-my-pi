@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { SessionFocusController } from "@oh-my-pi/pi-coding-agent/modes/controllers/session-focus-controller";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import type { InteractiveModeContext, TodoPhase } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -13,11 +13,12 @@ interface SessionStub {
 	setStreaming: (streaming: boolean) => void;
 }
 
-function makeSessionStub(opts: { isStreaming?: boolean } = {}): SessionStub {
+function makeSessionStub(opts: { isStreaming?: boolean; todos?: TodoPhase[] } = {}): SessionStub {
 	let listener: ((event: AgentSessionEvent) => Promise<void> | void) | undefined;
 	let unsubscribeCalls = 0;
 	const stub = {
 		isStreaming: opts.isStreaming ?? false,
+		getTodoPhases: () => opts.todos ?? [],
 		subscribe(fn: (event: AgentSessionEvent) => Promise<void> | void) {
 			listener = fn;
 			return () => {

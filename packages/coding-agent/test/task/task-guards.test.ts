@@ -80,6 +80,7 @@ function createFakeSession(config: FakeSessionConfig = {}): FakeSessionHandle {
 		agent: { state: { systemPrompt: ["test"] } } as never,
 		extensionRunner: undefined as never,
 		sessionManager: { appendSessionInit: () => {} } as never,
+		getTodoProjections: () => [],
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_names: string[]) => {},

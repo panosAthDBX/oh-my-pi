@@ -241,7 +241,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 	}
 	const normalizedArgs = normalizeArgs(
 		validatedArgs,
-		!intentIsDeclared ? (options.defaultIntent ?? "js prelude") : undefined,
+		!intentIsDeclared && name !== "task" ? (options.defaultIntent ?? "js prelude") : undefined,
 	);
 	try {
 		const result = await tool.execute(

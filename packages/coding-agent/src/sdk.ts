@@ -141,7 +141,7 @@ import {
 	shouldFilterBrowserMCPForPrelude,
 } from "./mcp";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
-import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
+import { createSessionMemoryRuntimeContext, offBackend, resolveMemoryBackend } from "./memory-backend";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
 import type { MnemopiSessionState } from "./mnemopi/state";
 import mcpXdevGuidanceTemplate from "./prompts/system/mcp-xdev-guidance.md" with { type: "text" };
@@ -1720,6 +1720,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	let hasSession = false;
 	let hasRegistered = false;
 	const restrictToolNames = options.restrictToolNames === true;
+	let memoryBackendReady: Promise<void> | undefined;
 	const enableLsp = options.enableLsp ?? !restrictToolNames;
 	const lspReadOnly = options.lspReadOnly ?? restrictToolNames;
 	const asyncMaxJobs = Math.min(100, Math.max(1, settings.get("async.maxJobs") ?? 100));
@@ -1823,6 +1824,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			requireYieldTool: options.requireYieldTool,
 			prewalkArmed: options.prewalk !== undefined,
 			taskDepth: options.taskDepth ?? 0,
+			agentKind,
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			sessionManager,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
@@ -1835,6 +1837,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			isDisposed: () => session?.isDisposed ?? false,
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
+			getMemoryBackend: () => (hasSession ? session.getMemoryBackend() : undefined),
+			getMemoryRuntime: () =>
+				session ? createSessionMemoryRuntimeContext(session, agentDir, sessionManager.getCwd()) : undefined,
 			getAgentId: () => resolvedAgentId,
 			getToolByName: name => session?.getToolByName(name),
 			getToolForEvalBridge: name => session?.getToolForEvalBridge(name),
@@ -2805,7 +2810,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			cwd,
 			sessionManager,
 			modelRegistry,
-			() => (hasSession ? createSessionMemoryRuntimeContext(session, agentDir, cwd) : undefined),
+			() =>
+				hasSession
+					? createSessionMemoryRuntimeContext(session, agentDir, session.sessionManager.getCwd())
+					: undefined,
 			settings,
 			localProtocolOptions,
 			() => (hasSession ? session.getAsyncJobSnapshot() : null),
@@ -3095,9 +3103,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				toolSession.contextFiles = contextFiles;
 				session.setAdvisorContextPrompt(formatAdvisorContextPrompt(contextFiles));
 			}
-			const memoryBackend = restrictToolNames ? undefined : await resolveMemoryBackend(settings);
+			const memoryBackend = restrictToolNames
+				? undefined
+				: ((hasSession ? session.getMemoryBackend() : undefined) ?? (await resolveMemoryBackend(settings)));
 			const memoryInstructions = memoryBackend
-				? await memoryBackend.buildDeveloperInstructions(agentDir, settings, session)
+				? await memoryBackend.buildDeveloperInstructions(agentDir, settings, hasSession ? session : undefined)
 				: undefined;
 			// Advisors get the same memory block (sharpshooter decisions, mnemopi/
 			// hindsight instructions) wrapped as shared background knowledge; the
@@ -3763,6 +3773,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						return mcpManager.getTools();
 					}
 				: undefined,
+			memoryEnabled: !restrictToolNames,
 			memoryAgentDir: agentDir,
 			memoryTaskDepth: taskDepth,
 			createMemoryTools: restrictToolNames
@@ -4119,6 +4130,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		const startMemoryBackend = async () => {
 			const memoryBackend = await resolveMemoryBackend(settings);
+			session.setMemoryBackend(memoryBackend);
+			if (session.isDisposed) return;
 			await memoryBackend.start({
 				session,
 				settings,
@@ -4188,6 +4201,23 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 		});
 
+		// Start after session construction so prompt assembly stays on the startup
+		// critical path, while AgentSession gates only its first agent-start hook on
+		// this task. That makes first-turn recall observe fully initialized state.
+		if (restrictToolNames) {
+			// Restricted sessions intentionally omit memory tools, instructions, and
+			// startup. Register the explicit no-op backend so AgentSession's direct-
+			// construction fallback cannot later attach the configured backend.
+			session.setMemoryBackend(offBackend);
+		}
+		const backendReady = restrictToolNames
+			? Promise.resolve()
+			: logger.time("startMemoryStartupTask", startMemoryBackend);
+		if (!restrictToolNames) {
+			memoryBackendReady = backendReady;
+			session.setMemoryBackendReady(backendReady);
+		}
+
 		// Auto-learn can immediately trigger a private capture after the first real
 		// stop. When a memory backend is selected, install that backend's
 		// per-session state first so the capture turn's `learn` tool observes the
@@ -4200,18 +4230,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// mid-session enable fire a nudge pointing at tools the session never built.
 		// Activation is therefore a session-start decision for BOTH the controller
 		// and the tools; the fire-time re-check in `#onAgentEnd` still handles a
-		// mid-session DISABLE. The subscription lives for the session's lifetime; the
-		// reference is intentionally discarded (the listener retains it).
+		// mid-session DISABLE. Use the session's effective classification: `/tan`
+		// clones have task depth zero but are still subagents. The subscription lives
+		// for the session's lifetime; the reference is intentionally discarded.
 		if (!restrictToolNames) {
-			if (settings.get("autolearn.enabled") && taskDepth === 0) {
-				await logger.time("startMemoryStartupTask", startMemoryBackend);
+			if (settings.get("autolearn.enabled") && session.agentKind === "main") {
+				await backendReady;
 				new AutoLearnController({
 					session,
 					settings,
 					capture: content => session.runAutolearnCapture(signal => runAutoLearnCapture(content, signal)),
 				});
 			} else {
-				void logger.time("startMemoryStartupTask", startMemoryBackend);
+				// Observe a background rejection until the first agent-start hook can
+				// report it without producing an unhandled-rejection warning.
+				void backendReady.catch(() => {});
 			}
 		}
 
@@ -4321,6 +4354,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		unsubscribeCredentialDisabled?.();
 		try {
 			if (hasSession) {
+				// Let a normal startup task either install its session state or
+				// conclusively fail before disposal. Otherwise a late Mnemopi/
+				// remote backend start can race cleanup after SDK construction
+				// aborts.
+				await memoryBackendReady?.catch(() => undefined);
 				await session.dispose();
 				if (hasRegistered) unregisterUnlessParked();
 			} else {

@@ -1,8 +1,15 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import {
+	type ExtensionFactory,
+	ExtensionRunner,
+	loadExtensionFromFactory,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -14,6 +21,8 @@ import type { TodoItem, TodoPhase } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
+const FOCUSED_AGENT_ID = "TodoProjectionFocusedWorker";
+
 function renderTodos(mode: InteractiveMode): string {
 	return Bun.stripANSI(mode.todoContainer.render(120).join("\n"));
 }
@@ -21,12 +30,13 @@ function renderTodos(mode: InteractiveMode): string {
 describe("InteractiveMode todo HUD persistence", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
+	let focusedSession: AgentSession | undefined;
 	let session: AgentSession;
 	let mode: InteractiveMode;
 	let eventBus: EventBus;
-	let modelRegistry: ModelRegistry;
 
-	async function replaceMode(): Promise<void> {
+	async function replaceMode(todoClearDelay = -1, extensionFactory?: ExtensionFactory): Promise<void> {
 		if (mode) {
 			mode.stop();
 			await session.dispose();
@@ -34,6 +44,19 @@ describe("InteractiveMode todo HUD persistence", () => {
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
 		eventBus = new EventBus();
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		let extensionRunner: ExtensionRunner | undefined;
+		if (extensionFactory) {
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				extensionFactory,
+				tempDir.path(),
+				eventBus,
+				runtime,
+				"startup-projection",
+			);
+			extensionRunner = new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, modelRegistry);
+		}
 		session = new AgentSession({
 			agent: new Agent({
 				initialState: {
@@ -43,9 +66,10 @@ describe("InteractiveMode todo HUD persistence", () => {
 					messages: [],
 				},
 			}),
-			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
-			settings: Settings.isolated(),
+			sessionManager,
+			settings: Settings.isolated({ "tasks.todoClearDelay": todoClearDelay }),
 			modelRegistry,
+			extensionRunner,
 		});
 		mode = new InteractiveMode(session, "test", undefined, undefined, undefined, undefined, eventBus);
 	}
@@ -60,8 +84,13 @@ describe("InteractiveMode todo HUD persistence", () => {
 		await replaceMode();
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
+		AgentRegistry.global().unregister(FOCUSED_AGENT_ID);
+		await focusedSession?.dispose();
+		focusedSession = undefined;
 		session.setTodoPhases([]);
+		session.clearTodoProjections();
+		Object.defineProperty(mode.ui.terminal, "rows", { get: () => 24, configurable: true });
 		mode.setTodos([]);
 		vi.useRealTimers();
 		vi.restoreAllMocks();
@@ -69,6 +98,8 @@ describe("InteractiveMode todo HUD persistence", () => {
 
 	afterAll(async () => {
 		mode?.stop();
+		AgentRegistry.global().unregister(FOCUSED_AGENT_ID);
+		await focusedSession?.dispose();
 		await session?.dispose();
 		authStorage?.close();
 		tempDir?.removeSync();
@@ -78,6 +109,26 @@ describe("InteractiveMode todo HUD persistence", () => {
 	function setTodoClearDelay(todoClearDelay: number): void {
 		session.settings.override("tasks.todoClearDelay", todoClearDelay);
 	}
+
+	it("renders a projection published by a session_start handler on initial startup", async () => {
+		await replaceMode(-1, pi => {
+			pi.on("session_start", () => {
+				pi.setTodoProjection("startup-projection", [
+					{
+						id: "startup-phase",
+						name: "Startup phase",
+						tasks: [{ id: "startup-task", content: "Startup task", status: "in_progress" }],
+					},
+				]);
+			});
+		});
+		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
+
+		await mode.init();
+
+		expect(renderTodos(mode)).toContain("startup-projection");
+		expect(renderTodos(mode)).toContain("Startup task");
+	});
 
 	it("clears closed todos from the panel instantly without mutating session history", () => {
 		setTodoClearDelay(0);
@@ -201,6 +252,78 @@ describe("InteractiveMode todo HUD persistence", () => {
 
 		vi.advanceTimersByTime(1);
 		expect(renderTodos(mode)).not.toContain("done task");
+	});
+
+	it("renders projection changes from the session focused through Agent Hub", async () => {
+		await replaceMode(-1);
+		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
+		session.setTodoPhases([
+			{ name: "Main native phase", tasks: [{ content: "Main native task", status: "in_progress" }] },
+		]);
+		await mode.init();
+		session.setTodoProjection("main-projection", [
+			{
+				id: "main-phase",
+				name: "Main phase",
+				tasks: [{ id: "main-task", content: "Main task", status: "in_progress" }],
+			},
+		]);
+		mode.refreshTodoProjections();
+		expect(renderTodos(mode)).toContain("main-projection");
+		expect(renderTodos(mode)).toContain("Main native task");
+
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		focusedSession = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Focused test"],
+					tools: [],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: Settings.isolated({ "tasks.todoClearDelay": -1 }),
+			modelRegistry,
+		});
+		focusedSession.setTodoPhases([
+			{ name: "Focused native phase", tasks: [{ content: "Focused native task", status: "in_progress" }] },
+		]);
+		AgentRegistry.global().register({
+			id: FOCUSED_AGENT_ID,
+			displayName: FOCUSED_AGENT_ID,
+			kind: "sub",
+			parentId: MAIN_AGENT_ID,
+			session: focusedSession,
+			status: "running",
+		});
+
+		focusedSession.setTodoProjection("focused-projection", [
+			{
+				id: "focused-phase",
+				name: "Focused phase",
+				tasks: [{ id: "focused-task", content: "Focused task", status: "in_progress" }],
+			},
+		]);
+		await mode.focusAgentSession(FOCUSED_AGENT_ID);
+
+		expect(renderTodos(mode)).toContain("focused-projection");
+		expect(renderTodos(mode)).toContain("Focused task");
+		expect(renderTodos(mode)).not.toContain("main-projection");
+		expect(renderTodos(mode)).toContain("Focused native task");
+		expect(renderTodos(mode)).not.toContain("Main native task");
+		Object.defineProperty(mode.ui.terminal, "rows", { get: () => 15, configurable: true });
+		const focusedCompactStatus = Bun.stripANSI(mode.statusContainer.render(120).join("\n"));
+		expect(focusedCompactStatus).toContain("focused-projection");
+		expect(focusedCompactStatus).not.toContain("main-projection");
+		Object.defineProperty(mode.ui.terminal, "rows", { get: () => 24, configurable: true });
+
+		await mode.unfocusSession();
+		expect(renderTodos(mode)).toContain("main-projection");
+		expect(renderTodos(mode)).not.toContain("focused-projection");
+		expect(renderTodos(mode)).toContain("Main native task");
+		expect(renderTodos(mode)).not.toContain("Focused native task");
 	});
 
 	it("marks todos complete when subagent reconciliation reports a finished agent", async () => {
@@ -417,6 +540,7 @@ describe("InteractiveMode todo HUD anchor", () => {
 	});
 
 	afterEach(() => {
+		session.clearTodoProjections();
 		mode.setTodos([]);
 		vi.useRealTimers();
 		vi.restoreAllMocks();
@@ -594,7 +718,60 @@ describe("InteractiveMode todo HUD anchor", () => {
 			expect(lastLine.startsWith(" ")).toBe(true);
 		});
 
-		it("places compact todo on the right side of the active loader / intent spinner", () => {
+		it("keeps projection-only work sanitized and bounded in compact mode", () => {
+			setTerminalRows(15);
+			const longPath = path.join(os.homedir(), "workspace", "projected", "x".repeat(120));
+			session.setTodoProjection("compact\tprojection\u001b[2J", [
+				{
+					id: "compact-phase",
+					name: "Compact phase",
+					tasks: [
+						{ id: "active", content: `${longPath}\nnext\tstep`, status: "in_progress" },
+						...Array.from({ length: 20 }, (_, index) => ({
+							id: `pending-${index}`,
+							content: `Pending projected task ${index}`,
+							status: "pending" as const,
+						})),
+					],
+				},
+			]);
+			mode.refreshTodoProjections();
+
+			expect(mode.todoContainer.render(72)).toHaveLength(0);
+			const rendered = mode.statusContainer.render(72);
+			const compactLine = Bun.stripANSI(rendered[rendered.length - 1] ?? "");
+			expect(rendered).toHaveLength(2);
+			expect(compactLine).toMatch(/compact +projection/);
+			expect(compactLine).toContain("~/workspace/projected/");
+			expect(compactLine).not.toContain("\u001b");
+			expect(compactLine).not.toContain("\t");
+			expect(Bun.stringWidth(compactLine)).toBeLessThanOrEqual(72);
+
+			setTerminalRows(24);
+			expect(mode.statusContainer.render(72)).toHaveLength(0);
+			expect(renderTodos(mode)).toMatch(/compact +projection/);
+		});
+
+		it("keeps native and projected summaries visible when compact detail is long", () => {
+			setTerminalRows(15);
+			mode.setTodos([{ name: "Native", tasks: [{ content: "Native task", status: "in_progress" }] }]);
+			session.setTodoProjection(`projected-${"x".repeat(120)}`, [
+				{
+					id: "projected-phase",
+					name: "Projected phase",
+					tasks: [{ id: "projected-task", content: "Projected task", status: "in_progress" }],
+				},
+			]);
+			mode.refreshTodoProjections();
+
+			const rendered = mode.statusContainer.render(72);
+			const compactLine = Bun.stripANSI(rendered[rendered.length - 1] ?? "");
+			expect(compactLine).toContain("projected-");
+			expect(compactLine).toContain("TODO");
+			expect(Bun.stringWidth(compactLine)).toBeLessThanOrEqual(72);
+		});
+
+		it("keeps native and projected summaries beside the active loader", () => {
 			setTerminalRows(14);
 			mode.setTodos([
 				{
@@ -605,6 +782,14 @@ describe("InteractiveMode todo HUD anchor", () => {
 					],
 				},
 			]);
+			session.setTodoProjection(`loader-projection-${"x".repeat(120)}`, [
+				{
+					id: "loader-phase",
+					name: "Loader phase",
+					tasks: [{ id: "loader-task", content: "Projected loader task", status: "in_progress" }],
+				},
+			]);
+			mode.refreshTodoProjections();
 
 			mode.ensureLoadingAnimation();
 			mode.setWorkingMessage("Reading src/index.ts (esc to interrupt)");
@@ -616,9 +801,10 @@ describe("InteractiveMode todo HUD anchor", () => {
 			const lastLine = Bun.stripANSI(rendered[rendered.length - 1] ?? "");
 			// Left side has the intent spinner/message
 			expect(lastLine).toContain("Reading src/index.ts");
-			// Right side has the compact todo
-			expect(lastLine).toContain("TODO 0/2");
-			expect(lastLine).toContain("Inspect server");
+			// Right side preserves both compact work sources within its collision budget.
+			expect(lastLine).toContain("loader-projection-");
+			expect(lastLine).toContain("TODO");
+			expect(lastLine).toContain("Inspect");
 			// Left message comes before right todo
 			expect(lastLine.indexOf("Reading src/index.ts")).toBeLessThan(lastLine.indexOf("TODO 0/2"));
 		});

@@ -299,6 +299,8 @@ export function getTaskSchema(options: {
  * transcripts using the flat form keep working under either setting.
  */
 export interface TaskParams {
+	/** @internal Trusted extension-owned invocation override; never part of the model-facing schema. */
+	modelOverride?: string | string[];
 	/** Stable agent name (flat form). */
 	name?: string;
 	/** Agent type to spawn (flat form); omitted values resolve from the session spawn policy. */

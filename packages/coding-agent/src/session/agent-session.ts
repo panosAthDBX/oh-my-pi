@@ -145,6 +145,11 @@ import type {
 import { emitSessionShutdownEvent } from "../extensibility/extensions";
 import { ManagedTimers } from "../extensibility/extensions/managed-timers";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
+import {
+	type NamespacedTodoProjection,
+	type TodoProjectionPhase,
+	TodoProjectionStore,
+} from "../extensibility/extensions/todo-projection";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
@@ -156,6 +161,8 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import type { IrcMessage } from "../irc/bus";
 import type { DaemonCompletionNotification } from "../launch/protocol";
+import { resolveMemoryBackend } from "../memory-backend/resolve";
+import type { MemoryBackend } from "../memory-backend/types";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { containsOrchestrate, renderOrchestrateNotice } from "../modes/orchestrate";
@@ -190,6 +197,10 @@ import {
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import { releaseSharpshooterSession } from "../sharpshooter/backend";
 import { flushSharpshooterExtraction } from "../sharpshooter/extract";
+import {
+	clearTrustedTaskInvocationModelOverride,
+	validateTrustedTaskInvocationEnvelope,
+} from "../task/invocation-model-override";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -334,6 +345,7 @@ import {
 	isHiddenUserCompanion,
 	isUserQueuedMessage,
 	queueChipText,
+	queuedTextContent,
 	toRestoredQueuedMessage,
 } from "./queued-messages";
 import type { ServingModel } from "./retry-fallback-chains";
@@ -355,7 +367,7 @@ import {
 	type SessionMaintenanceHost,
 } from "./session-maintenance";
 import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } from "./session-manager";
-import { SessionMemory, type SessionMemoryHost } from "./session-memory";
+import { type PreparedMemoryBackendTransition, SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
@@ -418,6 +430,37 @@ const noOpUIContext: ExtensionUIContext = {
 // AgentSession Class
 // ============================================================================
 
+type InFlightReservation = { readonly epoch: number };
+
+export type PreCoreQueuedMessageInput =
+	| { kind: "prompt"; text: string; options: PromptOptions }
+	| { kind: "preparedPrompt"; text: string; options: PromptOptions }
+	| {
+			kind: "userMessage";
+			content: string | (TextContent | ImageContent)[];
+			deliverAs: "prompt" | "steer" | "followUp";
+	  }
+	| {
+			kind: "customPrompt";
+			message: CustomMessage;
+			keywordNotices: CustomMessage[];
+			options: Pick<PromptOptions, "streamingBehavior" | "toolChoice"> & {
+				queueChipText?: string;
+				queueOnly?: boolean;
+			};
+	  }
+	| {
+			kind: "customDelivery";
+			message: CustomMessage;
+			options: {
+				triggerTurn?: boolean;
+				deliverAs?: "steer" | "followUp" | "nextTurn";
+				queueChipText?: string;
+				acceptTerminalEmptyStop?: boolean;
+			};
+	  };
+
+type PreCoreQueuedMessage = PreCoreQueuedMessageInput & { sequence: number };
 type MessageEndPersistenceSlot = {
 	readonly promise: Promise<void>;
 	persist: (persistMessage: () => void) => Promise<void>;
@@ -592,6 +635,14 @@ export class AgentSession {
 	#pendingNextTurnMessages: CustomMessage[] = [];
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	#queuedMessageDrainScheduled = false;
+	/** Input accepted before agent-core accepts the reserving prompt. */
+	#preCoreQueuedMessages: PreCoreQueuedMessage[] = [];
+	#preCoreQueuedSequence = 0;
+	#preCoreQueuedMessageDrainScheduled = false;
+	#preCoreQueuedMessageDrain?: Promise<void>;
+	#preCoreReservationSettled?: Promise<void>;
+	#resolvePreCoreReservationSettled?: () => void;
+	#sessionReplacementInProgress = false;
 	#planModeState: PlanModeState | undefined;
 	#vibeModeState: VibeModeState | undefined;
 	#goalModeState: GoalModeState | undefined;
@@ -621,6 +672,7 @@ export class AgentSession {
 	#planModeReminderAwaitingProgress = false;
 	readonly #todo: TodoTracker;
 	#workPoolYieldItems: readonly WorkPoolYieldItem[] = [];
+	#todoProjections = new TodoProjectionStore();
 	#replanTitleRefreshInFlight: Promise<void> | undefined = undefined;
 	/** Resolved TITLE_SYSTEM.md override applied to every automatic session-title
 	 *  generation path. Refresh via {@link AgentSession.setTitleSystemPrompt} when
@@ -725,6 +777,14 @@ export class AgentSession {
 	#preferWebsockets: boolean | undefined;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#disconnectOwnedMcpManager: (() => Promise<void>) | undefined;
+	#pendingMemoryPromptPromotion:
+		| {
+				generation: number;
+				promotedPrompt: string[];
+				previousBaseSystemPrompt: string[];
+				preserveOnCancellation: boolean;
+		  }
+		| undefined;
 
 	readonly #ttsr: TtsrCoordinator;
 	readonly #stats: SessionStatsTracker;
@@ -746,7 +806,8 @@ export class AgentSession {
 
 	readonly #streamingEditGuard: StreamingEditGuard;
 	readonly #loopGuards: LoopGuards;
-	#promptInFlightCount = 0;
+	#inFlightReservationEpoch = 0;
+	#inFlightReservations = new Set<InFlightReservation>();
 	#abortInProgress = false;
 	// Wire-level agent_end emission deferred until #promptInFlightCount drops to 0.
 	// Internal extension hooks and post-emit work (auto-retry, auto-compaction, todo
@@ -771,6 +832,15 @@ export class AgentSession {
 	 *  discarded moments before a rolled-back switchSession() restores the exact generation it
 	 *  was captured against. */
 	#sessionTransitionSettled: Promise<void> | undefined;
+	#agentStartPromptAbortController: AbortController | undefined;
+	/** Invalidates captured memory preflights when refreshed base context wins. */
+	#memoryContextGeneration = 0;
+	/**
+	 * A legacy durable-memory prompt can need a compensating refresh after its
+	 * preflight is cancelled. A replacement prompt must not set/use its system
+	 * prompt until that refresh has settled.
+	 */
+	#legacyMemoryPromptCleanup: Promise<void> | undefined;
 	#promptSequence = 0;
 	#skippedPostTurnSpeculationCompletion: Promise<void> | undefined;
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
@@ -795,8 +865,34 @@ export class AgentSession {
 	#synchronouslyTerminatedYieldToolCallIds = new Set<string>();
 	#providerSessionState = new Map<string, ProviderSessionState>();
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
+	/** Backend selected when this session started. */
+	#memoryBackend: MemoryBackend | undefined;
+	#memoryBackendDisposePromise: Promise<void> | undefined;
+	#memoryBackendReady: Promise<void> = Promise.resolve();
+	#memoryBackendFallbackReady: Promise<void> | undefined;
 	readonly #memory: SessionMemory;
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
+
+	get #baseSystemPrompt(): string[] {
+		return this.#tools.baseSystemPrompt;
+	}
+
+	set #baseSystemPrompt(prompt: string[]) {
+		this.#tools.setBaseSystemPrompt(prompt);
+	}
+
+	get #baseSystemPromptBeforeMemoryPromotion(): string[] | undefined {
+		return this.#memory.promotionSnapshot;
+	}
+
+	set #baseSystemPromptBeforeMemoryPromotion(prompt: string[] | undefined) {
+		if (prompt) this.#memory.restorePromotionSnapshot(prompt);
+		else this.#memory.clearPromotionSnapshot();
+	}
+
+	get #rebuildSystemPrompt(): boolean {
+		return this.#tools.canRebuildSystemPrompt;
+	}
 
 	#resetPromptMaintenanceState(): void {
 		this.#recovery.resetForNewPrompt();
@@ -827,25 +923,117 @@ export class AgentSession {
 		}
 	}
 
-	#beginInFlight(): void {
-		this.#promptInFlightCount++;
-		if (this.#promptInFlightCount === 1) {
-			this.#acquirePowerAssertion();
+	#hasPreCoreReservation(): boolean {
+		return this.#inFlightReservations.size > 0 && !this.agent.state.isStreaming;
+	}
+	#restorePreCoreQueuedMessage(message: PreCoreQueuedMessage): RestoredQueuedMessage {
+		switch (message.kind) {
+			case "prompt":
+			case "preparedPrompt":
+				return {
+					text: message.text,
+					...(message.options.images?.length ? { images: message.options.images } : {}),
+				};
+			case "userMessage": {
+				if (typeof message.content === "string") return { text: message.content };
+				const text = message.content
+					.filter((part): part is TextContent => part.type === "text")
+					.map(part => part.text)
+					.join("\n");
+				const images = message.content.filter((part): part is ImageContent => part.type === "image");
+				return images.length > 0 ? { text, images } : { text };
+			}
+			case "customPrompt":
+			case "customDelivery":
+				return toRestoredQueuedMessage(message.message);
 		}
 	}
 
-	#endInFlight(onSettled?: () => void | Promise<void>): void {
+	#enqueuePreCore(message: PreCoreQueuedMessageInput): void {
+		this.#preCoreQueuedMessages.push({ ...message, sequence: this.#preCoreQueuedSequence++ });
+	}
+
+	#reinsertPreCoreQueuedMessage(message: PreCoreQueuedMessage): void {
+		const index = this.#preCoreQueuedMessages.findIndex(candidate => candidate.sequence > message.sequence);
+		if (index < 0) this.#preCoreQueuedMessages.push(message);
+		else this.#preCoreQueuedMessages.splice(index, 0, message);
+	}
+
+	#preCoreRestoredMessages(followUpTier: boolean): RestoredQueuedMessage[] {
+		return this.#preCoreQueuedMessages
+			.filter(
+				message =>
+					((message.kind !== "customPrompt" && message.kind !== "customDelivery") ||
+						isUserQueuedMessage(message.message)) &&
+					this.#isPreCoreFollowUp(message) === followUpTier,
+			)
+			.sort((left, right) => left.sequence - right.sequence)
+			.map(message => this.#restorePreCoreQueuedMessage(message));
+	}
+
+	#isPreCoreFollowUp(message: PreCoreQueuedMessage): boolean {
+		switch (message.kind) {
+			case "prompt":
+			case "preparedPrompt":
+				return message.options.streamingBehavior === "followUp";
+			case "userMessage":
+				return message.deliverAs === "followUp";
+			case "customPrompt":
+				return message.options.streamingBehavior === "followUp";
+			case "customDelivery":
+				return message.options.deliverAs === "followUp";
+		}
+	}
+
+	#takeNextPreCoreQueuedMessage(): PreCoreQueuedMessage | undefined {
+		for (const followUpTier of [false, true]) {
+			const index = this.#preCoreQueuedMessages.findIndex(
+				message => this.#isPreCoreFollowUp(message) === followUpTier,
+			);
+			if (index >= 0) return this.#preCoreQueuedMessages.splice(index, 1)[0];
+		}
+		return undefined;
+	}
+
+	#beginInFlight(): InFlightReservation {
+		const reservation = { epoch: this.#inFlightReservationEpoch };
+		const wasIdle = this.#inFlightReservations.size === 0;
+		this.#inFlightReservations.add(reservation);
+		if (wasIdle) {
+			const settled = Promise.withResolvers<void>();
+			this.#preCoreReservationSettled = settled.promise;
+			this.#resolvePreCoreReservationSettled = settled.resolve;
+			this.#acquirePowerAssertion();
+		}
+		return reservation;
+	}
+
+	#endInFlight(reservation: InFlightReservation, onSettled?: () => void | Promise<void>): void {
 		if (onSettled) this.#inFlightSettledCallbacks.push(onSettled);
-		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
-		if (this.#promptInFlightCount !== 0) return;
+		if (reservation.epoch !== this.#inFlightReservationEpoch || !this.#inFlightReservations.delete(reservation)) {
+			if (this.#inFlightReservations.size === 0 && this.#inFlightSettledCallbacks.length > 0) {
+				void this.#flushInFlightSettledCallbacks().finally(() => this.#drainStrandedQueuedMessages());
+			}
+			return;
+		}
+		if (this.#inFlightReservations.size !== 0) return;
+		this.#resolvePreCoreReservationSettled?.();
+		this.#resolvePreCoreReservationSettled = undefined;
+		this.#preCoreReservationSettled = undefined;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
 		this.#flushPendingAgentEnd();
-		if (this.#inFlightSettledCallbacks.length === 0) {
+		const drainQueuedMessages = () => {
+			if (!this.#abortInProgress && !this.#sessionReplacementInProgress) {
+				this.#schedulePreCoreQueuedMessageDrain();
+			}
 			this.#drainStrandedQueuedMessages();
+		};
+		if (this.#inFlightSettledCallbacks.length === 0) {
+			drainQueuedMessages();
 			return;
 		}
-		void this.#flushInFlightSettledCallbacks().finally(() => this.#drainStrandedQueuedMessages());
+		void this.#flushInFlightSettledCallbacks().finally(drainQueuedMessages);
 	}
 
 	async #flushInFlightSettledCallbacks(): Promise<void> {
@@ -860,13 +1048,107 @@ export class AgentSession {
 		}
 	}
 
+	#schedulePreCoreQueuedMessageDrain(): void {
+		if (
+			this.#preCoreQueuedMessageDrainScheduled ||
+			this.#preCoreQueuedMessages.length === 0 ||
+			this.#isDisposed ||
+			this.#abortInProgress ||
+			this.#sessionReplacementInProgress
+		)
+			return;
+		this.#preCoreQueuedMessageDrainScheduled = true;
+		const drain = (async () => {
+			let replayFailed = false;
+			try {
+				while (
+					this.#preCoreQueuedMessages.length > 0 &&
+					!this.#isDisposed &&
+					!this.#abortInProgress &&
+					!this.#sessionReplacementInProgress
+				) {
+					const queued = this.#takeNextPreCoreQueuedMessage();
+					if (!queued) break;
+					try {
+						switch (queued.kind) {
+							case "prompt":
+								await this.prompt(queued.text, queued.options);
+								break;
+							case "preparedPrompt":
+								await this.prompt(queued.text, { ...queued.options, expandPromptTemplates: false });
+								break;
+							case "userMessage":
+								// Before admission there is no core loop to consume a
+								// follow-up/steer queue. Replay it as a fresh prompt when
+								// idle; once the core owns a turn, preserve its delivery mode.
+								await this.sendUserMessage(
+									queued.content,
+									this.isStreaming && queued.deliverAs !== "prompt"
+										? { deliverAs: queued.deliverAs }
+										: undefined,
+								);
+								break;
+							case "customPrompt":
+								if (queued.options.queueOnly) {
+									const delivery = queued.options.streamingBehavior;
+									if (!delivery) throw new AgentBusyError();
+									for (const notice of queued.keywordNotices) {
+										await this.#queueCustomMessage(notice, delivery);
+									}
+									await this.#queueCustomMessage(queued.message, delivery, queued.options.queueChipText);
+								} else if (this.isStreaming) {
+									for (const notice of queued.keywordNotices) {
+										await this.sendCustomMessage(notice, { deliverAs: queued.options.streamingBehavior });
+									}
+									await this.sendCustomMessage(queued.message, {
+										deliverAs: queued.options.streamingBehavior,
+										queueChipText: queued.options.queueChipText,
+									});
+								} else {
+									const text = queuedTextContent(queued.message) ?? "";
+									await this.#promptWithMessage(queued.message, text, {
+										...queued.options,
+										prependMessages: queued.keywordNotices.length > 0 ? queued.keywordNotices : undefined,
+									});
+								}
+								break;
+							case "customDelivery":
+								await this.sendCustomMessage(queued.message, queued.options);
+								break;
+						}
+					} catch (error) {
+						if (!this.#isDisposed && !this.#sessionReplacementInProgress) {
+							this.#reinsertPreCoreQueuedMessage(queued);
+						}
+						replayFailed = true;
+						logger.warn("Pre-core queued message replay failed", { error: String(error) });
+						break;
+					}
+				}
+			} finally {
+				this.#preCoreQueuedMessageDrainScheduled = false;
+				if (
+					!replayFailed &&
+					this.#preCoreQueuedMessages.length > 0 &&
+					!this.#isDisposed &&
+					!this.#abortInProgress &&
+					!this.#sessionReplacementInProgress
+				) {
+					this.#schedulePreCoreQueuedMessageDrain();
+				}
+			}
+		})();
+		this.#preCoreQueuedMessageDrain = drain;
+		void drain;
+	}
+
 	/** A steer/follow-up can land after the agent loop's final queue poll, or
 	 *  after an abort stops an auto-continued queued turn. In both cases the
 	 *  agent-core queue still owns the message, but no loop is left to poll it.
 	 *  Runs whenever the session settles; the guard makes it a no-op when the
 	 *  queue was consumed normally or a new turn already started. */
 	#drainStrandedQueuedMessages(): void {
-		if (this.#abortInProgress) return;
+		if (this.#abortInProgress || this.#sessionReplacementInProgress) return;
 		// Session transitions (newSession/`/new`, compact, model-switch, session-switch,
 		// dispose) call #disconnectFromAgent() BEFORE `await abort()`, so abort's own
 		// finally lands here with no listener attached. Auto-resuming now would snapshot
@@ -998,13 +1280,9 @@ export class AgentSession {
 		}
 		this.#resetPromptMaintenanceState();
 		// Capture the generation before the wake so its post-prompt recovery wait
-		// bails the instant an abort (which bumps #promptGeneration) supersedes
-		// this wake — otherwise the wait would follow a successor turn (a queued
-		// follow-up or another stranded IRC wake started by abort cleanup),
-		// delaying finishObservation and mis-attributing the successor's RPC
-		// progress to this now-dead wake monitor.
+		// bails the instant an abort supersedes this wake.
 		const generation = this.#promptGeneration;
-		this.#beginInFlight();
+		const reservation = this.#beginInFlight();
 		let turnError: unknown;
 		void this.agent
 			.prompt(records)
@@ -1026,7 +1304,7 @@ export class AgentSession {
 					);
 					this.#queuedMessageDrainBlocked ||= parkedQueueDrainBlocked;
 				}
-				this.#endInFlight(async () => {
+				this.#endInFlight(reservation, async () => {
 					try {
 						await finishObservation?.(turnError);
 					} catch (error) {
@@ -1071,7 +1349,11 @@ export class AgentSession {
 	}
 
 	#resetInFlight(): void {
-		this.#promptInFlightCount = 0;
+		this.#inFlightReservationEpoch++;
+		this.#inFlightReservations.clear();
+		this.#resolvePreCoreReservationSettled?.();
+		this.#resolvePreCoreReservationSettled = undefined;
+		this.#preCoreReservationSettled = undefined;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
 		this.#flushPendingAgentEnd();
@@ -1351,6 +1633,12 @@ export class AgentSession {
 			modelRegistry: this.#modelRegistry,
 			isDisposed: () => this.#isDisposed,
 			memoryBackendSession: () => this,
+			getMemoryBackend: () => this.#memoryBackend,
+			setMemoryBackend: backend => this.setMemoryBackend(backend),
+			disposeMemoryBackend: () => this.#disposeMemoryBackend(),
+			clearMemoryBackend: () => {
+				this.#memoryBackend = undefined;
+			},
 			getHindsightSessionState: () => this.getHindsightSessionState(),
 			setHindsightSessionState: state => this.setHindsightSessionState(state),
 			getMnemopiSessionState: () => this.getMnemopiSessionState(),
@@ -1363,6 +1651,7 @@ export class AgentSession {
 			replaceMemoryTools: tools => this.#tools.replaceMemoryTools(tools),
 		};
 		this.#memory = new SessionMemory(memoryHost, {
+			memoryEnabled: config.memoryEnabled,
 			memoryAgentDir: config.memoryAgentDir,
 			memoryTaskDepth: config.memoryTaskDepth,
 			createMemoryTools: config.createMemoryTools,
@@ -1425,11 +1714,11 @@ export class AgentSession {
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
-				this.#beginInFlight();
+				const reservation = this.#beginInFlight();
 				try {
 					await this.agent.prompt(messages.length === 1 ? first : messages);
 				} finally {
-					this.#endInFlight();
+					this.#endInFlight(reservation);
 				}
 			},
 			scheduleIdleFlush: run => {
@@ -1740,6 +2029,7 @@ export class AgentSession {
 			planReferencePath: () => this.#planReferencePath,
 			nonMessageTokenSource: () => this,
 			memoryBackendSession: () => this,
+			getMemoryBackend: () => this.#memoryBackend,
 			emitSessionEvent: (event, options) => this.#emitSessionEvent(event, options),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			schedulePostPromptTask: (task, options) => this.#schedulePostPromptTask(task, options),
@@ -2375,13 +2665,13 @@ export class AgentSession {
 			await previousGate;
 			// Hold the wire-level agent_end until in-flight prompts unwind. Subscribers
 			// (rpc-mode, ACP, Cursor) treat agent_end as the "session is idle" signal;
-			// emitting while #promptInFlightCount > 0 lets a client fire its next
+			// emitting while a prompt reservation is still live lets a client fire its next
 			// `prompt` into a session that still reports isStreaming === true. Flush
 			// happens in #endInFlight / #resetInFlight. A later agent_end (e.g. from
 			// an auto-compaction turn that starts before the original prompt unwinds)
 			// supersedes the pending one, which is what subscribers want — they only
 			// care about the final settle.
-			if (event.type === "agent_end" && this.#promptInFlightCount > 0) {
+			if (event.type === "agent_end" && this.#inFlightReservations.size > 0) {
 				this.#pendingAgentEndEmit = event;
 				return;
 			}
@@ -2463,6 +2753,9 @@ export class AgentSession {
 	 * the recovery wait always sees the in-flight handler and blocks until it — and
 	 * everything it schedules — settles. */
 	#dispatchAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "agent_start") {
+			this.#schedulePreCoreQueuedMessageDrain();
+		}
 		if (event.type === "tool_execution_end" && this.#isTerminalYieldToolResult(event)) {
 			const alreadyTerminated = this.#synchronouslyTerminatedYieldToolCallIds.delete(event.toolCallId);
 			if (!alreadyTerminated) {
@@ -3669,7 +3962,6 @@ export class AgentSession {
 					this.#skipAgentContinue("should-continue-false", request);
 					return;
 				}
-
 				const active = this.#activeAgentContinue;
 				if (active) {
 					active.coalescedSources.add(options.source);
@@ -3704,7 +3996,7 @@ export class AgentSession {
 						this.#activeAgentContinue = undefined;
 					}
 					this.#usagePreflightReadyForNextModelCall = false;
-					this.#endInFlight();
+					this.#endInFlight(reservation);
 				}
 			},
 			{
@@ -3877,22 +4169,37 @@ export class AgentSession {
 		const eventArgs = computer
 			? { actions: computer.actions, pendingSafetyChecks: computer.pendingSafetyChecks }
 			: ctx.args;
+		const trustedTaskScopeId = this.sessionManager.getSessionId();
 		runner.markToolCallEmitted(ctx.toolCall.id, ctx.tool.name);
-		const callResult = await runner.emitToolCall(
-			{
-				type: "tool_call",
-				toolName: ctx.tool.name,
-				toolCallId: ctx.toolCall.id,
-				input: normalizeToolEventInput(ctx.tool.name, resolveToolEventInput(ctx.tool, eventArgs)),
-			},
-			signal,
-		);
+		let callResult: { block?: boolean; reason?: string; input?: Record<string, unknown> } | undefined;
+		try {
+			callResult = await runner.emitToolCall(
+				{
+					type: "tool_call",
+					toolName: ctx.tool.name,
+					toolCallId: ctx.toolCall.id,
+					input: normalizeToolEventInput(ctx.tool.name, resolveToolEventInput(ctx.tool, eventArgs)),
+				},
+				signal,
+			);
+		} catch (error) {
+			if (ctx.tool.name === "task") clearTrustedTaskInvocationModelOverride(trustedTaskScopeId, ctx.toolCall.id);
+			throw error;
+		}
 		if (callResult?.block) {
+			if (ctx.tool.name === "task") clearTrustedTaskInvocationModelOverride(trustedTaskScopeId, ctx.toolCall.id);
 			return { block: true, reason: callResult.reason || "Tool execution was blocked by an extension" };
 		}
 		// A computer call's event input is a synthetic {actions, pendingSafetyChecks}
 		// view, not the execution params — a revision cannot map back onto them.
 		if (callResult?.input !== undefined && !computer) {
+			if (
+				ctx.tool.name === "task" &&
+				validateTrustedTaskInvocationEnvelope(trustedTaskScopeId, ctx.toolCall.id, callResult.input) === false
+			) {
+				clearTrustedTaskInvocationModelOverride(trustedTaskScopeId, ctx.toolCall.id);
+				return { block: true, reason: "Trusted task invocation was mutated after model authorization" };
+			}
 			return { args: callResult.input };
 		}
 		return undefined;
@@ -4311,6 +4618,95 @@ export class AgentSession {
 		}
 	}
 
+	#installMemoryBackend(backend: MemoryBackend): void {
+		this.#memoryBackend = backend;
+		this.#memoryBackendDisposePromise = undefined;
+	}
+
+	/** Register the backend selected for this session before its asynchronous start work begins. */
+	setMemoryBackend(backend: MemoryBackend): void {
+		if (this.#isDisposed) {
+			// Never attach a backend to a dead session. A caller that races teardown
+			// still owns a real backend instance, so release it without reviving any
+			// session-specific state.
+			void Promise.resolve()
+				.then(() => backend.disposeSession?.(this))
+				.catch(error => {
+					logger.warn("Late memory backend disposal failed", { backend: backend.id, error: String(error) });
+				});
+			return;
+		}
+		if (this.#memoryBackend) {
+			throw new Error("Memory backend is already registered for this session.");
+		}
+		this.#installMemoryBackend(backend);
+	}
+
+	/** Install the session-owned backend startup task before the session becomes usable. */
+	setMemoryBackendReady(ready: Promise<void>): void {
+		this.#memoryBackendReady = ready;
+	}
+
+	/** The session-start backend; backend setting changes take effect on the next session. */
+	getMemoryBackend(): MemoryBackend | undefined {
+		return this.#memoryBackend;
+	}
+
+	/**
+	 * SDK construction captures a backend before the first prompt. Direct
+	 * AgentSession users do not have that orchestration, so lazily provide the
+	 * same lifecycle at the first hook boundary without racing a captured
+	 * backend installed by the SDK.
+	 */
+	async #ensureMemoryBackendFallback(): Promise<void> {
+		if (this.#memoryBackend) return;
+		this.#memoryBackendFallbackReady ??= (async () => {
+			const backend = await resolveMemoryBackend(this.settings);
+			if (this.#memoryBackend || this.#isDisposed) return;
+			this.setMemoryBackend(backend);
+			await backend.start({
+				session: this,
+				settings: this.settings,
+				modelRegistry: this.#modelRegistry,
+				agentDir: this.settings.getAgentDir(),
+				// Directly constructed sessions bypass createAgentSession, so retain
+				// its primary/subagent automatic-memory boundary.
+				taskDepth: this.#agentKind === "sub" ? 1 : 0,
+			});
+			// A fallback may finish its backend start after disposal has begun.
+			// Disposal awaits this task before clearing backend-specific state, but
+			// it must not install prompt state into an already-closed session.
+			if (this.#isDisposed) return;
+			// Direct sessions have no rebuild callback. Compose the backend's
+			// generic developer instructions into their durable base prompt before
+			// first-turn recall, so remote memory is always treated as untrusted
+			// data rather than relying on provider-specific prompt text.
+			const developerInstructions = await backend.buildDeveloperInstructions(
+				this.settings.getAgentDir(),
+				this.settings,
+				this,
+			);
+			if (this.#isDisposed) return;
+			if (developerInstructions?.trim() && !this.#baseSystemPrompt.includes(developerInstructions)) {
+				this.#replaceBaseSystemPrompt([...this.#baseSystemPrompt, developerInstructions]);
+			}
+		})();
+		await this.#memoryBackendFallbackReady;
+	}
+
+	#disposeMemoryBackend(): Promise<void> {
+		this.#memoryBackendDisposePromise ??= (async () => {
+			await Promise.allSettled([this.#memoryBackendReady, this.#memoryBackendFallbackReady ?? Promise.resolve()]);
+			const backend = this.#memoryBackend;
+			try {
+				await backend?.disposeSession?.(this);
+			} catch (error) {
+				logger.warn("Memory backend disposal failed", { backend: backend?.id, error: String(error) });
+			}
+		})();
+		return this.#memoryBackendDisposePromise;
+	}
+
 	/** Run one abortable auto-learn capture outside the primary agent loop. */
 	async runAutolearnCapture(capture: (signal: AbortSignal) => Promise<void>): Promise<void> {
 		if (this.#autolearnCaptureTask || this.#isDisposed) return;
@@ -4369,6 +4765,7 @@ export class AgentSession {
 	 * gap slips past the disposal guards.
 	 */
 	beginDispose(): void {
+		if (this.#isDisposed) return;
 		this.#isDisposed = true;
 		this.#modelDiscoveryAbortController.abort();
 		this.#queuedMessageDrainBlocked = false;
@@ -4380,6 +4777,7 @@ export class AgentSession {
 		this.#memory.cancelLocalMemoryStartup();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
+		void this.#disposeMemoryBackend();
 		this.#irc.flushPending();
 		this.yieldQueue.clear();
 		this.agent.setAsideMessageProvider(undefined);
@@ -4498,6 +4896,7 @@ export class AgentSession {
 		} catch (error) {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
+		this.clearTodoProjections();
 
 		// Stop fallback extension timers before aborting deferred work they could enqueue.
 		this.#fallbackExtensionTimers?.clearAll();
@@ -4553,8 +4952,12 @@ export class AgentSession {
 		this.#movedFromEmptySessionFile = undefined;
 		this.#closeAllProviderSessions("dispose");
 		this.#maintenance.cancelSpeculation();
+		await this.#memoryBackendFallbackReady?.catch(error => {
+			logger.warn("Memory backend fallback startup failed during disposal", { error: String(error) });
+		});
 		this.setHindsightSessionState(undefined);
 		hindsightState?.dispose();
+		await this.#disposeMemoryBackend();
 		this.#disconnectFromAgent();
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();
@@ -4938,20 +5341,40 @@ export class AgentSession {
 		return this.#models.serviceTierByFamily;
 	}
 
-	/** Whether agent is currently streaming a response */
+	/** Whether session admission or agent-core work is active. */
 	get isStreaming(): boolean {
-		return this.agent.state.isStreaming || this.#promptInFlightCount > 0;
+		return this.agent.state.isStreaming || this.#inFlightReservations.size > 0;
 	}
 
 	get isAborting(): boolean {
 		return this.agent.isAborting;
 	}
 
-	/** Wait until streaming, event persistence, and deferred recovery work are fully settled. */
+	/** Effective primary/subagent classification for lifecycle gating. */
+	get agentKind(): "main" | "sub" {
+		return this.#agentKind;
+	}
+
+	/** Wait until core work, admission reservations, advisor events, and recovery drains are stable. */
 	async waitForIdle(): Promise<void> {
-		await this.agent.waitForIdle();
-		await this.#advisors.waitForPendingCardEvents();
-		await this.#waitForPostPromptRecovery();
+		for (;;) {
+			await this.agent.waitForIdle();
+			const reservation = this.#preCoreReservationSettled;
+			if (reservation) await reservation;
+			await this.#advisors.waitForPendingCardEvents();
+			await this.#waitForPostPromptRecovery();
+			const drain = this.#preCoreQueuedMessageDrain;
+			if (drain) await drain;
+			await this.agent.waitForIdle();
+			await this.#advisors.waitForPendingCardEvents();
+			await this.#waitForPostPromptRecovery();
+			if (
+				!this.agent.state.isStreaming &&
+				reservation === this.#preCoreReservationSettled &&
+				drain === this.#preCoreQueuedMessageDrain
+			)
+				return;
+		}
 	}
 	/**
 	 * Prevent advisor notes from starting hidden primary turns while a headless
@@ -5125,6 +5548,18 @@ export class AgentSession {
 		return this.#tools.getSelectedMCPToolNames();
 	}
 
+	#applyActiveToolsByName(toolNames: string[]): Promise<void> {
+		return this.#tools.applyActiveToolsByName(toolNames);
+	}
+
+	/** Replace the durable system prompt and invalidate staged memory context. */
+	#replaceBaseSystemPrompt(systemPrompt: string[], invalidateMemoryContext = true): void {
+		if (invalidateMemoryContext) this.#memoryContextGeneration += 1;
+		this.#pendingMemoryPromptPromotion = undefined;
+		this.#tools.setBaseSystemPrompt(systemPrompt);
+		this.#memory.clearPromotionSnapshot();
+		this.agent.setSystemPrompt(systemPrompt);
+	}
 	/** Rediscovers reloadable skills and refreshes prompt metadata. */
 	refreshSkills(): Promise<void> {
 		return this.#tools.refreshSkills();
@@ -5193,6 +5628,170 @@ export class AgentSession {
 		return this.#memory.beginLocalMemoryStartup();
 	}
 
+	/** Rebuild the base system prompt using the current active tool set. */
+	refreshBaseSystemPrompt(options?: { invalidateMemoryContext?: boolean }): Promise<void> {
+		if (options?.invalidateMemoryContext ?? true) {
+			this.#memoryContextGeneration += 1;
+			this.#pendingMemoryPromptPromotion = undefined;
+		}
+		return this.#tools.refreshBaseSystemPrompt();
+	}
+	/**
+	 * Remove turn-local memory context previously promoted into the system prompt,
+	 * then rebuild the durable prompt when this session has a rebuild callback.
+	 *
+	 * Memory backends call this when their scope is invalidated or cleared. The
+	 * preserved pre-promotion prompt makes it safe for directly constructed
+	 * sessions, which intentionally have no rebuild callback.
+	 */
+	async refreshMemoryPromptContext(options?: { preservePromotedMemory?: boolean }): Promise<void> {
+		this.#memoryContextGeneration += 1;
+		if (this.#baseSystemPromptBeforeMemoryPromotion && !options?.preservePromotedMemory) {
+			this.#baseSystemPrompt = this.#baseSystemPromptBeforeMemoryPromotion;
+			this.agent.setSystemPrompt(this.#baseSystemPrompt);
+			this.#baseSystemPromptBeforeMemoryPromotion = undefined;
+		}
+		this.#pendingMemoryPromptPromotion = undefined;
+		await this.refreshBaseSystemPrompt({ invalidateMemoryContext: false });
+	}
+
+	/** Commit turn-local recalled context at the agent-core prompt boundary. */
+	commitMemoryPromptPromotion(): void {
+		this.#pendingMemoryPromptPromotion = undefined;
+	}
+
+	/** Restore the pre-promotion prompt when turn-local context is not admitted. */
+	#rollbackMemoryPromptPromotion(): void {
+		const promotion = this.#pendingMemoryPromptPromotion;
+		if (!promotion) return;
+		this.#pendingMemoryPromptPromotion = undefined;
+		// Direct legacy sessions have no prompt rebuild callback. Their recall
+		// state is already consumed, so retaining the completed promotion is the
+		// only way a cancelled preflight can expose it on the next turn.
+		if (promotion.preserveOnCancellation) return;
+		if (this.#baseSystemPrompt !== promotion.promotedPrompt) return;
+		this.#baseSystemPrompt = promotion.previousBaseSystemPrompt;
+		this.agent.setSystemPrompt(promotion.previousBaseSystemPrompt);
+		if (this.#baseSystemPromptBeforeMemoryPromotion === promotion.previousBaseSystemPrompt) {
+			this.#baseSystemPromptBeforeMemoryPromotion = undefined;
+		}
+	}
+
+	/** Prepare a recalled-context commit for agent-core's synchronous admission callback. */
+	async #prepareMemoryPromptForAgentStart(
+		promptText: string,
+		options: { generation: number; signal: AbortSignal; isCurrent: () => boolean; isMemoryCurrent: () => boolean },
+	): Promise<(() => void) | false> {
+		const backend = this.#memoryBackend;
+		try {
+			if (!options.isCurrent() || !options.isMemoryCurrent()) {
+				this.#rollbackMemoryPromptPromotion();
+				return false;
+			}
+			const prepared = await backend?.commitBeforeAgentStartPrompt?.(this, promptText, options);
+			if (prepared === false || !options.isCurrent() || !options.isMemoryCurrent()) {
+				this.#rollbackMemoryPromptPromotion();
+				return false;
+			}
+			return () => {
+				if (prepared) prepared.commit();
+				this.commitMemoryPromptPromotion();
+			};
+		} catch (err) {
+			logger.debug("Memory backend commitBeforeAgentStartPrompt failed", {
+				backend: backend?.id,
+				error: String(err),
+			});
+			this.#rollbackMemoryPromptPromotion();
+			return false;
+		}
+	}
+
+	async #buildSystemPromptForAgentStart(
+		promptText: string,
+		options: { generation: number; signal: AbortSignal; isCurrent: () => boolean; isMemoryCurrent: () => boolean },
+	): Promise<string[]> {
+		try {
+			await this.#memoryBackendReady;
+		} catch (err) {
+			logger.warn("Memory backend startup failed before agent start", { error: String(err) });
+			return this.#baseSystemPrompt;
+		}
+		try {
+			await this.#ensureMemoryBackendFallback();
+		} catch (err) {
+			logger.warn("Memory backend fallback startup failed before agent start", { error: String(err) });
+			return this.#baseSystemPrompt;
+		}
+
+		const backend = this.#memoryBackend;
+		if (!backend?.beforeAgentStartPrompt) return this.#baseSystemPrompt;
+
+		try {
+			const injected = await backend.beforeAgentStartPrompt(this, promptText, options);
+			if (!injected) return this.#baseSystemPrompt;
+			const preserveOnCancellation =
+				(backend.id === "hindsight" || backend.id === "mnemopi") &&
+				!backend.commitBeforeAgentStartPrompt &&
+				!this.#rebuildSystemPrompt;
+			if (!options.isCurrent() || !options.isMemoryCurrent()) {
+				if (preserveOnCancellation && !this.#baseSystemPrompt.includes(injected)) {
+					this.#baseSystemPrompt = [...this.#baseSystemPrompt, injected];
+					this.agent.setSystemPrompt(this.#baseSystemPrompt);
+				}
+				return this.#baseSystemPrompt;
+			}
+
+			try {
+				await this.refreshBaseSystemPrompt({ invalidateMemoryContext: false });
+			} catch (refreshErr) {
+				logger.debug("Memory backend prompt refresh after beforeAgentStartPrompt failed", {
+					backend: backend.id,
+					error: String(refreshErr),
+				});
+			}
+			if (!options.isCurrent() || !options.isMemoryCurrent()) return this.#baseSystemPrompt;
+
+			// A rebuild can change the prompt while recall is in flight. Promote
+			// onto that refreshed base; returning it bare would consume recall
+			// without letting the agent observe it.
+			const previousBaseSystemPrompt = this.#baseSystemPrompt;
+			// Rebuild callbacks may already have incorporated this exact legacy
+			// recall. Do not append it a second time after the refresh.
+			if (previousBaseSystemPrompt.some(part => part.includes(injected))) return previousBaseSystemPrompt;
+			this.#baseSystemPromptBeforeMemoryPromotion ??= previousBaseSystemPrompt;
+			const stablePrompt = [...previousBaseSystemPrompt, injected];
+			const promotion = {
+				generation: options.generation,
+				promotedPrompt: stablePrompt,
+				previousBaseSystemPrompt,
+				preserveOnCancellation,
+			};
+			this.#pendingMemoryPromptPromotion = promotion;
+			options.signal.addEventListener(
+				"abort",
+				() => {
+					if (this.#pendingMemoryPromptPromotion !== promotion) return;
+					this.#rollbackMemoryPromptPromotion();
+				},
+				{ once: true },
+			);
+			if (!options.isCurrent() || !options.isMemoryCurrent()) {
+				this.#rollbackMemoryPromptPromotion();
+				return this.#baseSystemPrompt;
+			}
+			this.#baseSystemPrompt = stablePrompt;
+			this.agent.setSystemPrompt(stablePrompt);
+			return stablePrompt;
+		} catch (err) {
+			logger.debug("Memory backend beforeAgentStartPrompt failed", {
+				backend: backend.id,
+				error: String(err),
+			});
+			return this.#baseSystemPrompt;
+		}
+	}
+
 	/** Releases the local startup slot if `signal` still owns it. */
 	endLocalMemoryStartup(signal: AbortSignal): void {
 		this.#memory.endLocalMemoryStartup(signal);
@@ -5203,13 +5802,18 @@ export class AgentSession {
 		return this.#memory.applyMemoryBackend();
 	}
 
-	/** Rebuilds the stable base prompt for the current tools and model. */
-	refreshBaseSystemPrompt(): Promise<void> {
-		return this.#tools.refreshBaseSystemPrompt();
+	#prepareMemoryBackendForNewTranscript(): Promise<PreparedMemoryBackendTransition | undefined> {
+		return this.#memory.prepareBackendForNewTranscript();
 	}
 
-	#buildSystemPromptForAgentStart(promptText: string): Promise<string[]> {
-		return this.#tools.buildSystemPromptForAgentStart(promptText);
+	#resetMemoryContextForNewTranscript(prepared?: PreparedMemoryBackendTransition): Promise<void> {
+		return this.#memory.resetContextForNewTranscript(prepared);
+	}
+
+	#restoreMemoryBackendAfterFailedTranscriptTransition(
+		prepared: PreparedMemoryBackendTransition | undefined,
+	): Promise<void> {
+		return this.#memory.restoreBackendAfterFailedTranscriptTransition(prepared);
 	}
 
 	/** Replaces connected MCP tools and enables them immediately. */
@@ -5939,146 +6543,173 @@ export class AgentSession {
 		// so a dropped prompt is handed back exactly as the user typed it.
 		const typedText = text;
 
-		// Handle extension commands first (execute immediately, even during streaming)
-		if (expandPromptTemplates && text.startsWith("/")) {
-			const handled = await this.#tryExecuteExtensionCommand(text);
-			if (handled) {
-				return false;
+		let commandName: string | undefined;
+		if (text.startsWith("/")) {
+			const spaceIndex = text.indexOf(" ");
+			commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+		}
+		// Commands observe the pre-admission idle state. They execute locally and must
+		// retain the historical `ctx.isIdle()` result; a file command is still a model
+		// prompt and is reserved below before any asynchronous work.
+		const isKnownLocalCommand =
+			expandPromptTemplates &&
+			commandName !== undefined &&
+			(this.#extensionRunner?.getCommand(commandName) !== undefined ||
+				this.#customCommands.some(command => command.command.name === commandName) ||
+				this.#mcpPromptCommands.some(command => command.command.name === commandName));
+		if (this.#sessionReplacementInProgress) return false;
+		let wasStreamingAtAdmission = this.agent.state.isStreaming;
+		let admissionReservation: InFlightReservation | undefined;
+		if (!wasStreamingAtAdmission && !isKnownLocalCommand) {
+			if (this.#hasPreCoreReservation()) {
+				if (!options?.streamingBehavior) throw new AgentBusyError();
+				this.#enqueuePreCore({ kind: "prompt", text, options: { ...options } });
+				return true;
 			}
-
-			// Try custom commands (TypeScript slash commands)
-			const customResult = await this.#tryExecuteCustomCommand(text);
-			if (customResult !== null) {
-				if (customResult === "") {
+			admissionReservation = this.#beginInFlight();
+		}
+		try {
+			// Handle extension commands first (execute immediately, even during streaming)
+			if (expandPromptTemplates && text.startsWith("/")) {
+				const handled = await this.#tryExecuteExtensionCommand(text);
+				if (handled) {
 					return false;
 				}
-				text = customResult;
-			}
 
-			// Try file-based slash commands (markdown files from commands/ directories)
-			// Only if text still starts with "/" (wasn't transformed by custom command)
-			if (text.startsWith("/")) {
-				text = expandSlashCommand(text, this.#slashCommands);
-			}
-		}
-
-		// Expand file-based prompt templates if requested
-		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
-
-		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
-		// user's message that steer this turn. User-authored prompts only — synthetic /
-		// agent-initiated turns never trigger them.
-		const keywordNotices = options?.synthetic ? [] : this.#createMagicKeywordNotices(expandedText);
-
-		// A user-initiated prompt (typed message or the `.`/`c` continue shortcut)
-		// re-enables advisor auto-resume that a prior user interrupt suppressed.
-		// Agent-initiated synthetic prompts (auto-continue, plan, reminders) do not.
-		if (options?.userInitiated ?? !options?.synthetic) {
-			this.#advisors.autoResumeSuppressed = false;
-			this.#planModeReminderCount = 0;
-			this.#planModeReminderAwaitingProgress = false;
-			// A user turn owns the next decision; drop a queued forced choice from
-			// a reminder continuation this prompt just preempted.
-			this.#toolChoiceQueue.removeByLabel("plan-mode-decision");
-		}
-
-		// If streaming, queue via steer()/followUp()/aside based on option
-		if (this.isStreaming) {
-			const streamingBehavior = options?.streamingBehavior;
-			if (!streamingBehavior) throw new AgentBusyError();
-
-			// Steer/follow-up/aside the keyword notices BEFORE the queued user message so the
-			// model reads the steering notice ahead of the prompt it modifies.
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
-			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, submittedAt);
-			return true;
-		}
-
-		// Skip eager preludes when the user has already queued a directive
-		const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
-		const activeModel = this.agent.state.model;
-		const externalThinkingToolChoice =
-			!options?.synthetic &&
-			!hasPendingUserDirective &&
-			this.settings.get("externalThinking") &&
-			this.getEnabledToolNames().includes("think") &&
-			supportsExternalThinking(activeModel)
-				? buildNamedToolChoice("think", activeModel)
-				: undefined;
-		const eagerTodoPrelude =
-			!options?.synthetic && !hasPendingUserDirective ? this.#todo.createEagerTodoPrelude(expandedText) : undefined;
-		const eagerTaskPrelude =
-			!options?.synthetic && !hasPendingUserDirective ? this.#todo.createEagerTaskPrelude(expandedText) : undefined;
-		const videoAttachmentNotices = this.#createVideoAttachmentNotices(options?.images, submittedAt);
-		const normalizedImages = await this.#normalizeImagesForModel(options?.images);
-
-		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
-		if (normalizedImages?.length) {
-			userContent.push(...normalizedImages);
-		}
-		// Text-only model + image attachment: describe via a vision model and inject the
-		// description as a hidden companion (the image stays in the visible user message).
-		const imageDescriptionNotice = normalizedImages?.length
-			? await this.#buildImageDescriptionNotice(normalizedImages)
-			: undefined;
-
-		// A concurrent prompt() can start a turn during the awaits above: image
-		// normalization and the vision-description call suspend after the
-		// isStreaming check at the top, so two callers — the CLI initial message
-		// and a freshly typed submission — can both observe an idle session.
-		// Re-check before dispatch so the loser queues exactly like the early
-		// branch instead of racing #promptWithMessage into AgentBusyError. No
-		// await sits between this check and #beginInFlight, so the winner's
-		// in-flight increment is visible to every later re-check.
-		if (this.isStreaming) {
-			const streamingBehavior = options?.streamingBehavior;
-			if (!streamingBehavior) throw new AgentBusyError();
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
-			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, submittedAt, {
-				images: normalizedImages,
-				descriptionNotice: imageDescriptionNotice,
-			});
-			return true;
-		}
-
-		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
-		if (externalThinkingToolChoice) {
-			this.#toolChoiceQueue.pushOnce(externalThinkingToolChoice, {
-				label: "external-thinking",
-				now: true,
-			});
-		}
-		const message = options?.synthetic
-			? {
-					role: "developer" as const,
-					content: userContent,
-					attribution: promptAttribution,
-					timestamp: submittedAt,
-					synthetic: true,
-					userInitiated: options?.userInitiated === true ? true : undefined,
+				// Try custom commands (TypeScript slash commands)
+				const customResult = await this.#tryExecuteCustomCommand(text);
+				if (customResult !== null) {
+					if (customResult === "") {
+						return false;
+					}
+					// A prompt-producing custom command performs its local work before
+					// claiming model admission. If another prompt reserves admission
+					// while it runs, preserve this transformed result rather than
+					// replaying the command (which can have local side effects).
+					if (!admissionReservation) {
+						wasStreamingAtAdmission = this.agent.state.isStreaming;
+						if (!wasStreamingAtAdmission && this.#hasPreCoreReservation()) {
+							this.#enqueuePreCore({
+								kind: "preparedPrompt",
+								text: expandPromptTemplate(expandSlashCommand(customResult, this.#slashCommands), [
+									...this.#promptTemplates,
+								]),
+								options: { ...options },
+							});
+							return true;
+						}
+						if (!wasStreamingAtAdmission) admissionReservation = this.#beginInFlight();
+					}
+					text = customResult;
 				}
-			: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: submittedAt };
 
-		const preludeMessages: AgentMessage[] = [];
-		if (eagerTodoPrelude) {
-			if (eagerTodoPrelude.toolChoice) {
-				this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
-					label: "eager-todo",
+				// Try file-based slash commands (markdown files from commands/ directories)
+				// Only if text still starts with "/" (wasn't transformed by custom command)
+				if (text.startsWith("/")) {
+					text = expandSlashCommand(text, this.#slashCommands);
+				}
+			}
+
+			// Expand file-based prompt templates if requested
+			const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
+
+			// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
+			// user's message that steer this turn. User-authored prompts only — synthetic /
+			// agent-initiated turns never trigger them.
+			const keywordNotices = options?.synthetic ? [] : this.#createMagicKeywordNotices(expandedText);
+
+			// A user-initiated prompt (typed message or the `.`/`c` continue shortcut)
+			// re-enables advisor auto-resume that a prior user interrupt suppressed.
+			// Agent-initiated synthetic prompts (auto-continue, plan, reminders) do not.
+			if (options?.userInitiated ?? !options?.synthetic) {
+				this.#advisors.autoResumeSuppressed = false;
+				this.#planModeReminderCount = 0;
+				this.#planModeReminderAwaitingProgress = false;
+				// A user turn owns the next decision; drop a queued forced choice from
+				// a reminder continuation this prompt just preempted.
+				this.#toolChoiceQueue.removeByLabel("plan-mode-decision");
+			}
+
+			// Use the admission snapshot rather than `isStreaming`: this call's own
+			// reservation makes the latter true while it performs preflight.
+			if (wasStreamingAtAdmission) {
+				if (!options?.streamingBehavior) {
+					throw new AgentBusyError();
+				}
+				// Steer/follow-up the keyword notices BEFORE the queued user message so the
+				// model reads the steering notice ahead of the prompt it modifies.
+				for (const notice of keywordNotices) {
+					await this.sendCustomMessage(notice, { deliverAs: options.streamingBehavior });
+				}
+				if (options.streamingBehavior === "followUp") {
+					await this.#queueUserMessage(expandedText, options?.images, "followUp");
+				} else {
+					await this.#queueUserMessage(expandedText, options?.images, "steer");
+				}
+				return true;
+			}
+
+			// Skip eager preludes when the user has already queued a directive
+			const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
+			const activeModel = this.agent.state.model;
+			const externalThinkingToolChoice =
+				!options?.synthetic &&
+				!hasPendingUserDirective &&
+				this.settings.get("externalThinking") &&
+				this.getEnabledToolNames().includes("think") &&
+				supportsExternalThinking(activeModel)
+					? buildNamedToolChoice("think", activeModel)
+					: undefined;
+			const eagerTodoPrelude =
+				!options?.synthetic && !hasPendingUserDirective
+					? this.#todo.createEagerTodoPrelude(expandedText)
+					: undefined;
+			const eagerTaskPrelude =
+				!options?.synthetic && !hasPendingUserDirective
+					? this.#todo.createEagerTaskPrelude(expandedText)
+					: undefined;
+			const normalizedImages = await this.#normalizeImagesForModel(options?.images);
+
+			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
+			if (normalizedImages?.length) {
+				userContent.push(...normalizedImages);
+			}
+			// Text-only model + image attachment: describe via a vision model and inject the
+			// description as a hidden companion (the image stays in the visible user message).
+			const imageDescriptionNotice = normalizedImages?.length
+				? await this.#buildImageDescriptionNotice(normalizedImages)
+				: undefined;
+
+			const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
+			const message = options?.synthetic
+				? {
+						role: "developer" as const,
+						content: userContent,
+						attribution: promptAttribution,
+						timestamp: Date.now(),
+					}
+				: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
+
+			if (externalThinkingToolChoice) {
+				this.#toolChoiceQueue.pushOnce(externalThinkingToolChoice, {
+					label: "external-thinking",
+					now: true,
 				});
 			}
-			preludeMessages.push(eagerTodoPrelude.message);
-		}
-		if (eagerTaskPrelude) {
-			preludeMessages.push(eagerTaskPrelude);
-		}
+			const preludeMessages: AgentMessage[] = [];
+			if (eagerTodoPrelude) {
+				if (eagerTodoPrelude.toolChoice) {
+					this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
+						label: "eager-todo",
+					});
+				}
+				preludeMessages.push(eagerTodoPrelude.message);
+			}
+			if (eagerTaskPrelude) {
+				preludeMessages.push(eagerTaskPrelude);
+			}
 
-		let dispatched = false;
-		try {
-			dispatched = await this.#promptWithMessage(message, expandedText, {
+			const dispatched = await this.#promptWithMessage(message, expandedText, {
 				...options,
 				images: normalizedImages,
 				prependMessages:
@@ -6093,21 +6724,22 @@ export class AgentSession {
 								...(imageDescriptionNotice ? [imageDescriptionNotice] : []),
 							]
 						: undefined,
+				inFlightReservation: admissionReservation,
 			});
+			if (!dispatched && message.role === "user") {
+				// An abort (Esc) or preflight denial raced turn setup: the prompt never
+				// reached the agent or the session file. Hand it back to the host so the
+				// user can edit/resubmit instead of losing it (tree/branch can't offer
+				// a message that was never persisted).
+				this.#promptDropped?.({ text: typedText, images: options?.images });
+			}
+			return true;
 		} finally {
-			// Clean up residual eager-todo directive if the prompt never consumed it
-			// (e.g., compaction aborted, validation failed).
+			// Clean up residual tool directives if the prompt never consumed them.
 			this.#toolChoiceQueue.removeByLabel("eager-todo");
 			this.#toolChoiceQueue.removeByLabel("external-thinking");
+			if (admissionReservation) this.#endInFlight(admissionReservation);
 		}
-		if (!dispatched && message.role === "user") {
-			// An abort (Esc) or preflight denial raced turn setup: the prompt never
-			// reached the agent or the session file. Hand it back to the host so the
-			// user can edit/resubmit instead of losing it (tree/branch can't offer
-			// a message that was never persisted).
-			this.#promptDropped?.({ text: typedText, images: options?.images });
-		}
-		return true;
 	}
 
 	/**
@@ -6124,6 +6756,7 @@ export class AgentSession {
 			queueOnly?: boolean;
 		},
 	): Promise<boolean> {
+		if (this.#sessionReplacementInProgress) return false;
 		const textContent =
 			typeof message.content === "string"
 				? message.content
@@ -6149,6 +6782,33 @@ export class AgentSession {
 					queueChipText: options?.queueChipText,
 				}),
 			);
+		}
+
+		if (options?.queueOnly && !options.streamingBehavior) {
+			throw new AgentBusyError();
+		}
+
+		if (this.#hasPreCoreReservation()) {
+			this.#enqueuePreCore({
+				kind: "customPrompt",
+				message: {
+					role: "custom",
+					customType: message.customType,
+					content: message.content,
+					display: message.display,
+					details: message.details,
+					attribution: message.attribution ?? "agent",
+					timestamp: Date.now(),
+				},
+				keywordNotices,
+				options: {
+					streamingBehavior: options?.streamingBehavior,
+					toolChoice: options?.toolChoice,
+					queueChipText: options?.queueChipText,
+					queueOnly: options?.queueOnly,
+				},
+			});
+			return;
 		}
 
 		if (options?.queueOnly) {
@@ -6195,15 +6855,59 @@ export class AgentSession {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
+			/** The public prompt entry's reservation, if any. */
+			inFlightReservation?: InFlightReservation;
 		},
 	): Promise<boolean> {
-		// Returns false when the prompt was dropped before reaching the agent —
-		// every pre-dispatch bail (generation bump from abort, disposal, usage
-		// preflight denial) exits silently, and prompt() uses the outcome to hand
-		// the typed text back to the host instead of losing it.
-		this.#beginInFlight();
+		// Returns false when the prompt was dropped before reaching the agent.
+		const reservation = options?.inFlightReservation ?? this.#beginInFlight();
+		const ownsInFlightReservation = options?.inFlightReservation === undefined;
 		const generation = this.#promptGeneration;
-		this.#promptSequence++;
+	this.#promptSequence++;
+		let memoryContextGeneration: number;
+		const priorLegacyMemoryPromptCleanup = this.#legacyMemoryPromptCleanup;
+		this.#agentStartPromptAbortController?.abort();
+		const agentStartPromptAbortController = new AbortController();
+		this.#agentStartPromptAbortController = agentStartPromptAbortController;
+		if (priorLegacyMemoryPromptCleanup) {
+			await priorLegacyMemoryPromptCleanup;
+		}
+		// SDK sessions install their backend asynchronously and direct sessions lazily
+		// resolve one. Set up the legacy cleanup barrier only after either path has
+		// settled, otherwise the first prompt can miss a Hindsight/Mnemopi preflight.
+		try {
+			await this.#memoryBackendReady;
+		} catch (err) {
+			logger.warn("Memory backend startup failed before agent start", { error: String(err) });
+		}
+		try {
+			await this.#ensureMemoryBackendFallback();
+		} catch (err) {
+			logger.warn("Memory backend fallback startup failed before agent start", { error: String(err) });
+		}
+		memoryContextGeneration = this.#memoryContextGeneration;
+		const requiresLegacyMemoryCleanup =
+			this.#memoryBackend?.id === "hindsight" || this.#memoryBackend?.id === "mnemopi";
+		const legacyMemoryPromptCleanup = requiresLegacyMemoryCleanup ? Promise.withResolvers<void>() : undefined;
+		if (legacyMemoryPromptCleanup) {
+			this.#legacyMemoryPromptCleanup = legacyMemoryPromptCleanup.promise;
+		}
+		const memoryPromptOptions = {
+			generation,
+			signal: agentStartPromptAbortController.signal,
+			isCurrent: () =>
+				!agentStartPromptAbortController.signal.aborted &&
+				!this.#isDisposed &&
+				this.#promptGeneration === generation &&
+				this.#agentStartPromptAbortController === agentStartPromptAbortController,
+			isMemoryCurrent: () => this.#memoryContextGeneration === memoryContextGeneration,
+		};
+		// Drained next-turn context belongs to this admission only once agent-core
+		// accepts it. Any early cancellation must put it back ahead of messages
+		// that arrived while preflight was running.
+		let drainedPendingNextTurnMessages: CustomMessage[] = [];
+		let agentCoreStarted = false;
+		let ranLegacyMemoryPreflight = false;
 		try {
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
@@ -6273,7 +6977,7 @@ export class AgentSession {
 
 			// Early bail-out: if a newer abort/prompt cycle started during setup,
 			// return before mutating shared state (nextTurn messages, system prompt).
-			if (this.#promptGeneration !== generation) {
+			if (!memoryPromptOptions.isCurrent()) {
 				return false;
 			}
 
@@ -6283,11 +6987,11 @@ export class AgentSession {
 			// whether the final provider prompt still carries the base catalog.
 			const xdevMountNoticeIndex = messages.length;
 			messages.push(message);
-			// Inject any pending "nextTurn" messages as context alongside the user message
-			for (const msg of this.#pendingNextTurnMessages) {
-				messages.push(msg);
-			}
+			// Take ownership only until agent-core accepts the turn. The finally block
+			// restores this exact FIFO prefix on every pre-agent-core exit.
+			drainedPendingNextTurnMessages = this.#pendingNextTurnMessages;
 			this.#pendingNextTurnMessages = [];
+			messages.push(...drainedPendingNextTurnMessages);
 
 			// Auto-read @filepath mentions
 			const fileMentions = extractFileMentions(expandedText);
@@ -6302,24 +7006,21 @@ export class AgentSession {
 				}
 			}
 
-			// A prompt issued while the session is already disposing must still run:
-			// the dispose-driven abort settles its turn (see "does not auto-retry
-			// empty reasonless aborts once the session is disposing"). Only drop the
-			// prompt when disposal began during the backend-transition await, where
-			// resuming would start a turn on a torn-down session.
 			const disposingBeforeTransition = this.#isDisposed;
 			await this.#memory.transition;
-			if ((this.#isDisposed && !disposingBeforeTransition) || this.#promptGeneration !== generation) return false;
-			const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
-
+			if ((this.#isDisposed && !disposingBeforeTransition) || !memoryPromptOptions.isCurrent()) return false;
+			const beforeAgentStartMessageCount = messages.length;
 			let baseXdevCatalogDelivered = true;
-			// Emit before_agent_start extension event
-			if (this.#extensionRunner) {
+			let beforeAgentStartReplacedSystemPrompt = false;
+			const emitBeforeAgentStart = async (systemPrompt: string[]): Promise<string[]> => {
+				if (!this.#extensionRunner) return systemPrompt;
 				const result = await this.#extensionRunner.emitBeforeAgentStart(
 					expandedText,
 					options?.images,
-					beforeAgentStartSystemPrompt,
+					systemPrompt,
 				);
+				beforeAgentStartReplacedSystemPrompt = result?.systemPrompt !== undefined;
+				baseXdevCatalogDelivered = result?.systemPrompt === undefined;
 				if (result?.messages) {
 					const promptAttribution: "user" | "agent" | undefined =
 						"attribution" in message ? message.attribution : undefined;
@@ -6345,21 +7046,45 @@ export class AgentSession {
 						);
 					}
 				}
-
-				if (result?.systemPrompt !== undefined) {
-					baseXdevCatalogDelivered = false;
-					this.#tools.setTurnSystemPromptOverride(result.systemPrompt);
-				} else {
-					this.#tools.clearTurnSystemPromptOverride();
-					this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
+				return result?.systemPrompt ?? systemPrompt;
+			};
+			const applyBeforeAgentStartSystemPrompt = (systemPrompt: string[]): void => {
+				if (beforeAgentStartReplacedSystemPrompt) {
+					this.#tools.setTurnSystemPromptOverride(systemPrompt);
+					return;
 				}
-			} else {
 				this.#tools.clearTurnSystemPromptOverride();
-				this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
+				this.agent.setSystemPrompt(systemPrompt);
+			};
+
+			let beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(
+				expandedText,
+				memoryPromptOptions,
+			);
+			// Scope changes and `/memory clear` invalidate only recalled context, not
+			// this user turn. Discard the stale preflight and rebuild/recall against
+			// the newly refreshed base exactly once before continuing admission.
+			if (!memoryPromptOptions.isMemoryCurrent() && memoryPromptOptions.isCurrent()) {
+				memoryContextGeneration = this.#memoryContextGeneration;
+				beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(
+					expandedText,
+					memoryPromptOptions,
+				);
+			}
+			ranLegacyMemoryPreflight = requiresLegacyMemoryCleanup;
+
+			if (!memoryPromptOptions.isCurrent()) {
+				return false;
 			}
 
+			beforeAgentStartSystemPrompt = await emitBeforeAgentStart(beforeAgentStartSystemPrompt);
+			if (!memoryPromptOptions.isCurrent()) {
+				return false;
+			}
+			applyBeforeAgentStartSystemPrompt(beforeAgentStartSystemPrompt);
+
 			// Bail out if a newer abort/prompt cycle has started since we began setup
-			if (this.#promptGeneration !== generation) {
+			if (!memoryPromptOptions.isCurrent()) {
 				return false;
 			}
 
@@ -6373,7 +7098,7 @@ export class AgentSession {
 			const isUserTurn = message.role === "user" || (message.role === "custom" && isUserInvokedSkillPrompt(message));
 			if (this.isAutoThinking && isUserTurn) {
 				await this.#models.applyAutoThinkingLevel(expandedText, generation);
-				if (this.#promptGeneration !== generation) {
+				if (!memoryPromptOptions.isCurrent()) {
 					return false;
 				}
 			}
@@ -6391,7 +7116,7 @@ export class AgentSession {
 			}
 
 			await this.#maintenance.runPrePromptCompactionIfNeeded(messages);
-			if (this.#promptGeneration !== generation) {
+			if (!memoryPromptOptions.isCurrent()) {
 				return false;
 			}
 
@@ -6404,24 +7129,46 @@ export class AgentSession {
 				nonMessageTokens +
 					this.agent.tokenizer.countMessages(this.messages) +
 					this.agent.tokenizer.countMessages(messages);
+			if (!memoryPromptOptions.isCurrent()) return false;
 			this.#stats.setPendingSnapshot({
 				promptTokens,
 				nonMessageTokens,
 				cutoffCount: this.messages.length + messages.length,
 			});
-			// Commit the plan-reference delivery flag only now that the message is
-			// actually handed to agent.prompt. Every pre-send setup step above can
-			// return (generation-bail) or throw (@-mention reads, before_agent_start
-			// hooks, pre-prompt compaction) before this point; setting the flag at
-			// construction time (#buildPlanReferenceMessage) stranded it `true` with
-			// nothing delivered, so the retry skipped re-injection and the executor
-			// lost the approved plan (issue #4094). The compaction-success resets
-			// (issue #1246) still clear it for re-injection on the next turn.
-			if (planReferenceMessage) {
-				this.#planReferenceSent = true;
-			}
+			let retriedMemoryPreflight = false;
 			try {
-				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
+				const admitsPlanReference = messages.some(
+					candidate => candidate.role === "custom" && candidate.customType === "plan-mode-reference",
+				);
+				await this.#promptAgentWithIdleRetry(
+					messages,
+					agentPromptOptions,
+					() => this.#prepareMemoryPromptForAgentStart(expandedText, memoryPromptOptions),
+					async () => {
+						if (!memoryPromptOptions.isCurrent() || retriedMemoryPreflight) return false;
+						retriedMemoryPreflight = true;
+						memoryContextGeneration = this.#memoryContextGeneration;
+						// The previous extension result belongs to the rejected
+						// admission. Rebuild both recall and extension output from the
+						// newest base without duplicating those custom messages.
+						messages.length = beforeAgentStartMessageCount;
+						const rebuiltSystemPrompt = await this.#buildSystemPromptForAgentStart(
+							expandedText,
+							memoryPromptOptions,
+						);
+						if (!memoryPromptOptions.isCurrent()) return false;
+						beforeAgentStartSystemPrompt = await emitBeforeAgentStart(rebuiltSystemPrompt);
+						if (!memoryPromptOptions.isCurrent()) return false;
+						applyBeforeAgentStartSystemPrompt(beforeAgentStartSystemPrompt);
+						return true;
+					},
+					() => {
+						agentCoreStarted = true;
+						this.#schedulePreCoreQueuedMessageDrain();
+						if (admitsPlanReference) this.#planReferenceSent = true;
+					},
+					memoryPromptOptions.isCurrent,
+				);
 			} finally {
 				this.#stats.setPendingSnapshot(undefined);
 			}
@@ -6432,8 +7179,35 @@ export class AgentSession {
 		} finally {
 			// The per-turn before_agent_start override lives only for this turn.
 			this.#tools.clearTurnSystemPromptOverride();
+			if (!agentCoreStarted) {
+				// Promotion and recall rollback are tied to this signal. Abort before
+				// refresh/controller cleanup so a rejected admission cannot commit it.
+				agentStartPromptAbortController.abort();
+			}
+			if (!agentCoreStarted && drainedPendingNextTurnMessages.length > 0) {
+				this.#pendingNextTurnMessages = [...drainedPendingNextTurnMessages, ...this.#pendingNextTurnMessages];
+			}
+			// Hindsight/Mnemopi have durable recall state. If cancellation wins after
+			// their completed preflight, rebuild that durable prompt for the next
+			// turn. Supermemory remains pending-only and is deliberately not committed.
+			if (!agentCoreStarted && ranLegacyMemoryPreflight) {
+				try {
+					await this.refreshMemoryPromptContext({ preservePromotedMemory: !this.#rebuildSystemPrompt });
+				} catch (err) {
+					logger.debug("Memory prompt refresh after pre-agent cancellation failed", { error: String(err) });
+				}
+			}
+			if (legacyMemoryPromptCleanup) {
+				legacyMemoryPromptCleanup.resolve();
+				if (this.#legacyMemoryPromptCleanup === legacyMemoryPromptCleanup.promise) {
+					this.#legacyMemoryPromptCleanup = undefined;
+				}
+			}
+			if (this.#agentStartPromptAbortController === agentStartPromptAbortController) {
+				this.#agentStartPromptAbortController = undefined;
+			}
 			this.#usagePreflightReadyForNextModelCall = false;
-			this.#endInFlight();
+			if (ownsInFlightReservation) this.#endInFlight(reservation);
 		}
 	}
 
@@ -6600,10 +7374,19 @@ export class AgentSession {
 			this.#throwIfExtensionCommand(text);
 		}
 
+		if (this.#sessionReplacementInProgress) return;
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
 		// Stamp before image preprocessing so a queued image steer measures from
 		// the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
+		if (this.#hasPreCoreReservation()) {
+			this.#enqueuePreCore({
+				kind: "userMessage",
+				content: images?.length ? [{ type: "text", text: expandedText }, ...images] : expandedText,
+				deliverAs: "steer",
+			});
+			return;
+		}
 		await this.#queueUserMessage(expandedText, images, "steer", submittedAt);
 	}
 
@@ -6619,15 +7402,40 @@ export class AgentSession {
 			this.#throwIfExtensionCommand(text);
 		}
 
+		if (this.#sessionReplacementInProgress) return;
 		const expandedText =
 			options?.expandPromptTemplates === false ? text : expandPromptTemplate(text, [...this.#promptTemplates]);
 		// Stamp before image preprocessing so a queued image follow-up measures
 		// from the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
 		if (!options?.synthetic) {
+			// Agent-core cannot consume a follow-up until the preflight owner has
+			// admitted its turn. Match steer/sendUserMessage and replay via the
+			// pre-core queue rather than depositing it in the core queue early.
+			if (this.#hasPreCoreReservation()) {
+				this.#enqueuePreCore({
+					kind: "userMessage",
+					content: images?.length ? [{ type: "text", text: expandedText }, ...images] : expandedText,
+					deliverAs: "followUp",
+				});
+				return;
+			}
 			await this.#queueUserMessage(expandedText, images, "followUp", submittedAt);
 			return;
 		}
+		if (this.#hasPreCoreReservation()) {
+			await this.sendCustomMessage(
+				{
+					customType: "synthetic-follow-up",
+					content: images?.length ? [{ type: "text", text: expandedText }, ...images] : expandedText,
+					display: false,
+					attribution: options.attribution ?? "agent",
+				},
+				{ deliverAs: "followUp" },
+			);
+			return;
+		}
+
 		// Synthetic branch: agent-initiated hidden developer message. Bypass
 		// #queueUserMessage (which clears advisor auto-resume suppression and
 		// enqueues as a user-attributed message) and place the developer message
@@ -6761,6 +7569,7 @@ export class AgentSession {
 
 	#scheduleQueuedMessageDrain(): void {
 		if (
+			this.#sessionReplacementInProgress ||
 			this.#queuedMessageDrainScheduled ||
 			this.#modeExitDrainSuppressionDepth > 0 ||
 			this.#queuedMessageDrainBlocked ||
@@ -6924,7 +7733,7 @@ export class AgentSession {
 		message: CustomMessage,
 		options?: { acceptTerminalEmptyStop?: boolean },
 	): Promise<boolean> {
-		this.#beginInFlight();
+		const reservation = this.#beginInFlight();
 		try {
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
 			const acceptTerminalEmptyStop = options?.acceptTerminalEmptyStop === true;
@@ -6938,7 +7747,7 @@ export class AgentSession {
 		} finally {
 			this.#usagePreflightReadyForNextModelCall = false;
 			this.#recovery.setAcceptTerminalEmptyStop(false);
-			this.#endInFlight();
+			this.#endInFlight(reservation);
 		}
 	}
 
@@ -7015,6 +7824,7 @@ export class AgentSession {
 			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<boolean> {
+		if (this.#sessionReplacementInProgress) return false;
 		// Captured before the normalization await below — see #sessionGeneration's doc comment.
 		const sessionGeneration = this.#sessionGeneration;
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
@@ -7038,6 +7848,18 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
+		if (this.#hasPreCoreReservation()) {
+			// The owner has not assembled its prompt yet in the usual case, so
+			// attach next-turn context directly to that batch. If assembly already
+			// drained it, this naturally becomes the following turn; rollback puts
+			// an earlier drained prefix back ahead of it.
+			if (options?.deliverAs === "nextTurn") {
+				this.#queueHiddenNextTurnMessage(normalizedAppMessage, options.triggerTurn ?? false);
+				return false;
+			}
+			this.#enqueuePreCore({ kind: "customDelivery", message: normalizedAppMessage, options: { ...options } });
+			return false;
+		}
 		if (this.isStreaming) {
 			if (options?.deliverAs === "nextTurn") {
 				this.#queueHiddenNextTurnMessage(normalizedAppMessage, options?.triggerTurn ?? false);
@@ -7143,7 +7965,7 @@ export class AgentSession {
 		content: string | (TextContent | ImageContent)[],
 		options?: { deliverAs?: "steer" | "followUp" | "aside" },
 	): Promise<void> {
-		// Normalize content to text string + optional images
+		if (this.#sessionReplacementInProgress) return;
 		let text: string;
 		let images: ImageContent[] | undefined;
 
@@ -7161,6 +7983,15 @@ export class AgentSession {
 			}
 			text = textParts.join("\n");
 			if (images.length === 0) images = undefined;
+		}
+		// Agent-core cannot consume queue input until preflight admission completes.
+		if (this.#hasPreCoreReservation()) {
+			this.#enqueuePreCore({
+				kind: "userMessage",
+				content: typeof content === "string" ? content : [...content],
+				deliverAs: options?.deliverAs ?? "prompt",
+			});
+			return;
 		}
 
 		let deliveredAsAside = false;
@@ -7194,65 +8025,67 @@ export class AgentSession {
 		});
 	}
 
-	/** Clear queued messages and return the user-restorable ones (text plus any attached images).
-	 *  Only user-authored messages (plain user turns, `attribution:"user"` custom like `/skill`) are
-	 *  returned for editor restore. Other queued messages stay in the agent-core queues so a continuing
-	 *  stream still delivers them — EXCEPT on `forInterrupt` (Esc+abort), where only advisor cards are
-	 *  kept (abort()'s #extractQueuedAdvisorCards preserves them as visible advice) and every other
-	 *  non-user steer (hidden goal/plan/budget, IRC/extension asides) is dropped, so abort()'s
-	 *  #drainStrandedQueuedMessages can't auto-resume the run the user just interrupted (the drain only
-	 *  fires while agent.hasQueuedMessages()). Plain Alt+Up dequeue preserves those non-user steers. */
+	/** Clear queued messages and return the user-restorable ones (text plus any attached images). */
 	clearQueue(options?: { forInterrupt?: boolean }): {
 		steering: RestoredQueuedMessage[];
 		followUp: RestoredQueuedMessage[];
 	} {
 		const steeringAll = this.agent.peekSteeringQueue();
 		const followUpAll = this.agent.peekFollowUpQueue();
-		const steering = steeringAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
-		const followUp = followUpAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
-		const keep: (m: AgentMessage) => boolean = options?.forInterrupt
+		const steering = [
+			...steeringAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage),
+			...this.#preCoreRestoredMessages(false),
+		];
+		const followUp = [
+			...followUpAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage),
+			...this.#preCoreRestoredMessages(true),
+		];
+		const keep: (message: AgentMessage) => boolean = options?.forInterrupt
 			? isAdvisorCard
-			: m => !isUserQueuedMessage(m) && !isHiddenUserCompanion(m);
+			: message => !isUserQueuedMessage(message) && !isHiddenUserCompanion(message);
 		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
+		this.#preCoreQueuedMessages = this.#preCoreQueuedMessages.filter(message => {
+			if (message.kind !== "customPrompt" && message.kind !== "customDelivery") return false;
+			return options?.forInterrupt ? isAdvisorCard(message.message) : !isUserQueuedMessage(message.message);
+		});
 		this.#reconcileQueuedMessageDrain();
 		return { steering, followUp };
 	}
 
-	/** Number of pending displayable messages (includes steering, follow-up, and next-turn messages).
-	 *  Reflects actual queued work (advisor cards included) — feeds hasPendingMessages()/RPC and the
-	 *  empty-submit abort gate. The user-restorable subset is surfaced by getQueuedMessages()/clearQueue(). */
+	/** Number of pending displayable messages (includes steering, follow-up, and next-turn messages). */
 	get queuedMessageCount(): number {
 		return (
 			this.agent.peekSteeringQueue().filter(isDisplayableQueuedMessage).length +
 			this.agent.peekFollowUpQueue().filter(isDisplayableQueuedMessage).length +
-			this.#pendingNextTurnMessages.length
+			this.#pendingNextTurnMessages.length +
+			this.#preCoreQueuedMessages.filter(
+				message =>
+					(message.kind !== "customPrompt" && message.kind !== "customDelivery") ||
+					isDisplayableQueuedMessage(message.message),
+			).length
 		);
 	}
 
 	getQueuedMessages(): { steering: readonly string[]; followUp: readonly string[] } {
 		return {
-			steering: this.agent.peekSteeringQueue().filter(isUserQueuedMessage).map(queueChipText),
-			followUp: this.agent.peekFollowUpQueue().filter(isUserQueuedMessage).map(queueChipText),
+			steering: [
+				...this.agent.peekSteeringQueue().filter(isUserQueuedMessage).map(queueChipText),
+				...this.#preCoreRestoredMessages(false).map(message => message.text),
+			],
+			followUp: [
+				...this.agent.peekFollowUpQueue().filter(isUserQueuedMessage).map(queueChipText),
+				...this.#preCoreRestoredMessages(true).map(message => message.text),
+			],
 		};
 	}
 
-	/**
-	 * Pop the last queued message (steering first, then follow-up).
-	 * Used by dequeue keybinding to restore messages to editor one at a time.
-	 * Steps over agent-authored queued messages (advisor cards, hidden/internal steers).
-	 */
 	popLastQueuedMessage(): RestoredQueuedMessage | undefined {
 		const steering = this.agent.peekSteeringQueue();
 		const followUp = this.agent.peekFollowUpQueue();
 		const lastUserIndex = (queue: readonly AgentMessage[]): number => {
-			for (let i = queue.length - 1; i >= 0; i--) {
-				if (isUserQueuedMessage(queue[i])) return i;
-			}
+			for (let index = queue.length - 1; index >= 0; index--) if (isUserQueuedMessage(queue[index])) return index;
 			return -1;
 		};
-		// Notices queue immediately before their user message, so dropping the popped
-		// prompt means also dropping the contiguous hidden-user companions right before
-		// it — companions of other queued prompts stay put.
 		const removeWithCompanions = (queue: readonly AgentMessage[], userIndex: number): AgentMessage[] => {
 			let start = userIndex;
 			while (start > 0 && isHiddenUserCompanion(queue[start - 1])) start--;
@@ -7260,13 +8093,30 @@ export class AgentSession {
 			next.splice(start, userIndex - start + 1);
 			return next;
 		};
+		const takePreCore = (followUpTier: boolean): RestoredQueuedMessage | undefined => {
+			for (let index = this.#preCoreQueuedMessages.length - 1; index >= 0; index--) {
+				const message = this.#preCoreQueuedMessages[index]!;
+				if (this.#isPreCoreFollowUp(message) !== followUpTier) continue;
+				if (
+					(message.kind === "customPrompt" || message.kind === "customDelivery") &&
+					!isUserQueuedMessage(message.message)
+				)
+					continue;
+				return this.#restorePreCoreQueuedMessage(this.#preCoreQueuedMessages.splice(index, 1)[0]!);
+			}
+			return undefined;
+		};
+		const preCoreSteer = takePreCore(false);
+		if (preCoreSteer) return preCoreSteer;
 		const fromSteer = lastUserIndex(steering);
 		if (fromSteer >= 0) {
-			const removed = steering[fromSteer];
+			const removed = steering[fromSteer]!;
 			this.agent.replaceQueues(removeWithCompanions(steering, fromSteer), followUp.slice());
 			this.#reconcileQueuedMessageDrain();
 			return toRestoredQueuedMessage(removed);
 		}
+		const preCoreFollowUp = takePreCore(true);
+		if (preCoreFollowUp) return preCoreFollowUp;
 		const fromFollowUp = lastUserIndex(followUp);
 		if (fromFollowUp >= 0) {
 			const removed = followUp[fromFollowUp];
@@ -7307,6 +8157,28 @@ export class AgentSession {
 	/** Replace the item labels before starting a pooled turn. */
 	setWorkPoolYieldItems(items: readonly WorkPoolYieldItem[]): void {
 		this.#workPoolYieldItems = items.map(item => ({ ...item }));
+	}
+
+	/**
+	 * Replace one extension-owned projection without touching canonical todos.
+	 * The projection is cloned and stripped to its public display fields.
+	 */
+	setTodoProjection(namespace: string, phases: readonly TodoProjectionPhase[] | undefined): void {
+		if (this.#todoProjections.set(namespace, phases)) {
+			this.#emit({ type: "todo_projection_changed", projections: this.getTodoProjections() });
+		}
+	}
+
+	/** Return deterministic, defensive snapshots for host rendering. */
+	getTodoProjections(): NamespacedTodoProjection[] {
+		return this.#todoProjections.snapshot();
+	}
+
+	/** Remove every derived projection in the current host session. */
+	clearTodoProjections(): void {
+		if (this.#todoProjections.clear()) {
+			this.#emit({ type: "todo_projection_changed", projections: [] });
+		}
 	}
 
 	#buildReplanTitleContext(): string {
@@ -7502,6 +8374,7 @@ export class AgentSession {
 			this.#abortAutolearnCapture();
 			for (const controller of this.#usagePreflightAbortControllers) controller.abort();
 			this.abortRetry();
+			this.#agentStartPromptAbortController?.abort();
 			this.#promptGeneration++;
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			// Abort the handoff first so generic compaction cancellation cannot replace
@@ -7530,6 +8403,10 @@ export class AgentSession {
 			// finishes, or the replacement turn's events are neither forwarded nor persisted.
 			await manualCompactionCleanup;
 			await this.#drainAutolearnCapture();
+			// A cancelled Hindsight/Mnemopi preflight may still be restoring the
+			// durable system prompt. Do not report abort complete while that stale
+			// cleanup can race a replacement prompt.
+			await this.#legacyMemoryPromptCleanup;
 			await this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" });
 			// Clear prompt-in-flight state: waitForIdle resolves when the agent loop's finally
 			// block runs, but nested prompt setup/finalizers may still be unwinding. Without this,
@@ -7559,6 +8436,13 @@ export class AgentSession {
 			}
 		} finally {
 			this.#abortInProgress = false;
+			// #endInFlight and #resetInFlight intentionally leave pre-core input
+			// stranded while abort cleanup owns the session. Replay it only once the
+			// aborted turn has fully reset and the session is usable again, unless a
+			// replacement owns the transcript boundary.
+			if (!this.#sessionReplacementInProgress) {
+				this.#schedulePreCoreQueuedMessageDrain();
+			}
 			this.#drainStrandedQueuedMessages();
 		}
 	}
@@ -7580,21 +8464,21 @@ export class AgentSession {
 				type: "session_before_switch",
 				reason: "new",
 			})) as SessionBeforeSwitchResult | undefined;
-
-			if (result?.cancel) {
-				return false;
-			}
+			if (result?.cancel) return false;
 		}
 
-		this.#disconnectFromAgent();
+		this.#sessionReplacementInProgress = true;
+		this.#preCoreQueuedMessages = [];
 		let advisorRecordersDetached = false;
-		await this.abort();
-		this.#cancelOwnAsyncJobs();
-		this.#closeAllProviderSessions("new session");
-		await this.#bash.flushPending();
-		const bashTransition = this.#bash.beginSessionTransition({ persistDetached: options?.drop !== true });
 		let sessionTransitioned = false;
 		try {
+			this.#disconnectFromAgent();
+			await this.abort();
+			this.#cancelOwnAsyncJobs();
+			this.#closeAllProviderSessions("new session");
+			await this.#bash.flushPending();
+			const preparedMemoryBackend = await this.#prepareMemoryBackendForNewTranscript();
+			const bashTransition = this.#bash.beginSessionTransition({ persistDetached: options?.drop !== true });
 			advisorRecordersDetached = true;
 			await this.#advisors.drainAndDetachRecorders();
 			try {
@@ -7613,11 +8497,12 @@ export class AgentSession {
 					additionalDirectories: this.settings.get("workspace.additionalDirectories"),
 				});
 				this.#bash.markSessionTransition(bashTransition);
-				// The new session owns the transcript from here, so the previous
-				// conversation's advisor spend is retired with it. Clearing at the commit
-				// point keeps the status line honest even if a later step below throws.
+				// The new session owns the transcript and advisor ledger.
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
+			} catch (error) {
+				await this.#restoreMemoryBackendAfterFailedTranscriptTransition(preparedMemoryBackend);
+				throw error;
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
@@ -7625,6 +8510,7 @@ export class AgentSession {
 			this.#clearSessionScopedToolState();
 			this.#clearCheckpointRuntimeState();
 			this.setTodoPhases([]);
+			this.clearTodoProjections();
 			this.#freshProviderSessionId = undefined;
 			this.#clearInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId();
@@ -7633,8 +8519,7 @@ export class AgentSession {
 			// post-/new turns keep sending the previous session's StablePrefix, and
 			// #syncAppendOnlyContext only re-runs on model or setting changes.
 			this.agent.appendOnlyContext?.invalidateForModelChange();
-			this.#memory.rekeyForCurrentSessionId();
-			await this.#memory.resetContextForNewTranscript();
+			await this.#resetMemoryContextForNewTranscript(preparedMemoryBackend);
 			this.#pendingNextTurnMessages = [];
 			// The abort above may have skipped the loop's final aside poll (issue: stranded
 			// asides survive an aborted turn by design so a resumed session can still see
@@ -7667,7 +8552,6 @@ export class AgentSession {
 			resetCapabilities();
 			await this.refreshBaseSystemPrompt();
 
-			// Emit session_switch event with reason "new" to hooks
 			if (this.#extensionRunner) {
 				await this.#extensionRunner.emit({
 					type: "session_switch",
@@ -7675,14 +8559,15 @@ export class AgentSession {
 					previousSessionFile,
 				});
 			}
-
-			return true;
 		} finally {
 			if (advisorRecordersDetached) {
 				if (sessionTransitioned) this.#advisors.resetSessionState();
 				else this.#advisors.reattachRecorderFeeds();
 			}
+			this.#sessionReplacementInProgress = false;
+			this.#reconnectToAgent();
 		}
+		return true;
 	}
 
 	/**
@@ -7719,11 +8604,11 @@ export class AgentSession {
 		await this.#bash.flushPending();
 		// Flush current session to ensure all entries are written
 		await this.sessionManager.flush();
+		const preparedMemoryBackend = await this.#prepareMemoryBackendForNewTranscript();
 		let advisorRecordersDetached = false;
 		try {
 			advisorRecordersDetached = true;
-			// Fork keeps the conversation, but still needs a quiet artifact boundary:
-			// stop and settle in-flight advisors before muting their feeds.
+			// Fork keeps the conversation, but still needs a quiet artifact boundary.
 			await this.#advisors.drainAndDetachRecorders();
 			const bashTransition = this.#bash.beginSessionTransition();
 
@@ -7733,12 +8618,15 @@ export class AgentSession {
 				forkResult = await this.sessionManager.fork();
 			} catch (error) {
 				this.#bash.finishSessionTransition(bashTransition, false);
+				await this.#restoreMemoryBackendAfterFailedTranscriptTransition(preparedMemoryBackend);
 				throw error;
 			}
 			if (!forkResult) {
 				this.#bash.finishSessionTransition(bashTransition, false);
+				await this.#restoreMemoryBackendAfterFailedTranscriptTransition(preparedMemoryBackend);
 				return false;
 			}
+			this.clearTodoProjections();
 			this.#bash.markSessionTransition(bashTransition);
 			this.#bash.finishSessionTransition(bashTransition, true);
 			// The fork clones the transcript and keeps this recovery state running
@@ -7751,10 +8639,9 @@ export class AgentSession {
 			this.#freshProviderSessionId = undefined;
 			this.#adoptInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId();
-			this.#memory.rekeyForCurrentSessionId();
+			await this.#resetMemoryContextForNewTranscript(preparedMemoryBackend);
 			this.#advisors.reattachRecorderFeeds();
 			advisorRecordersDetached = false;
-			await this.#memory.resetContextForNewTranscript();
 
 			// Emit session_switch event with reason "fork" to hooks
 			if (this.#extensionRunner) {
@@ -8377,7 +9264,70 @@ export class AgentSession {
 		this.#recovery.abortRetry();
 	}
 
-	/** Whether auto-retry is currently in progress. */
+	/**
+	 * Wait for agent-core idle, preparing recalled context before atomically
+	 * committing it from the core admission callback.
+	 */
+	async #promptAgentWithIdleRetry(
+		messages: AgentMessage[],
+		options?: { toolChoice?: ToolChoice },
+		prepareAdmission?: () => Promise<(() => void) | false>,
+		onAdmissionPreflightRejected?: () => Promise<boolean>,
+		onAgentCoreStarted?: () => void,
+		isCurrent?: () => boolean,
+	): Promise<void> {
+		const deadline = Date.now() + 30_000;
+		let onAccepted: (() => void) | false | undefined;
+		for (;;) {
+			if (isCurrent && !isCurrent()) return;
+			// This session can retain an in-flight reservation while asynchronous
+			// preflight runs, so inspect the core loop directly. A prior core turn
+			// owns admission until it reaches idle; recalled memory and staged
+			// context must remain uncommitted while we wait.
+			if (this.agent.state.isStreaming) {
+				const remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) {
+					throw new Error("Timed out waiting for prior agent run to finish before prompting.");
+				}
+				await Promise.race([this.agent.waitForIdle(), Bun.sleep(Math.min(remainingMs, 50))]);
+				continue;
+			}
+
+			if (onAccepted === undefined) {
+				onAccepted = prepareAdmission ? await prepareAdmission() : undefined;
+			}
+			if (onAccepted === false) {
+				onAccepted = undefined;
+				if (isCurrent && !isCurrent()) return;
+				if (await onAdmissionPreflightRejected?.()) continue;
+			}
+			if (isCurrent && !isCurrent()) return;
+			try {
+				await this.agent.prompt(messages, {
+					...options,
+					onAccepted: () => {
+						try {
+							if (onAccepted !== false) onAccepted?.();
+						} finally {
+							onAgentCoreStarted?.();
+						}
+					},
+				});
+				return;
+			} catch (error) {
+				// The core may become busy after asynchronous preflight completed.
+				// No onAccepted callback ran, so retry the same reservation without
+				// consuming its staged recall or duplicating the user turn.
+				if (error instanceof AgentBusyError) {
+					onAccepted = undefined;
+					continue;
+				}
+				throw error;
+			}
+		}
+	}
+
+	/** Whether auto-retry is currently in progress */
 	get isRetrying(): boolean {
 		return this.#recovery.isRetrying;
 	}
@@ -8736,13 +9686,38 @@ export class AgentSession {
 			}
 		}
 
-		this.#disconnectFromAgent();
-		await this.abort({ goalReason: "internal" });
-		await this.#sessionBeforeSwitchReconciler?.();
+		const previousTodoProjections = this.getTodoProjections();
 
-		await this.#bash.flushPending();
-		// Flush pending writes before switching so restore snapshots reflect committed state.
-		await this.sessionManager.flush();
+		this.#disconnectFromAgent();
+		let preparedMemoryBackend: PreparedMemoryBackendTransition | undefined;
+		let sessionModeQuiescingStarted = false;
+		try {
+			await this.abort({ goalReason: "internal" });
+			if (this.#sessionBeforeSwitchReconciler) {
+				sessionModeQuiescingStarted = true;
+				await this.#sessionBeforeSwitchReconciler();
+			}
+
+			await this.#bash.flushPending();
+			// Flush pending writes before switching so restore snapshots reflect committed state.
+			await this.sessionManager.flush();
+			preparedMemoryBackend = switchingToDifferentSession
+				? await this.#prepareMemoryBackendForNewTranscript()
+				: undefined;
+		} catch (error) {
+			this.#reconnectToAgent();
+			if (sessionModeQuiescingStarted) {
+				try {
+					await this.#sessionSwitchReconciler?.();
+				} catch (reconcileError) {
+					logger.warn("Failed to reconcile session mode after aborted switch", {
+						targetSessionFile: sessionPath,
+						error: String(reconcileError),
+					});
+				}
+			}
+			throw error;
+		}
 		const previousSessionState = this.sessionManager.captureState();
 		const bashTransition = this.#bash.beginSessionTransition();
 		// Only same-session reloads compare against the prior context to detect
@@ -8846,6 +9821,8 @@ export class AgentSession {
 				didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);
 			this.#rehydrateCheckpointRewindState();
 
+			this.clearTodoProjections();
+
 			// Emit session_switch event to hooks
 			if (this.#extensionRunner) {
 				await this.#extensionRunner.emit({
@@ -8940,7 +9917,7 @@ export class AgentSession {
 			);
 
 			if (switchingToDifferentSession) {
-				await this.#memory.resetContextForNewTranscript();
+				await this.#resetMemoryContextForNewTranscript(preparedMemoryBackend);
 			}
 			if (switchingToDifferentSession || didReloadConversationChange) {
 				this.#clearSessionScopedToolState();
@@ -8986,6 +9963,7 @@ export class AgentSession {
 			this.sessionManager.restoreState(previousSessionState);
 			this.#freshProviderSessionId = previousFreshProviderSessionId;
 			this.#syncAgentSessionId(previousSessionState.sessionId, false);
+			await this.#restoreMemoryBackendAfterFailedTranscriptTransition(preparedMemoryBackend);
 			this.#memory.rekeyForCurrentSessionId();
 			this.agent.setTools(previousTools);
 			this.#tools.setBaseSystemPrompt(previousBaseSystemPrompt);
@@ -9031,6 +10009,10 @@ export class AgentSession {
 				this.#emit({ type: "model_changed" });
 			}
 			this.#todo.syncFromBranch();
+			this.clearTodoProjections();
+			for (const projection of previousTodoProjections) {
+				this.setTodoProjection(projection.namespace, projection.phases);
+			}
 			this.#advisors.resetAllRuntimes();
 			this.#advisors.reattachRecorderFeeds();
 			this.#reconnectToAgent();
@@ -9118,6 +10100,7 @@ export class AgentSession {
 		this.#cancelOwnAsyncJobs();
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
+		const preparedMemoryBackend = await this.#prepareMemoryBackendForNewTranscript();
 
 		let sessionTransitioned = false;
 		let advisorRecordersDetached = false;
@@ -9129,13 +10112,18 @@ export class AgentSession {
 					const title = this.sessionManager.getSessionName();
 					const titleSource = this.sessionManager.titleSource;
 					await this.sessionManager.newSession({ parentSession: previousSessionFile });
+					this.clearTodoProjections();
 					if (title) await this.sessionManager.setSessionName(title, titleSource);
 				} else {
 					this.sessionManager.createBranchedSession(selectedEntry.parentId);
+					this.clearTodoProjections();
 				}
 				this.#bash.markSessionTransition(bashTransition);
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
+			} catch (error) {
+				await this.#restoreMemoryBackendAfterFailedTranscriptTransition(preparedMemoryBackend);
+				throw error;
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
@@ -9145,13 +10133,10 @@ export class AgentSession {
 			this.#freshProviderSessionId = undefined;
 			this.#clearInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId();
-			this.#memory.rekeyForCurrentSessionId();
-			await this.#memory.resetContextForNewTranscript();
+			await this.#resetMemoryContextForNewTranscript(preparedMemoryBackend);
 
-			// Reload messages from entries (works for both file and in-memory mode)
 			const sessionContext = this.buildDisplaySessionContext();
 
-			// Emit session_branch event to hooks (after branch completes)
 			if (this.#extensionRunner) {
 				await this.#extensionRunner.emit({
 					type: "session_branch",
@@ -9246,6 +10231,7 @@ export class AgentSession {
 		this.#cancelOwnAsyncJobs();
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
+		const preparedMemoryBackend = await this.#prepareMemoryBackendForNewTranscript();
 
 		let sessionTransitioned = false;
 		let advisorRecordersDetached = false;
@@ -9257,9 +10243,13 @@ export class AgentSession {
 					throw new Error("Cannot branch /btw: session changed since /btw started");
 				}
 				this.sessionManager.createBranchedSession(leafId);
+				this.clearTodoProjections();
 				this.#bash.markSessionTransition(bashTransition);
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
+			} catch (error) {
+				await this.#restoreMemoryBackendAfterFailedTranscriptTransition(preparedMemoryBackend);
+				throw error;
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
@@ -9276,8 +10266,7 @@ export class AgentSession {
 			this.#todo.syncFromBranch();
 			this.#freshProviderSessionId = undefined;
 			this.#syncAgentSessionId();
-			this.#memory.rekeyForCurrentSessionId();
-			await this.#memory.resetContextForNewTranscript();
+			await this.#resetMemoryContextForNewTranscript(preparedMemoryBackend);
 
 			const sessionContext = this.buildDisplaySessionContext();
 
@@ -9519,6 +10508,7 @@ export class AgentSession {
 			summaryDetails = hookSummary.details;
 		}
 
+		const preparedMemoryBackend = await this.#prepareMemoryBackendForNewTranscript();
 		// Determine the new leaf position based on target type
 		let newLeafId: string | null;
 		let editorText: string | undefined;
@@ -9594,11 +10584,16 @@ export class AgentSession {
 			} else {
 				this.sessionManager.branch(newLeafId);
 			}
+			this.clearTodoProjections();
 			this.#bash.markSessionTransition(bashTransition);
 			branchTransitioned = true;
+		} catch (error) {
+			await this.#restoreMemoryBackendAfterFailedTranscriptTransition(preparedMemoryBackend);
+			throw error;
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, branchTransitioned);
 		}
+		await this.#resetMemoryContextForNewTranscript(preparedMemoryBackend);
 
 		// Update agent state — build display context to populate agent messages.
 		const stateContext = this.sessionManager.buildSessionContext();
@@ -10218,7 +11213,6 @@ export class AgentSession {
 				: undefined,
 		});
 	}
-
 	// =========================================================================
 	// Utilities
 	// =========================================================================

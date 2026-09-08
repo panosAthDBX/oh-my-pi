@@ -22,14 +22,15 @@ export type LearnParams = typeof learnSchema.infer;
 /**
  * Orchestrating "learn" tool: persists a lesson to long-term memory and,
  * given a `skill` payload, mints/enhances a managed skill via the shared
- * `writeManagedSkill` primitive. Gated behind `autolearn.enabled` plus a live
- * memory backend — `hindsight`/`mnemopi` (remote/SQLite) or `local` (the
- * file-based rollout backend, where lessons append to `learned.md`).
+ * memory backend — `hindsight`/`supermemory`/`mnemopi` (remote/SQLite) or
+ * `local` (the file-based rollout backend, where lessons append to
+ * `learned.md`).
  */
 export class LearnTool implements AgentTool<typeof learnSchema> {
 	readonly name = "learn";
 	readonly approval = (args: unknown) =>
-		(args as Partial<LearnParams>).skill || this.session.settings.get("memory.backend") === "local"
+		(args as Partial<LearnParams>).skill ||
+		(this.session.getMemoryBackend?.()?.id ?? this.session.settings.get("memory.backend")) === "local"
 			? "write"
 			: "read";
 	readonly label = "Learn";
@@ -43,16 +44,29 @@ export class LearnTool implements AgentTool<typeof learnSchema> {
 
 	static createIf(session: ToolSession): LearnTool | null {
 		if (!session.settings.get("autolearn.enabled")) return null;
-		const backend = session.settings.get("memory.backend");
-		if (backend !== "hindsight" && backend !== "mnemopi" && backend !== "local") return null;
+		const backend = session.getMemoryBackend?.()?.id ?? session.settings.get("memory.backend");
+		if (backend !== "hindsight" && backend !== "supermemory" && backend !== "mnemopi" && backend !== "local")
+			return null;
 		return new LearnTool(session);
 	}
 
 	async execute(_id: string, params: LearnParams): Promise<AgentToolResult> {
 		// 1) Persist or queue the lesson to long-term memory (mirrors MemoryRetainTool).
-		const backend = this.session.settings.get("memory.backend");
+		const backend = this.session.getMemoryBackend?.()?.id ?? this.session.settings.get("memory.backend");
 		let memoryMessage = "Lesson stored";
-		if (backend === "mnemopi") {
+		if (backend === "supermemory") {
+			const memory = this.session.getMemoryRuntime?.();
+			if (!memory) throw new Error("Supermemory backend is not initialised for this session.");
+			const result = await memory.save({
+				content: params.memory,
+				context: params.context,
+				source: "coding-agent-learn",
+				importance: 0.8,
+			});
+			if (result.stored === 0) {
+				throw new Error(result.message ?? "Supermemory did not store the lesson.");
+			}
+		} else if (backend === "mnemopi") {
 			const state = this.session.getMnemopiSessionState?.();
 			if (!state) {
 				throw new Error("Mnemopi backend is not initialised for this session.");

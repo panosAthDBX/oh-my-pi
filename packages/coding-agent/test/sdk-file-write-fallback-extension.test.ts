@@ -58,6 +58,7 @@ function initializeRunnerForTest(runner: ExtensionRunner | undefined): void {
 		setThinkingLevel: () => {},
 		getSessionName: () => undefined,
 		setSessionName: async () => {},
+		setTodoProjection: () => {},
 	};
 	const contextActions: ExtensionContextActions = {
 		getModel: () => undefined,
