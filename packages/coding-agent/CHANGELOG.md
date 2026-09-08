@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- Fixed JavaScript eval cells dropping delayed replies to floated bridge calls, which could leave a promise from `agent()` or another tool permanently pending across cells.
 - Fixed deferred memory backend settings being ignored by fork, resume, branch, and handoff session transitions.
 - Fixed automatic Supermemory retention reusing one document identity across cadence windows, which caused later conversation windows to overwrite earlier retained content.
 

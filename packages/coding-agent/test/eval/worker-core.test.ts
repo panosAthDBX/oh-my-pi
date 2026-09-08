@@ -92,6 +92,170 @@ function installFatalCapture(): {
 }
 
 describe("WorkerCore", () => {
+	it("retains a finished cell until its floated bridge promise settles across cells", async () => {
+		const harness = createWorkerHarness();
+		const cwd = process.cwd();
+		const snapshot = { cwd, sessionId: "floated-bridge", localRoots: {} };
+		await initializeWorker(harness, snapshot);
+
+		const outbound: WorkerOutbound[] = [];
+		const unsubscribe = harness.onMessage(message => outbound.push(message));
+		try {
+			const toolCall = waitForMessage(harness, message => message.type === "tool-call");
+			const firstResult = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "floated-first",
+			);
+			harness.send({
+				type: "run",
+				runId: "floated-first",
+				filename: "[floated-first].js",
+				snapshot,
+				code: "globalThis.__worker_core_saved = globalThis.__omp_call_tool__('fake', {}); 'returned';",
+			});
+
+			const call = (await toolCall) as Extract<WorkerOutbound, { type: "tool-call" }>;
+			await Bun.sleep(10);
+			expect(outbound).not.toContainEqual(expect.objectContaining({ type: "result", runId: "floated-first" }));
+
+			harness.send({ type: "tool-reply", id: call.id, reply: { ok: true, value: "bridge-result" } });
+			expect(await firstResult).toMatchObject({ type: "result", runId: "floated-first", ok: true });
+
+			const secondText = waitForMessage(
+				harness,
+				message => message.type === "text" && message.runId === "floated-second",
+			);
+			const secondResult = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "floated-second",
+			);
+			harness.send({
+				type: "run",
+				runId: "floated-second",
+				filename: "[floated-second].js",
+				snapshot,
+				code: "display(await globalThis.__worker_core_saved);",
+			});
+			expect(await secondText).toMatchObject({ type: "text", runId: "floated-second", chunk: "bridge-result\n" });
+			expect(await secondResult).toMatchObject({ type: "result", runId: "floated-second", ok: true });
+		} finally {
+			unsubscribe();
+			harness.send({ type: "close" });
+		}
+	});
+
+	it("preserves a delayed bridge error for a later cell without hanging", async () => {
+		const harness = createWorkerHarness();
+		const snapshot = { cwd: process.cwd(), sessionId: "floated-error", localRoots: {} };
+		await initializeWorker(harness, snapshot);
+		try {
+			const toolCall = waitForMessage(harness, message => message.type === "tool-call");
+			const firstResult = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "error-first",
+			);
+			harness.send({
+				type: "run",
+				runId: "error-first",
+				filename: "[error-first].js",
+				snapshot,
+				code: "globalThis.__worker_core_error = globalThis.__omp_call_tool__('fake', {}).catch(error => error.message); 'returned';",
+			});
+			const call = (await toolCall) as Extract<WorkerOutbound, { type: "tool-call" }>;
+			harness.send({
+				type: "tool-reply",
+				id: call.id,
+				reply: { ok: false, error: { name: "BridgeError", message: "delayed failure" } },
+			});
+			expect(await firstResult).toMatchObject({ type: "result", runId: "error-first", ok: true });
+
+			const secondText = waitForMessage(
+				harness,
+				message => message.type === "text" && message.runId === "error-second",
+			);
+			const secondResult = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "error-second",
+			);
+			harness.send({
+				type: "run",
+				runId: "error-second",
+				filename: "[error-second].js",
+				snapshot,
+				code: "display(await globalThis.__worker_core_error);",
+			});
+			expect(await secondText).toMatchObject({ type: "text", runId: "error-second", chunk: "delayed failure\n" });
+			expect(await secondResult).toMatchObject({ type: "result", runId: "error-second", ok: true });
+		} finally {
+			harness.send({ type: "close" });
+		}
+	});
+
+	it("drains bridge calls started by floated promise continuations before settling once", async () => {
+		const harness = createWorkerHarness();
+		const snapshot = { cwd: process.cwd(), sessionId: "chained-bridge", localRoots: {} };
+		await initializeWorker(harness, snapshot);
+		const outbound: WorkerOutbound[] = [];
+		const unsubscribe = harness.onMessage(message => outbound.push(message));
+		try {
+			const firstCall = waitForMessage(harness, message => message.type === "tool-call" && message.name === "first");
+			const result = waitForMessage(harness, message => message.type === "result" && message.runId === "chain");
+			harness.send({
+				type: "run",
+				runId: "chain",
+				filename: "[chain].js",
+				snapshot,
+				code: "globalThis.__worker_core_chain = globalThis.__omp_call_tool__('first', {}).then(() => globalThis.__omp_call_tool__('second', {})); 'returned';",
+			});
+			const first = (await firstCall) as Extract<WorkerOutbound, { type: "tool-call" }>;
+			const secondCall = waitForMessage(
+				harness,
+				message => message.type === "tool-call" && message.name === "second",
+			);
+			harness.send({ type: "tool-reply", id: first.id, reply: { ok: true, value: "first-result" } });
+			const second = (await secondCall) as Extract<WorkerOutbound, { type: "tool-call" }>;
+			expect(outbound).not.toContainEqual(expect.objectContaining({ type: "result", runId: "chain" }));
+			harness.send({ type: "tool-reply", id: second.id, reply: { ok: true, value: "second-result" } });
+			expect(await result).toMatchObject({ type: "result", runId: "chain", ok: true });
+			const lateReplyLog = waitForMessage(
+				harness,
+				message => message.type === "log" && message.msg === "Ignored unmatched JS eval tool reply",
+			);
+			harness.send({ type: "tool-reply", id: second.id, reply: { ok: true, value: "duplicate" } });
+			expect(await lateReplyLog).toMatchObject({ type: "log", level: "warn", meta: { id: second.id } });
+			await Bun.sleep(10);
+			expect(outbound.filter(message => message.type === "result" && message.runId === "chain")).toHaveLength(1);
+			expect(outbound.filter(message => message.type === "tool-call" && message.runId === "chain")).toHaveLength(2);
+		} finally {
+			unsubscribe();
+			harness.send({ type: "close" });
+		}
+	});
+
+	it("closes a run with a pending floated bridge call without a late result", async () => {
+		const harness = createWorkerHarness();
+		const snapshot = { cwd: process.cwd(), sessionId: "close-bridge", localRoots: {} };
+		await initializeWorker(harness, snapshot);
+		const outbound: WorkerOutbound[] = [];
+		harness.onMessage(message => outbound.push(message));
+		const toolCall = waitForMessage(harness, message => message.type === "tool-call");
+		harness.send({
+			type: "run",
+			runId: "close-pending",
+			filename: "[close-pending].js",
+			snapshot,
+			code: "globalThis.__omp_call_tool__('fake', {}).catch(() => undefined); 'returned';",
+		});
+		const call = (await toolCall) as Extract<WorkerOutbound, { type: "tool-call" }>;
+		const closed = waitForMessage(harness, message => message.type === "closed");
+		harness.send({ type: "close" });
+		expect((await closed).type).toBe("closed");
+		harness.send({ type: "tool-reply", id: call.id, reply: { ok: true, value: "late" } });
+		await Bun.sleep(10);
+		expect(outbound.filter(message => message.type === "result" && message.runId === "close-pending")).toEqual([]);
+		expect(outbound.filter(message => message.type === "closed")).toHaveLength(1);
+	});
+
 	it("reports same-realm cwd conflicts through the worker protocol", async () => {
 		const first = createWorkerHarness();
 		const second = createWorkerHarness();
@@ -461,6 +625,74 @@ describe("WorkerCore", () => {
 			harness.send({ type: "close" });
 			await fs.rm(dirA, { recursive: true, force: true });
 			await fs.rm(dirB, { recursive: true, force: true });
+		}
+	});
+
+	it("folds a floated delayed bridge rejection before the isolated worker result", async () => {
+		const workerCoreUrl = pathToFileURL(path.resolve(import.meta.dir, "../../src/eval/js/worker-core.ts")).href;
+		const probe = `import { WorkerCore } from ${JSON.stringify(workerCoreUrl)};
+
+const inbound = new Set();
+let core;
+let watchdog;
+const transport = {
+	send(message) {
+		if (message.type === "tool-call") {
+			queueMicrotask(() => {
+				for (const listener of inbound) listener({
+					type: "tool-reply",
+					id: message.id,
+					reply: { ok: false, error: { name: "BridgeError", message: "floated failure" } },
+				});
+			});
+		}
+		if (message.type === "result" && message.runId === "floated-rejection") {
+			process.stdout.write(JSON.stringify(message));
+			process.exitCode = message.ok ? 2 : 0;
+			clearTimeout(watchdog);
+			core.dispose();
+		}
+	},
+	onMessage(handler) { inbound.add(handler); return () => inbound.delete(handler); },
+	close() {},
+};
+core = new WorkerCore(transport, { mode: "isolated" });
+const snapshot = { cwd: process.cwd(), sessionId: "floated-rejection", localRoots: {}, preludes: [] };
+watchdog = setTimeout(() => process.exit(3), 2000);
+for (const listener of inbound) listener({ type: "init", snapshot });
+for (const listener of inbound) listener({
+	type: "run",
+	runId: "floated-rejection",
+	filename: "[floated-rejection].js",
+	snapshot,
+	code: "globalThis.__omp_call_tool__('fake', {}); 'returned';",
+});
+`;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-floated-rejection-"));
+		const probePath = path.join(root, "probe.ts");
+		try {
+			await Bun.write(probePath, probe);
+			const proc = Bun.spawn([process.execPath, probePath], {
+				cwd: process.cwd(),
+				stdout: "pipe",
+				stderr: "pipe",
+				env: { ...process.env },
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			expect(exitCode).toBe(0);
+			expect(JSON.parse(stdout.trim())).toMatchObject({
+				type: "result",
+				runId: "floated-rejection",
+				ok: false,
+				error: { name: "BridgeError", message: "Unhandled rejection (missing await?): floated failure" },
+			});
+			expect(stderr).toBe("");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
 
