@@ -86,6 +86,7 @@ import { createAcpClientBridge } from "./acp-client-bridge";
 import {
 	extractAssistantMessageText,
 	mapAgentSessionEventToAcpSessionUpdates,
+	mapTodoProjectionsToAcpPlanUpdate,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
@@ -1345,6 +1346,26 @@ export class AcpAgent implements Agent {
 	}
 
 	async #handleLifetimeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): Promise<void> {
+		if (event.type === "todo_projection_changed") {
+			const promptTurn = record.promptTurn;
+			if (promptTurn && !promptTurn.settled && !promptTurn.cancelRequested) {
+				return;
+			}
+			try {
+				for (const notification of mapAgentSessionEventToAcpSessionUpdates(event, record.session.sessionId, {
+					todoPhases: record.session.getTodoPhases(),
+					todoProjections: record.session.getTodoProjections(),
+				})) {
+					await this.#connection.sessionUpdate(notification);
+				}
+			} catch (error) {
+				logger.warn("Failed to push todo projection plan update", {
+					sessionId: record.session.sessionId,
+					error,
+				});
+			}
+			return;
+		}
 		if (event.type !== "thinking_level_changed" && event.type !== "model_changed") {
 			return;
 		}
@@ -1424,6 +1445,8 @@ export class AcpAgent implements Agent {
 			getMessageId: message => this.#getLiveMessageId(record, message),
 			getMessageProgress: message => this.#getLiveMessageProgress(record, message),
 			getToolArgs: toolCallId => record.toolArgsById.get(toolCallId),
+			todoPhases: record.session.getTodoPhases(),
+			todoProjections: record.session.getTodoProjections(),
 			cwd: record.session.sessionManager.getCwd(),
 			resolveImageData: resolveImageDataForAcp,
 		})) {
@@ -2088,6 +2111,10 @@ export class AcpAgent implements Agent {
 		});
 		await this.#connection.sessionUpdate({
 			sessionId,
+			update: mapTodoProjectionsToAcpPlanUpdate(record.session.getTodoPhases(), record.session.getTodoProjections()),
+		});
+		await this.#connection.sessionUpdate({
+			sessionId,
 			update: {
 				sessionUpdate: "session_info_update",
 				title: record.session.sessionName,
@@ -2557,6 +2584,7 @@ export class AcpAgent implements Agent {
 				setSessionName: async name => {
 					await record.session.sessionManager.setSessionName(name, "user");
 				},
+				setTodoProjection: (namespace, phases) => record.session.setTodoProjection(namespace, phases),
 			},
 			{
 				getModel: () => record.session.model,

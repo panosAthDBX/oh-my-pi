@@ -123,6 +123,7 @@ Core methods:
 - `getSessionName`, `setSessionName`
 - `setModel`, `getThinkingLevel`, `setThinkingLevel`
 - `getServiceTiers`, `setServiceTier`
+- `setTodoProjection(namespace, phases)`
 - `registerProvider`
 - `registerFileWriteFallback`, `registerFileDeleteFallback`
 - `events` (shared event bus)
@@ -180,6 +181,34 @@ Also exposed:
 - `pi.zod` (Zod-compatible builder backed by omptype)
 - `pi.typebox` (legacy TypeBox-compatible shim)
 - `pi.pi` (package exports)
+
+### Derived todo projections
+
+`pi.setTodoProjection(namespace, phases)` replaces the current session's
+display-only projection for one extension-owned namespace. Pass `undefined` to
+remove that namespace. Phase and task IDs must be non-empty and stable; task
+status is one of `pending`, `in_progress`, `completed`, `failed`, `cancelled`,
+or `abandoned`.
+
+```ts
+pi.on("session_start", () => {
+  pi.setTodoProjection("deployments", [{
+    id: "release",
+    name: "Release",
+    tasks: [
+      { id: "build", content: "Build artifacts", status: "completed" },
+      { id: "publish", content: "Publish package", status: "in_progress" },
+    ],
+  }]);
+});
+```
+
+Namespaces coexist and render deterministically after native todos. Projection
+input is cloned and limited to public display fields. It is never persisted as
+a native todo, sent to the model, normalized to one active item, or included in
+todo reminders. Reconstruct derived state from `session_start`,
+`session_switch`, `session_branch`, and `session_tree`; clear it with
+`pi.setTodoProjection(namespace, undefined)` during extension teardown.
 
 ### Message delivery semantics
 

@@ -13,7 +13,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import type { MnemopiSessionState } from "../mnemopi/state";
 import type { AgentSession } from "../session/agent-session";
 
-export type MemoryBackendId = "off" | "local" | "hindsight" | "mnemopi";
+export type MemoryBackendId = "off" | "local" | "hindsight" | "mnemopi" | "supermemory";
 
 export interface MemoryBackendStatus {
 	backend: MemoryBackendId;
@@ -92,6 +92,31 @@ export interface MemoryBackendStartOptions {
 	parentMnemopiSessionState?: MnemopiSessionState;
 }
 
+export interface MemoryBackendBeforeAgentStartOptions {
+	/** Best-effort cancellation for this turn's recall work. */
+	signal?: AbortSignal;
+	/** Monotonically increasing AgentSession turn generation. */
+	generation?: number;
+	/** True only while the originating turn is still eligible to mutate its prompt. */
+	isCurrent?: () => boolean;
+}
+
+/**
+ * Context identifying the prompt that completed preflight and is about to enter
+ * the agent loop. This is intentionally identical to the context supplied to
+ * {@link MemoryBackend.beforeAgentStartPrompt}.
+ */
+export type MemoryBackendCommitAgentStartOptions = MemoryBackendBeforeAgentStartOptions;
+
+/**
+ * A commit prepared asynchronously during prompt preflight. Its `commit` method
+ * runs synchronously only after agent-core has accepted the prompt, so rejected
+ * busy/validation calls cannot consume turn-local memory state.
+ */
+export interface MemoryBackendPreparedAgentStartCommit {
+	commit(): void;
+}
+
 export interface MemoryBackend {
 	readonly id: MemoryBackendId;
 
@@ -103,6 +128,18 @@ export interface MemoryBackend {
 	 * memory backend cannot break the agent loop.
 	 */
 	start(options: MemoryBackendStartOptions): void | Promise<void>;
+
+	/**
+	 * Reset per-transcript tracking after this session switches to a new
+	 * transcript. Return true when developer instructions need rebuilding.
+	 */
+	resetSession?(session: AgentSession): boolean | void | Promise<boolean | undefined> | Promise<void>;
+
+	/** Flush transcript-scoped work before the session manager replaces or deletes the current transcript. */
+	beforeTranscriptReplace?(session: AgentSession): void | Promise<void>;
+
+	/** Release session-scoped resources during AgentSession disposal. */
+	disposeSession?(session: AgentSession): void | Promise<void>;
 
 	/**
 	 * Markdown injected as the system-prompt append section.
@@ -147,7 +184,24 @@ export interface MemoryBackend {
 	 * system prompt for this turn only; callers may separately cache it and
 	 * surface it through `buildDeveloperInstructions()` on later rebuilds.
 	 */
-	beforeAgentStartPrompt?(session: AgentSession, promptText: string): Promise<string | undefined>;
+	beforeAgentStartPrompt?(
+		session: AgentSession,
+		promptText: string,
+		options?: MemoryBackendBeforeAgentStartOptions,
+	): Promise<string | undefined>;
+
+	/**
+	 * Prepare a turn-local commit after prompt preflight. Returning `false` means
+	 * the staged request is no longer current and the caller must rebuild recall
+	 * before retrying the same prompt. A returned token is committed synchronously
+	 * from agent-core's accepted-admission callback. `void` preserves compatibility
+	 * for backends with no turn-local state to commit.
+	 */
+	commitBeforeAgentStartPrompt?(
+		session: AgentSession,
+		promptText: string,
+		options?: MemoryBackendCommitAgentStartOptions,
+	): Promise<MemoryBackendPreparedAgentStartCommit | false | undefined> | Promise<void>;
 
 	/**
 	 * Optional hook to splice extra context into a compaction summarization.

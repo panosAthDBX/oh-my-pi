@@ -21,6 +21,11 @@ import * as profileAliasCli from "../src/cli/profile-alias";
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
 
+type ProbeProcess = Bun.Subprocess<"ignore", "pipe", "pipe">;
+
+const PROFILE_PROBE_TIMEOUT_MS = 10_000;
+const PROFILE_TEST_TIMEOUT_MS = 30_000;
+
 async function readStream(stream: ReadableStream<Uint8Array>): Promise<string> {
 	const reader = stream.getReader();
 	const decoder = new TextDecoder();
@@ -34,6 +39,37 @@ async function readStream(stream: ReadableStream<Uint8Array>): Promise<string> {
 		return text + decoder.decode();
 	} finally {
 		reader.releaseLock();
+	}
+}
+async function collectProbe(
+	proc: ProbeProcess,
+	timeoutMs = PROFILE_PROBE_TIMEOUT_MS,
+): Promise<[string, string, number]> {
+	const stdoutPromise = readStream(proc.stdout);
+	const stderrPromise = readStream(proc.stderr);
+	const deadline = Promise.withResolvers<never>();
+	let timeout: Timer | undefined;
+	let reaped = false;
+	try {
+		// This is a real subprocess watchdog; fake timers cannot advance the child process or prove it was reaped.
+		timeout = setTimeout(
+			() => deadline.reject(new Error(`profile CLI probe did not exit within ${timeoutMs}ms`)),
+			timeoutMs,
+		);
+		const result = await Promise.race([Promise.all([stdoutPromise, stderrPromise, proc.exited]), deadline.promise]);
+		reaped = true;
+		return result;
+	} finally {
+		clearTimeout(timeout);
+		if (!reaped) {
+			try {
+				proc.kill("SIGKILL");
+			} catch {
+				// The child may have exited between the rejected operation and cleanup.
+			}
+			await proc.exited;
+		}
+		await Promise.allSettled([stdoutPromise, stderrPromise]);
 	}
 }
 
@@ -218,61 +254,69 @@ describe("global --profile flag", () => {
 		expect(outSpy).not.toHaveBeenCalled();
 	});
 
-	it("loads profile agent .env before command modules import pi-utils env", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-profile-cli-env-"));
-		try {
-			const home = path.join(root, "home");
-			const configDir = ".omp-profile-cli-env";
-			const defaultAgentDir = path.join(home, configDir, "agent");
-			const profileAgentDir = path.join(home, configDir, "profiles", "work", "agent");
-			await fs.mkdir(defaultAgentDir, { recursive: true });
-			await fs.mkdir(profileAgentDir, { recursive: true });
-			await Bun.write(path.join(defaultAgentDir, ".env"), "OMP_PROFILE_BOOTSTRAP_SENTINEL=default\n");
-			await Bun.write(path.join(profileAgentDir, ".env"), "OMP_PROFILE_BOOTSTRAP_SENTINEL=work\n");
+	it(
+		"loads profile agent .env before command modules import pi-utils env",
+		async () => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-profile-cli-env-"));
+			try {
+				const home = path.join(root, "home");
+				const configDir = ".omp-profile-cli-env";
+				const defaultAgentDir = path.join(home, configDir, "agent");
+				const profileAgentDir = path.join(home, configDir, "profiles", "work", "agent");
+				await fs.mkdir(defaultAgentDir, { recursive: true });
+				await fs.mkdir(profileAgentDir, { recursive: true });
+				await Bun.write(path.join(defaultAgentDir, ".env"), "OMP_PROFILE_BOOTSTRAP_SENTINEL=default\n");
+				await Bun.write(path.join(profileAgentDir, ".env"), "OMP_PROFILE_BOOTSTRAP_SENTINEL=work\n");
 
-			const probePath = path.join(root, "probe.ts");
-			await Bun.write(
-				probePath,
-				[
-					`import { runCli } from ${JSON.stringify(url.pathToFileURL(cliEntry).href)};`,
-					'await runCli(["--profile", "work", "--help"]);',
-					'process.stdout.write("\\nSENTINEL=" + (Bun.env.OMP_PROFILE_BOOTSTRAP_SENTINEL ?? ""));',
-				].join("\n"),
-			);
+				const probePath = path.join(root, "probe.ts");
+				await Bun.write(
+					probePath,
+					[
+						`import { runCli } from ${JSON.stringify(url.pathToFileURL(cliEntry).href)};`,
+						'await runCli(["--profile", "work", "--help"]);',
+						'process.stdout.write("\\nSENTINEL=" + (Bun.env.OMP_PROFILE_BOOTSTRAP_SENTINEL ?? ""));',
+					].join("\n"),
+				);
 
-			const childEnv: Record<string, string | undefined> = {
-				...process.env,
-				HOME: home,
-				PI_CONFIG_DIR: configDir,
-				PI_NO_TITLE: "1",
-				NO_COLOR: "1",
-			};
-			delete childEnv.OMP_PROFILE;
-			delete childEnv.PI_PROFILE;
-			delete childEnv.PI_CODING_AGENT_DIR;
-			delete childEnv.OMP_PROFILE_BOOTSTRAP_SENTINEL;
+				const childEnv: Record<string, string | undefined> = {
+					...process.env,
+					HOME: home,
+					PI_CONFIG_DIR: configDir,
+					PI_NO_TITLE: "1",
+					NO_COLOR: "1",
+				};
+				delete childEnv.OMP_PROFILE;
+				delete childEnv.PI_PROFILE;
+				delete childEnv.PI_CODING_AGENT_DIR;
+				delete childEnv.OMP_PROFILE_BOOTSTRAP_SENTINEL;
 
-			const proc = Bun.spawn([process.execPath, probePath], {
-				cwd: repoRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env: childEnv,
-			});
-			const [stdout, stderr, exitCode] = await Promise.all([
-				readStream(proc.stdout as ReadableStream<Uint8Array>),
-				readStream(proc.stderr as ReadableStream<Uint8Array>),
-				proc.exited,
-			]);
+				const proc = Bun.spawn([process.execPath, probePath], {
+					cwd: repoRoot,
+					stdout: "pipe",
+					stderr: "pipe",
+					env: childEnv,
+				});
+				const [stdout, stderr, exitCode] = await collectProbe(proc);
 
-			expect(exitCode, stderr).toBe(0);
-			expect(stdout).toContain("SENTINEL=work");
-			expect(stdout).not.toContain("SENTINEL=default");
-		} finally {
-			await removeWithRetries(root);
-		}
-		// Spawns a probe that imports the command modules, so the cost is cold
-		// transpile of the CLI graph, not latency under test.
-	}, 30_000);
+				expect(exitCode, stderr).toBe(0);
+				expect(stdout).toContain("SENTINEL=work");
+				expect(stdout).not.toContain("SENTINEL=default");
+			} finally {
+				await removeWithRetries(root);
+			}
+		},
+		PROFILE_TEST_TIMEOUT_MS,
+	);
+
+	it("kills and reaps a profile probe that misses its deadline", async () => {
+		const proc = Bun.spawn([process.execPath, "-e", "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0)"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+
+		await expect(collectProbe(proc, 50)).rejects.toThrow("profile CLI probe did not exit within 50ms");
+		expect(await proc.exited).not.toBe(0);
+	});
 
 	it("surfaces an invalid OMP_PROFILE env as a clean error, not an import crash", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-profile-cli-env-bad-"));

@@ -387,9 +387,6 @@ describe("AgentSession role model thinking behavior", () => {
 
 		session.setThinkingLevel(AUTO_THINKING);
 		expect(session.autoResolvedThinkingLevel()).toBeUndefined();
-
-		// A /skill:<name> invocation reaches the session as a user-attributed
-		// custom message, not a `user` role. It is still a real user turn.
 		await session.promptCustomMessage({
 			customType: SKILL_PROMPT_MESSAGE_TYPE,
 			content: "Expanded SKILL.md body: implement the focused parser fix",
@@ -418,8 +415,6 @@ describe("AgentSession role model thinking behavior", () => {
 		const classifierSpy = vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(Effort.Medium);
 
 		session.setThinkingLevel(AUTO_THINKING);
-
-		// Autoloaded / agent-originated skill injections must stay excluded.
 		await session.promptCustomMessage({
 			customType: SKILL_PROMPT_MESSAGE_TYPE,
 			content: "Autoloaded skill body",
@@ -429,6 +424,33 @@ describe("AgentSession role model thinking behavior", () => {
 		});
 
 		expect(classifierSpy).not.toHaveBeenCalled();
+		expect(session.autoResolvedThinkingLevel()).toBeUndefined();
+	});
+
+	it("does not let an aborted auto-thinking classifier overwrite the next turn", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: model.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${model.provider}/${model.id}` },
+		});
+		const classifier = Promise.withResolvers<Effort>();
+		const classifierStarted = Promise.withResolvers<void>();
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockImplementation(async () => {
+			classifierStarted.resolve();
+			return classifier.promise;
+		});
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		session.setThinkingLevel(AUTO_THINKING);
+		const provisional = session.thinkingLevel;
+
+		const turn = session.prompt("Classify this before aborting");
+		await classifierStarted.promise;
+		await session.abort();
+		classifier.resolve(Effort.Max);
+		await turn;
+
+		expect(session.thinkingLevel).toBe(provisional);
 		expect(session.autoResolvedThinkingLevel()).toBeUndefined();
 	});
 

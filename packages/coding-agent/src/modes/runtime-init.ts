@@ -99,6 +99,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			setSessionName: async name => {
 				await session.sessionManager.setSessionName(name, "user");
 			},
+			setTodoProjection: (namespace, phases) => session.setTodoProjection(namespace, phases),
 		},
 		// ExtensionContextActions
 		{

@@ -56,7 +56,7 @@ describe("AgentSession before_agent_start system prompt override", () => {
 	 */
 	function createSession(
 		responses: MockResponseSource,
-		options: { rebuildInWindow?: boolean } = {},
+		options: { rebuildInWindow?: boolean; replaceSystemPrompt?: boolean } = {},
 	): { session: AgentSession; systemPrompts: string[][] } {
 		const mock = createMockModel({ responses });
 		const systemPrompts: string[][] = [];
@@ -82,7 +82,8 @@ describe("AgentSession before_agent_start system prompt override", () => {
 			settings: Settings.isolated({ "compaction.enabled": false, "todo.enabled": false }),
 			modelRegistry: { getApiKey: async () => "test-key" } as never,
 			extensionRunner: {
-				emitBeforeAgentStart: async () => ({ systemPrompt: [OVERRIDE] }),
+				emitBeforeAgentStart: async () =>
+					options.replaceSystemPrompt === false ? {} : { systemPrompt: [OVERRIDE] },
 				emit: async () => undefined,
 			} as unknown as ExtensionRunner,
 			rebuildSystemPrompt: async () => ({ systemPrompt: [REBUILT_BASE] }),
@@ -111,6 +112,19 @@ describe("AgentSession before_agent_start system prompt override", () => {
 		// override must still reach the provider instead of the rebuilt base.
 		expect(systemPrompts).toHaveLength(1);
 		expect(systemPrompts[0]).toEqual([OVERRIDE]);
+	});
+
+	it("applies a mid-turn base rebuild when the hook does not replace the prompt", async () => {
+		const { session, systemPrompts } = createSession([{ content: ["Done"] }], {
+			rebuildInWindow: true,
+			replaceSystemPrompt: false,
+		});
+
+		await session.prompt("hello");
+		await session.waitForIdle();
+
+		expect(systemPrompts).toHaveLength(1);
+		expect(systemPrompts[0]).toEqual([REBUILT_BASE]);
 	});
 
 	it("falls back to the rebuilt base once the turn ends", async () => {

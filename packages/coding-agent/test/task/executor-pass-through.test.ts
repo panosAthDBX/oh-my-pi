@@ -18,19 +18,53 @@ import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { type AgentDefinition, TASK_SUBAGENT_EVENT_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
-function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent) => void }) => void): AgentSession {
+function createMockSession(
+	onPrompt: (params: { emit: (event: AgentSessionEvent) => void }) => void,
+	options: { startupProjection?: boolean } = {},
+): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const emit = (event: AgentSessionEvent) => {
 		for (const listener of listeners) listener(event);
 	};
+	const startupProjectionEvent: Extract<AgentSessionEvent, { type: "todo_projection_changed" }> = {
+		type: "todo_projection_changed",
+		projections: [
+			{
+				namespace: "startup",
+				phases: [
+					{
+						id: "boot",
+						name: "Boot",
+						tasks: [{ id: "attach", content: "Attach monitor", status: "in_progress" }],
+					},
+				],
+			},
+		],
+	};
+	let setTodoProjection: ((namespace: string, phases: unknown) => void) | undefined;
+	const extensionRunner = options.startupProjection
+		? {
+				initialize: (actions: { setTodoProjection: (namespace: string, phases: unknown) => void }) => {
+					setTodoProjection = actions.setTodoProjection;
+				},
+				onError: () => {},
+				emit: async (event: { type: string }) => {
+					if (event.type !== "session_start") return;
+					// This non-projection startup event intentionally remains
+					// before monitor ownership begins.
+					emit({ type: "notice", level: "info", message: "startup notice" });
+					setTodoProjection?.("startup", startupProjectionEvent.projections[0]!.phases);
+				},
+			}
+		: undefined;
 	const session = {
 		state: { messages: [] },
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
-		extensionRunner: undefined,
+		extensionRunner,
 		sessionManager: { appendSessionInit: () => {} },
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
@@ -42,6 +76,10 @@ function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent)
 				if (index >= 0) listeners.splice(index, 1);
 			};
 		},
+		setTodoProjection: () => {
+			emit(startupProjectionEvent);
+		},
+		getTodoProjections: () => startupProjectionEvent.projections,
 		prompt: async (_text: string, _options?: PromptOptions) => {
 			onPrompt({ emit });
 		},
@@ -137,6 +175,42 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.rules).toBe(rules);
 		expect(forwarded?.preloadedExtensionPaths).toBe(preloadedExtensionPaths);
 		expect(forwarded?.preloadedCustomToolPaths).toBe(preloadedCustomToolPaths);
+	});
+
+	it("publishes the startup projection after monitor attachment without replaying other startup events", async () => {
+		const session = createMockSession(
+			({ emit }) => {
+				emit({
+					type: "tool_execution_end",
+					toolCallId: "tool-startup-projection",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Result submitted." }],
+						details: { status: "success", data: { ok: true } },
+					},
+					isError: false,
+				});
+			},
+			{ startupProjection: true },
+		);
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const eventBus = new EventBus();
+		const forwarded: AgentSessionEvent[] = [];
+		eventBus.on(TASK_SUBAGENT_EVENT_CHANNEL, payload => {
+			// The event bus is untyped, but this listener is scoped to the
+			// SubagentEventPayload channel emitted by runSubprocess.
+			const subagentPayload = payload as { event: AgentSessionEvent };
+			forwarded.push(subagentPayload.event);
+		});
+
+		const result = await runSubprocess({ ...baseOptions, id: "startup-projection-child", eventBus });
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded.map(event => event.type)).toEqual(["todo_projection_changed", "tool_execution_end"]);
+		expect(forwarded[0]).toMatchObject({
+			type: "todo_projection_changed",
+			projections: [{ namespace: "startup", phases: [{ tasks: [{ content: "Attach monitor" }] }] }],
+		});
 	});
 
 	it("forwards an exact credential resolver without replacing it", async () => {

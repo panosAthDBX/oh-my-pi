@@ -245,6 +245,42 @@ describe("AgentSession approved-plan reference re-injection after compaction (is
 		});
 	}
 
+	it("restores an unadmitted plan reference when abort wins at the busy admission boundary", async () => {
+		const { session, sessionManager, observedCalls } = await createHarness();
+		const planUrl = "local://aborted-plan.md";
+		writePlanFile(sessionManager, planUrl, "# Approved Plan\n");
+		session.setPlanReferencePath(planUrl);
+
+		const setSystemPrompt = session.agent.setSystemPrompt.bind(session.agent);
+		const coreBecameBusy = Promise.withResolvers<void>();
+		const releaseIdle = Promise.withResolvers<void>();
+		let makeCoreBusy = true;
+		vi.spyOn(session.agent, "setSystemPrompt").mockImplementation(systemPrompt => {
+			setSystemPrompt(systemPrompt);
+			if (makeCoreBusy) {
+				makeCoreBusy = false;
+				session.agent.state.isStreaming = true;
+				coreBecameBusy.resolve();
+			}
+		});
+		let waitCount = 0;
+		vi.spyOn(session.agent, "waitForIdle").mockImplementation(() =>
+			++waitCount === 1 ? releaseIdle.promise : Promise.resolve(),
+		);
+
+		const first = session.prompt("first executor attempt");
+		await coreBecameBusy.promise;
+		const abort = session.abort();
+		session.agent.state.isStreaming = false;
+		releaseIdle.resolve();
+		await Promise.all([first, abort]);
+		expect(observedCalls).toHaveLength(0);
+
+		await session.prompt("retry executor attempt");
+		expect(observedCalls).toHaveLength(1);
+		expect(observedCalls[0]!.messageTexts.filter(text => text.includes(planUrl))).toHaveLength(1);
+	});
+
 	it("re-injects the approved plan reference on the auto-continuation turn", async () => {
 		const { session, sessionManager, observedCalls, waitForCall } = await createHarness();
 

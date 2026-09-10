@@ -301,6 +301,11 @@ export class SessionTools {
 		return this.#baseSystemPrompt;
 	}
 
+	/** Whether this session can rebuild its durable system prompt. */
+	get canRebuildSystemPrompt(): boolean {
+		return this.#rebuildSystemPrompt !== undefined;
+	}
+
 	/** Replaces the controller-owned base prompt without applying it to the agent. */
 	setBaseSystemPrompt(prompt: string[]): void {
 		this.#baseSystemPrompt = prompt;

@@ -471,7 +471,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			const verb = (command.args.trim().split(/\s+/)[0] ?? "").toLowerCase() || "view";
-			const backend = await resolveMemoryBackend(runtime.settings);
+			const backend = runtime.session.getMemoryBackend?.() ?? (await resolveMemoryBackend(runtime.settings));
 			switch (verb) {
 				case "view": {
 					const payload = await backend.buildDeveloperInstructions(

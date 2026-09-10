@@ -78,6 +78,27 @@ describe("callSessionTool", () => {
 		);
 	});
 
+	it("preserves exact task envelopes without injecting intent metadata", async () => {
+		const execute = vi.fn().mockResolvedValue({
+			content: [{ type: "text", text: "accepted" }],
+		});
+		const session = createSession([createTool("task", execute)]);
+		const envelope = {
+			context: "Authenticated Babysitter dispatch",
+			tasks: [{ name: "Babysitter-effect", agent: "babysitter-task", task: "Exact signed payload" }],
+		};
+
+		await callSessionTool("task", envelope, { session });
+
+		expect(execute).toHaveBeenCalledWith(
+			expect.stringMatching(/^js-task-/),
+			envelope,
+			undefined,
+			undefined,
+			undefined,
+		);
+	});
+
 	it("returns structured tool results when details or images are present", async () => {
 		const session = createSession([
 			createTool("custom", async () => ({

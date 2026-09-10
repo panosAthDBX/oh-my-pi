@@ -211,7 +211,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Git",
 	],
 	context: ["General", "Compaction", "Rules (TTSR)", "Experimental"],
-	memory: ["General", "Auto-Learn", "Mnemopi", "Hindsight"],
+	memory: ["General", "Auto-Learn", "Mnemopi", "Hindsight", "Supermemory"],
 	files: ["Editing", "Reading", "Read Summaries", "LSP"],
 	shell: ["Bash", "Eval & Runtimes"],
 	tools: [
@@ -2927,17 +2927,19 @@ export const SETTINGS_SCHEMA = {
 	"memories.summaryInjectionTokenLimit": { type: "number", default: 5000 },
 
 	// Memory backend selector — picks between local memories pipeline,
-	// Mnemopi local SQLite, Hindsight remote memory, or off. The legacy
-	// `memories.enabled` flag is migration input only; see config/settings.ts.
+	// Mnemopi local SQLite, Hindsight remote memory, Supermemory remote memory,
+	// or off. The legacy `memories.enabled` flag is migration input only; see
+	// config/settings.ts.
 	"memory.backend": {
 		type: "enum",
-		values: ["off", "local", "hindsight", "mnemopi"] as const,
+		values: ["off", "local", "hindsight", "mnemopi", "supermemory"] as const,
 		default: "off",
 		ui: {
 			tab: "memory",
 			group: "General",
 			label: "Memory Backend",
-			description: "Off, local summary pipeline, Mnemopi SQLite, or Hindsight remote memory",
+			description:
+				"Off, local summary pipeline, Mnemopi SQLite, Hindsight, or Supermemory remote memory. Changes apply when the next session starts.",
 			options: [
 				{ value: "off", label: "Off", description: "No memory subsystem runs" },
 				{ value: "local", label: "Local", description: "Local rollout summarisation pipeline (memory_summary.md)" },
@@ -2946,6 +2948,11 @@ export const SETTINGS_SCHEMA = {
 					value: "mnemopi",
 					label: "Mnemopi",
 					description: "Local SQLite recall/retain backend with optional embeddings",
+				},
+				{
+					value: "supermemory",
+					label: "Supermemory",
+					description: "Supermemory remote memory service",
 				},
 			],
 		},
@@ -3359,6 +3366,109 @@ export const SETTINGS_SCHEMA = {
 	"hindsight.reflectTimeoutMs": { type: "number", default: 120_000 },
 	"hindsight.recallTimeoutMs": { type: "number", default: 30_000 },
 	"hindsight.retainTimeoutMs": { type: "number", default: 60_000 },
+	// Supermemory (https://supermemory.ai)
+	"supermemory.scoping": {
+		type: "enum",
+		values: ["global", "per-project"] as const,
+		default: "per-project",
+		ui: {
+			tab: "memory",
+			group: "Supermemory",
+			label: "Supermemory Scoping",
+			description: "global = one shared container; per-project = isolated privacy-preserving project containers",
+			options: [
+				{ value: "global", label: "Global", description: "One shared container for every project" },
+				{ value: "per-project", label: "Per project", description: "One isolated container per project" },
+			],
+			condition: "supermemoryActive",
+		},
+	},
+	"supermemory.autoRecall": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "memory",
+			group: "Supermemory",
+			label: "Supermemory Auto Recall",
+			description: "Recall memories on the first turn of each primary session",
+			condition: "supermemoryActive",
+		},
+	},
+	"supermemory.autoRetain": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "memory",
+			group: "Supermemory",
+			label: "Supermemory Auto Retain",
+			description: "Retain primary-session conversation every N turns",
+			condition: "supermemoryActive",
+		},
+	},
+	"supermemory.retainEveryNTurns": {
+		type: "number",
+		default: 3,
+		ui: {
+			tab: "memory",
+			group: "Supermemory",
+			label: "Supermemory Retain Every N Turns",
+			description: "Number of completed primary-session turns between automatic retention",
+			options: [
+				{ value: "1", label: "Every turn", description: "Retain after each completed primary-session turn" },
+				{ value: "3", label: "Every 3 turns", description: "Default retention cadence" },
+				{ value: "5", label: "Every 5 turns", description: "Retain less often" },
+			],
+			condition: "supermemoryActive",
+		},
+	},
+	"supermemory.recallLimit": {
+		type: "number",
+		default: 8,
+		ui: {
+			tab: "memory",
+			group: "Supermemory",
+			label: "Supermemory Recall Limit",
+			description: "Maximum recalled memories included for a query",
+			options: [
+				{ value: "4", label: "4 results", description: "Smaller recall context" },
+				{ value: "8", label: "8 results", description: "Default recall limit" },
+				{ value: "12", label: "12 results", description: "Broader recall context" },
+			],
+			condition: "supermemoryActive",
+		},
+	},
+	"supermemory.threshold": {
+		type: "number",
+		default: 0.5,
+		ui: {
+			tab: "memory",
+			group: "Supermemory",
+			label: "Supermemory Recall Threshold",
+			description: "Similarity threshold from 0 (broad) to 1 (strict)",
+			options: [
+				{ value: "0.3", label: "0.3 (broad)", description: "Return more loosely related results" },
+				{ value: "0.5", label: "0.5 (balanced)", description: "Default balance of recall and precision" },
+				{ value: "0.8", label: "0.8 (strict)", description: "Return only highly similar results" },
+			],
+			condition: "supermemoryActive",
+		},
+	},
+	"supermemory.searchMode": {
+		type: "enum",
+		values: ["hybrid", "memories"] as const,
+		default: "hybrid",
+		ui: {
+			tab: "memory",
+			group: "Supermemory",
+			label: "Supermemory Search Mode",
+			description: "hybrid searches memories and document chunks; memories searches extracted facts only",
+			options: [
+				{ value: "hybrid", label: "Hybrid", description: "Search memories and document chunks" },
+				{ value: "memories", label: "Memories", description: "Search extracted memories only" },
+			],
+			condition: "supermemoryActive",
+		},
+	},
 
 	"hindsight.mentalModelsEnabled": {
 		type: "boolean",

@@ -60,8 +60,7 @@ import type { CompactionSettings as ConfiguredCompactionSettings, Settings } fro
 import type { ExtensionRunner, SessionBeforeCompactResult } from "../extensibility/extensions";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
 import type { GoalModeState } from "../goals/state";
-import { resolveMemoryBackend } from "../memory-backend/resolve";
-import type { MemoryBackendOperationContext } from "../memory-backend/types";
+import type { MemoryBackend, MemoryBackendOperationContext } from "../memory-backend/types";
 import type { NonMessageTokenSource } from "../modes/utils/context-usage";
 import { computeNonMessageTokens } from "../modes/utils/context-usage";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
@@ -267,6 +266,7 @@ export interface SessionMaintenanceHost {
 	planReferencePath(): string;
 	nonMessageTokenSource(): NonMessageTokenSource;
 	memoryBackendSession(): MemoryBackendOperationContext["session"];
+	getMemoryBackend(): MemoryBackend | undefined;
 	emitSessionEvent(event: AgentSessionEvent, options?: { detachExtensions?: boolean }): Promise<void>;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 	schedulePostPromptTask(
@@ -1102,8 +1102,8 @@ export class SessionMaintenance {
 		messagesToSummarize: AgentMessage[];
 		turnPrefixMessages: AgentMessage[];
 	}): Promise<string | undefined> {
-		const backend = await resolveMemoryBackend(this.#host.settings);
-		if (!backend.preCompactionContext) return undefined;
+		const backend = this.#host.getMemoryBackend();
+		if (!backend?.preCompactionContext) return undefined;
 		const messages = preparation.messagesToSummarize.concat(preparation.turnPrefixMessages);
 		try {
 			return await backend.preCompactionContext(messages, this.#host.settings, this.#host.memoryBackendSession());

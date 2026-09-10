@@ -25,6 +25,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { supermemoryBackend } from "@oh-my-pi/pi-coding-agent/supermemory/backend";
 import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
 import { logger, removeSyncWithRetries, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
 
@@ -1938,6 +1939,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			});
 			expect(restricted.getAllToolNames()).toEqual(["read", "lsp", "yield"]);
 			expect(restricted.getActiveToolNames()).toEqual(["read", "lsp", "yield"]);
+			expect(restricted.getMemoryBackend()?.id).toBe("off");
 			for (const name of [
 				"generate_image",
 				"tts",
@@ -2004,6 +2006,31 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			);
 		} finally {
 			await normal.dispose();
+		}
+	});
+
+	it("does not start configured memory on a restricted session's first turn", async () => {
+		const tempDir = makeTempDir();
+		const start = vi.spyOn(supermemoryBackend, "start").mockImplementation(async () => undefined);
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings: Settings.isolated({ "memory.backend": "supermemory" }),
+			toolNames: ["read"],
+			restrictToolNames: true,
+		});
+		modelRegistry.authStorage.setRuntimeApiKey("openai", "test-key");
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		try {
+			await session.prompt("restricted turn");
+			await session.applyMemoryBackend();
+			await session.newSession();
+			await session.prompt("restricted turn after new session");
+			expect(start).not.toHaveBeenCalled();
+			expect(session.getMemoryBackend()?.id).toBe("off");
+		} finally {
+			modelRegistry.authStorage.removeRuntimeApiKey("openai");
+			await session.dispose();
 		}
 	});
 

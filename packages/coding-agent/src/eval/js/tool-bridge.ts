@@ -44,12 +44,12 @@ function getTool(session: ToolSession, name: string): AgentTool {
 	return tool;
 }
 
-function normalizeArgs(args: unknown): unknown {
+function normalizeArgs(name: string, args: unknown): unknown {
 	if (!args || typeof args !== "object" || Array.isArray(args)) {
 		return args;
 	}
 	const record = { ...(args as Record<string, unknown>) };
-	if (record[INTENT_FIELD] === undefined) {
+	if (name !== "task" && record[INTENT_FIELD] === undefined) {
 		record[INTENT_FIELD] = "js prelude";
 	}
 	return record;
@@ -121,7 +121,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		return runEvalConcurrency(args, options);
 	}
 	const tool = getTool(options.session, name);
-	const normalizedArgs = normalizeArgs(args);
+	const normalizedArgs = normalizeArgs(name, args);
 	const toolCallId = `js-${name}-${crypto.randomUUID()}`;
 	try {
 		const result = await tool.execute(

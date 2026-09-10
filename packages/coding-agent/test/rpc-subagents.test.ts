@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
+import { RpcFrameDecoder } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import {
 	handleRpcSessionChange,
 	type RpcSessionChangeCommand,
@@ -12,6 +13,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import {
 	type AgentProgress,
 	type SubagentEventPayload,
@@ -22,7 +24,7 @@ import {
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 } from "@oh-my-pi/pi-coding-agent/task";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
+import { isRecord, ptree, readJsonl, removeSyncWithRetries, withTimeout } from "@oh-my-pi/pi-utils";
 
 const tempPaths: string[] = [];
 
@@ -414,6 +416,7 @@ function handle(frame) {
 	if (frame.type === "prompt") {
 		write({ id: frame.id, type: "response", command: "prompt", success: true });
 		write({ type: "notice", level: "info", message: "subagent test" });
+		write({ type: "todo_projection_changed", projections: [] });
 		write({ type: "subagent_lifecycle", payload: { id: "SubagentA", index: 0, agent: "task", agentSource: "bundled", status: "started", sessionFile: "/tmp/subagent.jsonl" } });
 		write({ type: "subagent_progress", payload: { index: 0, agent: "task", agentSource: "bundled", task: "Do work", assignment: "Implement work", sessionFile: "/tmp/subagent.jsonl", progress } });
 		write({ type: "subagent_event", payload: { id: "SubagentA", event: { type: "agent_start" } } });
@@ -445,5 +448,384 @@ function handle(frame) {
 		expect(progressTasks).toEqual(["Do work"]);
 		expect(rawEventTypes).toEqual(["agent_start"]);
 		expect(sessionEventTypes).toContain("notice");
+		expect(sessionEventTypes).toContain("todo_projection_changed");
+	});
+
+	test("delivers startup projections to a passive v1 host and cleans up the expired grace", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-passive-v1-projection-"));
+		tempPaths.push(tempDir);
+		const extensionPath = path.join(tempDir, "startup-projection.ts");
+		await Bun.write(
+			extensionPath,
+			`
+export default function (pi) {
+	pi.on("session_start", () => {
+		pi.setTodoProjection("passive-v1", [{
+			id: "startup-phase",
+			name: "Startup",
+			tasks: [{ id: "startup-task", content: "ready", status: "in_progress" }]
+		}]);
+	});
+}
+`,
+		);
+
+		const child = ptree.spawn(
+			[
+				"bun",
+				path.join(import.meta.dir, "..", "src", "cli.ts"),
+				"--mode",
+				"rpc",
+				"--provider",
+				"anthropic",
+				"--model",
+				"claude-sonnet-4-5",
+				"--extension",
+				extensionPath,
+			],
+			{
+				cwd: path.join(import.meta.dir, ".."),
+				env: { ...Bun.env, PI_CODING_AGENT_DIR: path.join(tempDir, "agent"), PI_NO_TITLE: "1" },
+				stdin: "pipe",
+			},
+		);
+		try {
+			const frames = await withTimeout(
+				(async () => {
+					const received: object[] = [];
+					let projectionSeen = false;
+					for await (const frame of readJsonl(child.stdout)) {
+						if (!isRecord(frame)) continue;
+						received.push(frame);
+						if (frame.type === "todo_projection_changed" && !projectionSeen) {
+							projectionSeen = true;
+							child.stdin.write(
+								`${JSON.stringify({ type: "negotiate_protocol", protocolVersion: 2, id: "late-v2" })}\n`,
+							);
+							await child.stdin.flush();
+						}
+						if (frame.type === "response" && frame.id === "late-v2") return received;
+					}
+					throw new Error(`RPC v1 output closed before grace cleanup probe: ${child.peekStderr()}`);
+				})(),
+				10_000,
+				"passive RPC v1 startup projection timed out",
+			);
+
+			expect(frames[0]).toMatchObject({ type: "ready", protocolVersion: 1 });
+			const availableCommandsIndex = frames.findIndex(
+				frame => isRecord(frame) && frame.type === "available_commands_update",
+			);
+			const projectionIndexes = frames.flatMap((frame, index) =>
+				isRecord(frame) && frame.type === "todo_projection_changed" ? [index] : [],
+			);
+			const responseIndex = frames.findIndex(
+				frame => isRecord(frame) && frame.type === "response" && frame.id === "late-v2",
+			);
+			expect(availableCommandsIndex).toBeGreaterThan(0);
+			expect(projectionIndexes).toHaveLength(1);
+			expect(projectionIndexes[0]!).toBeGreaterThan(availableCommandsIndex);
+			expect(responseIndex).toBeGreaterThan(projectionIndexes[0]!);
+			expect(frames[projectionIndexes[0]!]).toMatchObject({
+				type: "todo_projection_changed",
+				projections: [{ namespace: "passive-v1" }],
+			});
+			expect(frames[responseIndex]).toMatchObject({
+				type: "response",
+				command: "negotiate_protocol",
+				success: true,
+			});
+		} finally {
+			child.stdin.end();
+			child.kill();
+			await child.exited.catch(() => {});
+		}
+	});
+
+	test("orders v2 negotiation before the deferred startup projection", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-v2-projection-order-"));
+		tempPaths.push(tempDir);
+		const extensionPath = path.join(tempDir, "startup-projection.ts");
+		await Bun.write(
+			extensionPath,
+			`
+export default function (pi) {
+	pi.on("session_start", () => {
+		pi.setTodoProjection("v2-order", [{
+			id: "startup-phase",
+			name: "Startup",
+			tasks: [{ id: "startup-task", content: "ready", status: "in_progress" }]
+		}]);
+	});
+}
+`,
+		);
+
+		const child = ptree.spawn(
+			[
+				"bun",
+				path.join(import.meta.dir, "..", "src", "cli.ts"),
+				"--mode",
+				"rpc",
+				"--provider",
+				"anthropic",
+				"--model",
+				"claude-sonnet-4-5",
+				"--extension",
+				extensionPath,
+			],
+			{
+				cwd: path.join(import.meta.dir, ".."),
+				env: { ...Bun.env, PI_CODING_AGENT_DIR: path.join(tempDir, "agent"), PI_NO_TITLE: "1" },
+				stdin: "pipe",
+			},
+		);
+		try {
+			child.stdin.write(`${JSON.stringify({ type: "negotiate_protocol", protocolVersion: 2, id: "v2" })}\n`);
+			await child.stdin.flush();
+			const frames = await withTimeout(
+				(async () => {
+					const received: object[] = [];
+					for await (const frame of readJsonl(child.stdout)) {
+						if (!isRecord(frame)) continue;
+						received.push(frame);
+						if (frame.type === "todo_projection_changed") return received;
+					}
+					throw new Error(`RPC output closed before negotiated startup projection: ${child.peekStderr()}`);
+				})(),
+				10_000,
+				"negotiated RPC startup projection timed out",
+			);
+
+			const responseIndex = frames.findIndex(
+				frame => isRecord(frame) && frame.type === "response" && frame.id === "v2",
+			);
+			const projectionIndex = frames.findIndex(frame => isRecord(frame) && frame.type === "todo_projection_changed");
+			expect(frames[0]).toMatchObject({ type: "ready", protocolVersion: 1 });
+			expect(responseIndex).toBeGreaterThan(0);
+			expect(projectionIndex).toBeGreaterThan(responseIndex);
+			expect(frames[responseIndex]).toMatchObject({
+				type: "response",
+				command: "negotiate_protocol",
+				success: true,
+				data: { protocolVersion: 2 },
+			});
+		} finally {
+			child.stdin.end();
+			child.kill();
+			await child.exited.catch(() => {});
+		}
+	});
+
+	test("negotiates v2 after ready before writing an oversized startup projection", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-ready-negotiate-projection-"));
+		tempPaths.push(tempDir);
+		const extensionPath = path.join(tempDir, "startup-projection.ts");
+		await Bun.write(
+			extensionPath,
+			`
+export default function (pi) {
+	pi.on("session_start", () => {
+		pi.setTodoProjection("ready-then-v2", [{
+			id: "startup-phase",
+			name: "Startup",
+			tasks: [{ id: "startup-task", content: "x".repeat(1024 * 1024 + 4096), status: "in_progress" }]
+		}]);
+	});
+}
+`,
+		);
+
+		const child = ptree.spawn(
+			[
+				"bun",
+				path.join(import.meta.dir, "..", "src", "cli.ts"),
+				"--mode",
+				"rpc",
+				"--provider",
+				"anthropic",
+				"--model",
+				"claude-sonnet-4-5",
+				"--extension",
+				extensionPath,
+			],
+			{
+				cwd: path.join(import.meta.dir, ".."),
+				env: { ...Bun.env, PI_CODING_AGENT_DIR: path.join(tempDir, "agent"), PI_NO_TITLE: "1" },
+				stdin: "pipe",
+			},
+		);
+		try {
+			const frames = await withTimeout(
+				(async () => {
+					const received: object[] = [];
+					const decoder = new RpcFrameDecoder();
+					let negotiationSent = false;
+					for await (const rawFrame of readJsonl(child.stdout)) {
+						if (!isRecord(rawFrame)) continue;
+						received.push(rawFrame);
+						if (!negotiationSent && rawFrame.type === "ready") {
+							negotiationSent = true;
+							child.stdin.write(
+								`${JSON.stringify({ type: "negotiate_protocol", protocolVersion: 2, id: "ready-v2" })}\n`,
+							);
+							await child.stdin.flush();
+						}
+						const frame = decoder.push(rawFrame);
+						if (isRecord(frame) && frame.type === "todo_projection_changed") {
+							expect(negotiationSent).toBe(true);
+							return { received, projection: frame };
+						}
+						if (rawFrame.type === "rpc_frame_error" && rawFrame.originalType === "todo_projection_changed") {
+							return { received, projection: undefined };
+						}
+					}
+					throw new Error(`RPC output closed before ready-then-negotiate projection: ${child.peekStderr()}`);
+				})(),
+				10_000,
+				"ready-then-negotiate RPC startup projection timed out",
+			);
+
+			const responseIndex = frames.received.findIndex(
+				frame => isRecord(frame) && frame.type === "response" && frame.id === "ready-v2",
+			);
+			const firstProjectionTransportIndex = frames.received.findIndex(
+				frame =>
+					isRecord(frame) &&
+					(frame.type === "rpc_chunk" ||
+						frame.type === "todo_projection_changed" ||
+						(frame.type === "rpc_frame_error" && frame.originalType === "todo_projection_changed")),
+			);
+			expect(responseIndex).toBeGreaterThan(0);
+			expect(firstProjectionTransportIndex).toBeGreaterThan(responseIndex);
+			expect(
+				frames.received.some(
+					frame =>
+						isRecord(frame) &&
+						frame.type === "rpc_frame_error" &&
+						frame.originalType === "todo_projection_changed",
+				),
+			).toBe(false);
+			expect(frames.projection).toMatchObject({
+				type: "todo_projection_changed",
+				projections: [{ namespace: "ready-then-v2" }],
+			});
+		} finally {
+			child.stdin.end();
+			child.kill();
+			await child.exited.catch(() => {});
+		}
+	});
+
+	test("delivers oversized startup projection snapshots after v2 negotiation", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-startup-projection-"));
+		tempPaths.push(tempDir);
+		const extensionPath = path.join(tempDir, "startup-projection.ts");
+		await Bun.write(
+			extensionPath,
+			`
+export default function (pi) {
+	pi.on("session_start", () => {
+		pi.setTodoProjection("rpc-startup", [{
+			id: "startup-phase",
+			name: "Startup",
+			tasks: [{ id: "startup-task", content: "x".repeat(1024 * 1024 + 4096), status: "in_progress" }]
+		}]);
+	});
+}
+`,
+		);
+
+		const { promise, resolve } =
+			Promise.withResolvers<Extract<AgentSessionEvent, { type: "todo_projection_changed" }>>();
+		using client = new RpcClient({
+			cliPath: path.join(import.meta.dir, "..", "src", "cli.ts"),
+			cwd: path.join(import.meta.dir, ".."),
+			env: { PI_CODING_AGENT_DIR: path.join(tempDir, "agent"), PI_NO_TITLE: "1" },
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			args: ["--extension", extensionPath],
+		});
+		client.onSessionEvent(event => {
+			if (event.type === "todo_projection_changed") resolve(event);
+		});
+
+		await client.start();
+		const event = await withTimeout(promise, 10_000, "oversized startup projection event never reached RpcClient");
+		const projection = event.projections[0];
+		expect(projection?.namespace).toBe("rpc-startup");
+		expect(projection?.phases[0]?.tasks[0]).toMatchObject({
+			id: "startup-task",
+			status: "in_progress",
+		});
+		expect(projection?.phases[0]?.tasks[0]?.content).toHaveLength(1024 * 1024 + 4096);
+	});
+
+	test("reports an oversized startup projection cleanly to a v1 client", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-v1-startup-projection-"));
+		tempPaths.push(tempDir);
+		const extensionPath = path.join(tempDir, "startup-projection.ts");
+		await Bun.write(
+			extensionPath,
+			`
+export default function (pi) {
+	pi.on("session_start", () => {
+		pi.setTodoProjection("rpc-startup", [{
+			id: "startup-phase",
+			name: "Startup",
+			tasks: [{ id: "startup-task", content: "x".repeat(1024 * 1024 + 4096), status: "in_progress" }]
+		}]);
+	});
+}
+`,
+		);
+
+		const child = ptree.spawn(
+			[
+				"bun",
+				path.join(import.meta.dir, "..", "src", "cli.ts"),
+				"--mode",
+				"rpc",
+				"--provider",
+				"anthropic",
+				"--model",
+				"claude-sonnet-4-5",
+				"--extension",
+				extensionPath,
+			],
+			{
+				cwd: path.join(import.meta.dir, ".."),
+				env: { ...Bun.env, PI_CODING_AGENT_DIR: path.join(tempDir, "agent"), PI_NO_TITLE: "1" },
+				stdin: "pipe",
+			},
+		);
+		try {
+			child.stdin.write(`${JSON.stringify({ type: "get_state", id: "v1-probe" })}\n`);
+			await child.stdin.flush();
+			const frames = await withTimeout(
+				(async () => {
+					const received: object[] = [];
+					for await (const frame of readJsonl(child.stdout)) {
+						if (!isRecord(frame)) continue;
+						received.push(frame);
+						if (frame.type === "response" && frame.id === "v1-probe") return received;
+					}
+					throw new Error(`RPC v1 output closed before probe response: ${child.peekStderr()}`);
+				})(),
+				10_000,
+				"RPC v1 startup projection probe timed out",
+			);
+
+			expect(frames).toContainEqual({
+				type: "rpc_frame_error",
+				originalType: "todo_projection_changed",
+				error: "RPC frame exceeded the transport limit",
+			});
+			expect(frames.some(frame => isRecord(frame) && frame.type === "todo_projection_changed")).toBe(false);
+		} finally {
+			child.stdin.end();
+			child.kill();
+			await child.exited.catch(() => {});
+		}
 	});
 });

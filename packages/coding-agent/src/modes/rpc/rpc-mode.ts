@@ -36,7 +36,7 @@ import { calculateTokensPerSecond } from "../../utils/token-rate";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
-import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
+import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder, RpcStartupProjectionGate } from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
@@ -733,10 +733,16 @@ export async function runRpcMode(
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
 		}),
 	);
-	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
+	const writeOutput = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		writeFrames(frameEncoder.encodeFrames(obj));
-		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
-			frameEncoder.setProtocolVersion(2);
+	};
+	const startupProjectionGate = new RpcStartupProjectionGate<object>(writeOutput);
+	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
+		writeOutput(obj);
+		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol") {
+			if (obj.success === true) frameEncoder.setProtocolVersion(2);
+			startupProjectionGate.flush();
+		}
 	};
 	const emitRpcTitles = shouldEmitRpcTitles();
 
@@ -956,6 +962,15 @@ export async function runRpcMode(
 	const rpcUiContext = new RpcExtensionUIContext(pendingExtensionRequests, output);
 	setToolUIContext?.(rpcUiContext, true);
 
+	// Subscribe before extension initialization so session_start handlers cannot
+	// emit events before the RPC transport is listening. Startup projection
+	// snapshots are coalesced until the client either negotiates v2 or proves it
+	// is staying on v1 with its first ordinary command.
+	session.subscribe(event => {
+		if (event.type === "todo_projection_changed" && startupProjectionGate.capture(event)) return;
+		output(event);
+	});
+
 	// Set up extensions with RPC-based UI context
 	await initializeExtensions(session, {
 		mode: "rpc",
@@ -972,11 +987,6 @@ export async function runRpcMode(
 			extensionUserMessageTracker.trackAgentMessageTask(task);
 		},
 		uiContext: rpcUiContext,
-	});
-
-	// Output all agent events as JSON
-	session.subscribe(event => {
-		output(event);
 	});
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
@@ -996,10 +1006,16 @@ export async function runRpcMode(
 		void emitAvailableCommandsUpdate();
 	});
 	await emitAvailableCommandsUpdate();
+	// RpcClient negotiates immediately after observing ready, but ready and the
+	// reply cross process boundaries. Keep startup projection encoding undecided
+	// for a short bounded grace instead of racing stdin I/O against a zero-delay
+	// timer. Negotiation or the first ordinary command cancels this timer.
+	startupProjectionGate.startGrace();
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		if (command.type !== "negotiate_protocol") startupProjectionGate.flush();
 
 		switch (command.type) {
 			case "negotiate_protocol": {

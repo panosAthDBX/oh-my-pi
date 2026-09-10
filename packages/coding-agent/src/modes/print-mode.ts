@@ -116,6 +116,15 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			writeStdoutLine(`${JSON.stringify(header)}\n`);
 		}
 	}
+
+	// observable in JSON mode. The header remains the first JSON record, and
+	// text mode retains the subscription used for session persistence.
+	session.subscribe(event => {
+		if (mode === "json") {
+			writeStdoutLine(`${JSON.stringify(printableEvent(event))}\n`);
+		}
+	});
+
 	// Set up extensions for print mode (no UI, no command context)
 	await initializeExtensions(session, {
 		mode: mode === "json" ? "json" : "print",
@@ -128,6 +137,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			process.stderr.write(`Extension error (${err.extensionPath}): ${err.error}\n`);
 		},
 	});
+	if (mode === "json") await stdoutTail;
 
 	// `plan.defaultOnStartup` opens fresh *interactive* sessions in plan mode so a
 	// human can review the plan before it executes. Headless print mode has no
@@ -149,13 +159,8 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		);
 	}
 
-	// Always subscribe to enable session persistence via _handleAgentEvent
-	session.subscribe(event => {
-		// In JSON mode, output all events
-		if (mode === "json") {
-			writeStdoutLine(`${JSON.stringify(printableEvent(event))}\n`);
-		}
-	});
+	// Startup extension events must reach JSON consumers before prompting begins.
+	await stdoutTail;
 
 	let wroteTextWorkingIndicator = false;
 	const writeTextWorkingIndicator = (): void => {

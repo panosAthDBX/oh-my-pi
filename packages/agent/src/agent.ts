@@ -337,6 +337,12 @@ export interface AgentOptions {
 
 export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
+	/**
+	 * Synchronously observes successful prompt admission after the agent has
+	 * acquired its busy/streaming state. This is never awaited; callbacks must
+	 * not perform asynchronous work.
+	 */
+	onAccepted?: () => void;
 }
 
 /** Buffered Cursor exec-channel tool result waiting to be emitted after the assistant message. */
@@ -1311,6 +1317,24 @@ export class Agent {
 		this.#state.isStreaming = true;
 		this.#state.streamMessage = null;
 		this.#state.error = undefined;
+		// Admission is now irreversible for this synchronous call: a concurrent
+		// prompt observes `isStreaming` and validation has already succeeded.
+		// Intentionally do not await this hook; it is the atomic handoff boundary
+		// for callers with prepared synchronous side effects.
+		try {
+			const result = options?.onAccepted?.() as unknown;
+			if (isPromise(result)) {
+				result.catch(err => {
+					logger.warn("Agent prompt admission callback rejected", {
+						error: err instanceof Error ? err.message : String(err),
+					});
+				});
+			}
+		} catch (err) {
+			logger.warn("Agent prompt admission callback threw", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
 
 		// Clear Cursor tool result buffer at start of each run
 		this.#cursorToolResultBuffer = [];

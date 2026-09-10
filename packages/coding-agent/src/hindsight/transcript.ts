@@ -32,20 +32,23 @@ export interface ReadonlySessionManagerLike {
  *   toolCall blocks are intentionally dropped: the user never saw them, so
  *   retaining them would prime recall on internal monologue.
  */
+export function extractHindsightMessage(entry: SessionEntry): HindsightMessage | undefined {
+	if (entry.type !== "message") return undefined;
+	const msg = entry.message;
+	const role = msg.role;
+	if (role !== "user" && role !== "assistant") return undefined;
+
+	const text = role === "user" ? extractUserText(msg) : extractAssistantText(msg as AssistantMessage);
+	if (!hasSubstantiveContent(text)) return undefined;
+	return { role, content: text, timestamp: entry.timestamp };
+}
+
 export function extractMessages(sessionManager: ReadonlySessionManagerLike): HindsightMessage[] {
 	const messages: HindsightMessage[] = [];
-
 	for (const entry of sessionManager.getEntries()) {
-		if (entry.type !== "message") continue;
-		const msg = entry.message;
-		const role = msg.role;
-		if (role !== "user" && role !== "assistant") continue;
-
-		const text = role === "user" ? extractUserText(msg) : extractAssistantText(msg as AssistantMessage);
-		if (!hasSubstantiveContent(text)) continue;
-		messages.push({ role, content: text, timestamp: entry.timestamp });
+		const message = extractHindsightMessage(entry);
+		if (message) messages.push(message);
 	}
-
 	return messages;
 }
 

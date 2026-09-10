@@ -160,6 +160,23 @@ describe("AgentSession handoff", () => {
 		expect(events.filter(event => event.type === "auto_compaction_end")).toHaveLength(0);
 	});
 
+	it("preserves namespaced todo projections across an in-place handoff", async () => {
+		const phases = [
+			{
+				id: "outgoing",
+				name: "Outgoing session",
+				tasks: [{ id: "continue", content: "Continue work", status: "in_progress" as const }],
+			},
+		];
+		session.setTodoProjection("handoff", phases);
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+
+		await session.handoff();
+		await drainMaintenance();
+
+		expect(session.getTodoProjections()).toEqual([{ namespace: "handoff", phases }]);
+	});
+
 	it("runs handoff generation through the configured side stream function", async () => {
 		const handoffText = "## Goal\nContinue via side stream";
 		let sideStreamCalls = 0;
