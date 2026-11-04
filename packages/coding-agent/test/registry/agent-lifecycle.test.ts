@@ -294,6 +294,8 @@ describe("AgentLifecycleManager", () => {
 	});
 
 	it("tombstoning a parked agent during revive prevents the stale session from attaching", async () => {
+		// The kill writes `<sessionFile>.tombstone`: keep it in an owned temp dir, not shared /tmp.
+		using tempDir = TempDir.createSync("@omp-lifecycle-revive-killed-");
 		const gate = deferred();
 		const revived = makeSessionStub();
 		const ref = registry.register({
@@ -301,7 +303,7 @@ describe("AgentLifecycleManager", () => {
 			displayName: "task",
 			kind: "sub",
 			session: null,
-			sessionFile: "/tmp/Revive-Killed.jsonl",
+			sessionFile: path.join(tempDir.path(), "Revive-Killed.jsonl"),
 			status: "parked",
 		});
 		lifecycle.adopt(
