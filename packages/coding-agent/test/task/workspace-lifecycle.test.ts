@@ -402,6 +402,44 @@ describe("workspace lifecycle host companion", () => {
 	});
 });
 
+describe("workspace lifecycle at shutdown", () => {
+	it("waits past the agent grace for a slow gated release, then removes", async () => {
+		// Real time on purpose: dispose bounds releases with AbortSignal.timeout, which fake timers do not drive.
+		gate(async () => {
+			await Bun.sleep(6000);
+			return { ok: true };
+		});
+		await spawn("SlowGate");
+		const before = lease("SlowGate");
+		await AgentLifecycleManager.global().dispose();
+		expect(lease("SlowGate").state).toBe("released");
+		expect(await exists(before.baseDir)).toBe(false);
+	}, 20_000);
+
+	it("persists the lease as held when the gate outlasts the bound, and never removes after", async () => {
+		const { promise: gateDone, resolve: finishGate } = Promise.withResolvers<void>();
+		gate(async () => {
+			await gateDone;
+			return { ok: true };
+		});
+		await spawn("StuckGate");
+		const before = lease("StuckGate");
+		await AgentLifecycleManager.global().dispose(Date.now(), Date.now() + 300);
+		const held = { state: "held", holdReason: "shutdown deadline: release incomplete" };
+		expect(lease("StuckGate")).toMatchObject(held);
+		expect(await Bun.file(path.join(before.baseDir, WORKSPACE_LEASE_FILE)).json()).toMatchObject(held);
+		expect(await Bun.file(path.join(before.workspaceDir, "work.txt")).text()).toBe("StuckGate\n");
+		// The late gate pass must keep the workspace (retained), not delete it. The late
+		// cleanup is tracked internally with no exposed promise: wait for its retain.
+		finishGate();
+		for (let i = 0; i < 100 && !lease("StuckGate").retainedDir; i++) await Bun.sleep(50);
+		const after = lease("StuckGate");
+		expect(after).toMatchObject(held);
+		expect(await Bun.file(path.join(after.retainedDir ?? "", "work.txt")).text()).toBe("StuckGate\n");
+		await fs.rm(path.dirname(after.retainedDir ?? ""), { recursive: true, force: true });
+	});
+});
+
 describe("task schema baseline", () => {
 	const call = { agent: "task", task: "t", solutionSpace: "s", isolated: true, baseline: "abc123" };
 	for (const options of [

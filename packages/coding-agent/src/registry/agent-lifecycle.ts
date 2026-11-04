@@ -26,6 +26,7 @@ import * as fs from "node:fs/promises";
 import { logger, postmortem, untilAborted } from "@oh-my-pi/pi-utils";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import type { AgentSessionDisposeOptions } from "../session/agent-session-types";
+import { getWorkspaceLifecycleService } from "../task/workspace-lifecycle";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import {
 	type AgentRef,
@@ -40,6 +41,13 @@ import { getAgentTombstonePath } from "./agent-tombstone";
 export type AgentReviver = (expected: AgentRef) => Promise<AgentSessionHandle>;
 
 const AGENT_RELEASE_GRACE_MS = 5000;
+/**
+ * Shutdown bound for an agent whose isolated workspace release runs
+ * workspace-lifecycle gates (plugin preserve+verify takes seconds under load).
+ * On expiry the lease is persisted as `held`; the workspace is never removed after that.
+ */
+const WORKSPACE_RELEASE_BOUND_MS = 60_000;
+const SHUTDOWN_HOLD_REASON = "shutdown deadline: release incomplete";
 
 async function persistAgentTombstone(sessionFile: string): Promise<void> {
 	try {
@@ -698,11 +706,18 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		return true;
 	}
 
-	/** Teardown everything; disposing the global manager makes its next owner a fresh instance. */
-	async dispose(deadlineAt: number = Date.now() + AGENT_RELEASE_GRACE_MS): Promise<void> {
+	/**
+	 * Teardown everything; disposing the global manager makes its next owner a fresh instance.
+	 * Agents with a gated workspace release wait until `workspaceDeadlineAt`, the rest until `deadlineAt`.
+	 */
+	async dispose(
+		deadlineAt: number = Date.now() + AGENT_RELEASE_GRACE_MS,
+		workspaceDeadlineAt: number = Date.now() + WORKSPACE_RELEASE_BOUND_MS,
+	): Promise<void> {
 		this.#unsubscribe?.();
 		this.#disposed = true;
 		this.#unsubscribe = undefined;
+		const workspaces = getWorkspaceLifecycleService();
 		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys()])];
 		// A turn still running (a revived or woken agent) is cut off by this
 		// teardown, not stopped: its session records a process exit, so
@@ -710,13 +725,16 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		const cutOff: AgentReleaseOptions = { dispose: { reason: postmortem.Reason.EXIT } };
 		await Promise.all(
 			ids.map(async id => {
+				const gated = workspaces.hasGatedRelease(id);
+				const until = gated ? workspaceDeadlineAt : deadlineAt;
 				const running = this.#registry.get(id)?.status === "running";
 				const release = this.release(id, undefined, running ? cutOff : undefined).then(() => {});
 				try {
-					await untilAborted(AbortSignal.timeout(Math.max(0, deadlineAt - Date.now())), () => release);
+					await untilAborted(AbortSignal.timeout(Math.max(0, until - Date.now())), () => release);
 				} catch (error) {
-					if (Date.now() >= deadlineAt) {
+					if (Date.now() >= until) {
 						trackLateCleanup(release, { id, resource: "adopted-agent" });
+						if (gated) await workspaces.holdAtShutdown(id, SHUTDOWN_HOLD_REASON);
 					}
 					logger.warn("Agent cleanup exceeded its deadline", {
 						id,

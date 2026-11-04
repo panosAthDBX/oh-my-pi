@@ -75,6 +75,8 @@ interface LeaseEntry {
 	ownerStartToken?: string;
 	/** The runner's post-run capture (branch commit, patch, nested patches) is still using the workspace. */
 	runnerBusy: boolean;
+	/** Every gate passed and teardown began: a shutdown hold would describe a workspace being removed. */
+	tearingDown?: boolean;
 }
 
 const STATUS_STATES = { running: "active", idle: "idle", parked: "parked" } as const;
@@ -101,6 +103,23 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 	hasLiveWorkspace(agentId: string): boolean {
 		const lease = this.#leases.get(agentId)?.lease;
 		return lease !== undefined && lease.state !== "releasing" && !isSettled(lease);
+	}
+
+	/** A gated release may still run for this lease: gates are registered and the lease is unsettled. */
+	hasGatedRelease(agentId: string): boolean {
+		const lease = this.#leases.get(agentId)?.lease;
+		return this.#gates.size > 0 && lease !== undefined && !isSettled(lease);
+	}
+
+	/**
+	 * Process shutdown gave up on this lease's release: settle it as `held` and
+	 * wait for the sidecar write. A late gate pass then holds instead of removing.
+	 */
+	async holdAtShutdown(agentId: string, holdReason: string): Promise<void> {
+		const entry = this.#leases.get(agentId);
+		if (!entry || entry.tearingDown || isSettled(entry.lease)) return;
+		this.#setState(entry, { state: "held", holdReason });
+		await entry.persisting;
 	}
 
 	registerReleaseGate(gate: WorkspaceReleaseGate): () => void {
@@ -223,6 +242,9 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 				return `release gate failed: ${errorMessage(error)}`;
 			}
 		}
+		// Shutdown may have settled the lease while a gate ran; never tear down after that.
+		if (isSettled(entry.lease)) return entry.lease.holdReason ?? "lease settled during release";
+		entry.tearingDown = true;
 		// Settle pending sidecar writes so none lands in a dir being torn down.
 		await entry.persisting;
 		return undefined;
