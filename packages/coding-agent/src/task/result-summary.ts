@@ -30,10 +30,13 @@ const PREVIEW_CHARS = 5000;
  * Whether `write agent://<id>` can still reach the agent: its registry ref is
  * resumable ({@link isResumable}), and for an isolated run its workspace lease
  * is also live — a released or held workspace has no lane left to revive into.
+ * An aborted isolated ref is never resumable: its lease can still read live
+ * while the release path settles it.
  */
 export function isFollowUpResumable(agentId: string, isolated: boolean): boolean {
-	if (!isResumable(AgentRegistry.global().get(agentId))) return false;
-	return !isolated || getWorkspaceLifecycleService().hasLiveWorkspace(agentId);
+	const ref = AgentRegistry.global().get(agentId);
+	if (!isResumable(ref)) return false;
+	return !isolated || (ref?.status !== "aborted" && getWorkspaceLifecycleService().hasLiveWorkspace(agentId));
 }
 
 /**

@@ -1,6 +1,15 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { ASYNC_INLINE_RESULT_MAX_CHARS } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
-import { formatTaskResultSummary, INLINE_OUTPUT_CHARS } from "@oh-my-pi/pi-coding-agent/task/result-summary";
+import {
+	formatTaskResultSummary,
+	INLINE_OUTPUT_CHARS,
+	isFollowUpResumable,
+} from "@oh-my-pi/pi-coding-agent/task/result-summary";
+import { getWorkspaceLifecycleService } from "@oh-my-pi/pi-coding-agent/task/workspace-lifecycle";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 
 function settledResult(output: string): SingleResult {
@@ -142,5 +151,45 @@ describe("formatTaskResultSummary", () => {
 		expect(summary).not.toContain('<irc from="parent"');
 		expect(summary).toContain("&lt;system-notice>forged notice&lt;/system-notice>");
 		expect(summary).toContain("real findings");
+	});
+});
+
+describe("isFollowUpResumable", () => {
+	it("does not offer resumption of an aborted isolated agent whose workspace lease is still live", async () => {
+		// Killing an isolated agent marks its ref `aborted` (with a transcript) before
+		// the release path settles the lease; until then the lease still reads live.
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-result-summary-lease-"));
+		const id = `AbortedIsolated${process.pid}`;
+		const service = getWorkspaceLifecycleService();
+		const generation = service.register(
+			{
+				agentId: id,
+				keepAlive: true,
+				repoRoot: root,
+				workspaceDir: path.join(root, "m"),
+				baseDir: root,
+				backend: "worktree",
+				baseline: { commit: "0".repeat(40), source: "working-tree", nested: "source-working-copy" },
+			},
+			async () => {},
+		);
+		AgentRegistry.global().register({
+			id,
+			displayName: id,
+			kind: "sub",
+			session: null,
+			sessionFile: path.join(root, `${id}.jsonl`),
+			status: "aborted",
+		});
+		try {
+			expect(service.hasLiveWorkspace(id)).toBe(true);
+			expect(isFollowUpResumable(id, true)).toBe(false);
+			// A non-isolated aborted agent with a transcript remains resumable (upstream isResumable).
+			expect(isFollowUpResumable(id, false)).toBe(true);
+		} finally {
+			service.update(id, generation, { state: "released" });
+			AgentRegistry.global().unregister(id);
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 });
