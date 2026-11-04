@@ -13,6 +13,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -25,6 +27,7 @@ import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
+import { getWorkspaceLifecycleService } from "@oh-my-pi/pi-coding-agent/task/workspace-lifecycle";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { AgentProgress, SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -347,6 +350,71 @@ describe("task spawn routing", () => {
 				expect(delivered).toContain("Isolation workspace retained at /wt/sandboxed/m");
 			} else {
 				expect(job!.status).toBe("completed");
+			}
+		});
+	}
+
+	// A parked keepAlive isolated lane revives via `write agent://<id>` while
+	// its workspace lease is live; only a released/held workspace ends that.
+	for (const { leaseState, messageable } of [
+		{ leaseState: "parked", messageable: true },
+		{ leaseState: "held", messageable: false },
+	] as const) {
+		it(`isolated follow-up hint is ${messageable ? "messageable" : "final"} with a ${leaseState} lease`, async () => {
+			vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+				agents: [{ ...taskAgent, model: ["anthropic/claude-sonnet-4"] }],
+				projectAgentsDir: null,
+			});
+			const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-follow-up-"));
+			const agentId = `Lane${leaseState}`;
+			vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/repo-root" });
+			vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts => {
+				const service = getWorkspaceLifecycleService();
+				const generation = service.register(
+					{
+						agentId: opts.agentId,
+						keepAlive: true,
+						repoRoot: "/repo-root",
+						workspaceDir: baseDir,
+						baseDir,
+						backend: "worktree",
+						baseline: { commit: "HEAD", source: "working-tree", nested: "source-working-copy" },
+					},
+					async () => {},
+				);
+				service.update(opts.agentId, generation, { state: leaseState });
+				AgentRegistry.global().register({
+					id: opts.agentId,
+					displayName: opts.agentId,
+					kind: "sub",
+					session: null,
+					sessionFile: path.join(baseDir, "s.jsonl"),
+					status: "parked",
+				});
+				return { ...makeResult(opts.agentId), isolated: true };
+			});
+
+			const manager = createManager();
+			const tool = await TaskTool.create(
+				createSession({ manager, settings: { "task.isolation.enabled": true, "task.isolation.apply": false } }),
+			);
+			const result = await tool.execute("tc-isolated-lane", {
+				agent: "task",
+				name: agentId,
+				task: "Do the thing.",
+				isolated: true,
+			} as TaskParams);
+			const job = manager.getJob(result.details?.async?.jobId ?? "");
+			await job!.promise;
+			await fs.rm(baseDir, { recursive: true, force: true });
+
+			const delivered = `${job!.resultText ?? ""}${job!.errorText ?? ""}`;
+			if (messageable) {
+				expect(delivered).toContain(`message it via \`write agent://${agentId}\``);
+				expect(delivered).not.toContain("cannot be resumed");
+			} else {
+				expect(delivered).toContain(`${agentId} ran isolated and cannot be resumed or messaged`);
+				expect(delivered).not.toContain("message it via");
 			}
 		});
 	}

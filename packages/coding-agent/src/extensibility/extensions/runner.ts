@@ -122,6 +122,7 @@ import {
 	cfgExtensionHandlersToolCallTimeoutMs,
 	cfgExtensionTranscriptPresenters,
 } from "../settings";
+import { getWorkspaceLifecycleHost } from "../../task/workspace-lifecycle";
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
@@ -1807,6 +1808,7 @@ export class ExtensionRunner {
 			getContextUsage: () => this.#getContextUsageFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
 			getAsyncJobSnapshot: () => this.#getAsyncJobSnapshotFn(),
+			workspaceLifecycle: getWorkspaceLifecycleHost(),
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
 			sessionManager: this.sessionManager,

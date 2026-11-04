@@ -41,13 +41,13 @@ import { hasWaitTool } from "../tools/wait";
 import { IrcBus } from "../irc/bus";
 import { isIrcEnabled } from "../irc/messaging";
 import { isReadOnlyAgent } from "./read-only-policy";
-import { formatTaskResultSummary } from "./result-summary";
+import { formatTaskResultSummary, isFollowUpResumable } from "./result-summary";
 import { isScoutSpawnable, resolveSpawnPolicy } from "./spawn-policy";
 import { type AgentDefinition, canSpawnAtDepth, getTaskSchema, type TaskToolSchemaInstance } from "./types";
 import type { AgentProgress, SingleResult, TaskItem, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError, type AsyncJobManagerApi } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
-import { AgentRegistry, isResumable } from "../registry/agent-registry";
+import { AgentRegistry } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import { getPerCallModelAdvertisement, type PerCallModelAdvertisement } from "./model-approval";
@@ -64,6 +64,7 @@ import {
 	resolveEffectiveSubagentPolicy,
 	runStructuredSubagent,
 	StructuredSubagentError,
+	type StructuredSubagentIsolationControls,
 	type StructuredSubagentRequest,
 } from "./structured-subagent";
 import { SpawnRun, type SpawnPermit } from "./spawn-run";
@@ -363,6 +364,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if ("effort" in params) item.effort = params.effort;
 	if ("isolated" in params) item.isolated = params.isolated;
 	if ("model" in params) item.model = params.model;
+	if (params.baseline !== undefined) item.baseline = params.baseline;
 	return [item];
 }
 
@@ -373,7 +375,8 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
  * `tasks` never leaks into a spawn; the shared `context` rides along
  * unchanged. Keys are only materialized when present — `#runSpawn`
  * distinguishes an absent `isolated` from an explicit one. The item's
- * `isolated` (batch form) wins over the top-level flag (flat form).
+ * `isolated` (batch form) wins over the top-level flag (flat form). A
+ * `baseline` implies `isolated: true` unless the caller set the flag.
  */
 function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string): TaskParams {
 	const spawn: TaskParams = { agent: item.agent?.trim() || defaultAgent };
@@ -392,7 +395,22 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	} else if ("isolated" in params) {
 		spawn.isolated = params.isolated;
 	}
+	if (item.baseline !== undefined) {
+		spawn.baseline = item.baseline;
+		spawn.isolated ??= true;
+	}
 	return spawn;
+}
+
+/** Structured-subagent isolation controls for one spawn; keys only when the caller sent them. */
+function isolationControls(params: TaskParams): { isolation?: StructuredSubagentIsolationControls } {
+	if (!("isolated" in params) && params.baseline === undefined) return {};
+	return {
+		isolation: {
+			requested: params.isolated,
+			...(params.baseline !== undefined ? { baseline: params.baseline } : {}),
+		},
+	};
 }
 
 /** A validated call's spawn list: its items and the per-spawn params each run receives. */
@@ -1012,7 +1030,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			...spawnModelFields(params),
 			...this.#resultParams(params),
 			...this.#effortParams(params),
-			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
+			...isolationControls(params),
 			blockedAgent: this.#blockedAgent,
 			enableLsp: this.session.enableLsp ?? true,
 			enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
@@ -1501,22 +1519,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// its widget has no tool tap to read.
 		let spawnRun: SpawnRun | undefined = run;
 		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
-			// Isolated runs are parked without a reviver once the run ends
-			// (`finalizeSubagentLifecycle`), so "message it" would point the
-			// caller at a follow-up path that no longer exists. The template says
-			// nothing about the worktree itself: the runner keeps it when captured
-			// changes could not be written, and names that path in the result.
+			// An isolated run can be messaged only while its lane is idle/parked
+			// and its workspace lease is live; once released or held there is no
+			// lane to revive. The template says nothing about the worktree itself:
+			// the runner keeps it when captured changes could not be written, and
+			// names that path in the result.
 			const isolated = spawnParams.isolated === true;
 			// A failed or killed run may never have written the transcript a revival
 			// reads, so a resumable-looking ref alone does not make it messageable.
 			const transcriptAvailable = await hasResolvableTranscript(agentId);
 			const ref = AgentRegistry.global().get(agentId);
+			const resumable = isolated
+				? transcriptAvailable && isFollowUpResumable(agentId, true)
+				: transcriptAvailable && (Boolean(ref?.session) || isFollowUpResumable(agentId, false));
 			return `\n\n${prompt.render(taskFollowUpTemplate, {
 				agentId,
 				aborted,
 				isolated,
 				ircEnabled,
-				resumable: !isolated && transcriptAvailable && (Boolean(ref?.session) || isResumable(ref)),
+				resumable,
 				transcriptAvailable,
 			})}`;
 		};
@@ -1901,7 +1922,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				...(onArtifactsRetained ? { onArtifactsRetained } : {}),
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
-				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
+				...isolationControls(params),
 				blockedAgent: this.#blockedAgent,
 				enableLsp: this.session.enableLsp ?? true,
 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),

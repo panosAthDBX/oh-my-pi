@@ -365,6 +365,11 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		);
 	}
 
+	/** True while a revive (follow-up / ensureLive) is in flight for this id. */
+	isReviving(id: string): boolean {
+		return this.#revivals.has(id);
+	}
+
 	/**
 	 * Dispose the live session, detach it from the registry, and mark the
 	 * agent `parked`. No-op unless the id is adopted and live.

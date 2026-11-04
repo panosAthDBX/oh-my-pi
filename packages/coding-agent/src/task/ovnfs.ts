@@ -62,7 +62,7 @@ function checkoutName(agentId: string): string {
 /**
  * Remove every checkout `dir` records (`checkout` when it records none), then
  * delete `dir`. A removal that cannot be confirmed keeps `dir` and the checkout
- * record in it, so `omp worktree clear` can retry.
+ * record in it, so `omp worktree clear` can retry, and throws.
  */
 async function releaseCheckoutRecord(dir: string, command: string, checkout: string): Promise<void> {
 	try {
@@ -73,7 +73,7 @@ async function releaseCheckoutRecord(dir: string, command: string, checkout: str
 			checkout,
 			error: err instanceof Error ? err.message : String(err),
 		});
-		return;
+		throw err;
 	}
 	await fs.rm(dir, { recursive: true, force: true });
 }
@@ -86,11 +86,12 @@ function sameFolder(a: string, b: string): boolean {
 
 /** An open ovnfs checkout and the isolation dir recording it. */
 class OvnfsWorkspace implements IsolationWorkspace {
+	readonly backend = "ovnfs";
 	readonly start?: WorkspaceStart;
 
 	constructor(
 		readonly dir: string,
-		private baseDir: string,
+		public baseDir: string,
 		private readonly command: string,
 		private readonly checkout: string,
 		/** The checkout's capture when it is the run's starting state; then no baseline is taken at start. */
@@ -150,11 +151,12 @@ class OvnfsWorkspace implements IsolationWorkspace {
 	/** The checkout stays where it is; its record leaves the deterministic slot so a later run with this id keeps it. */
 	async retain(): Promise<RetainedWorkspace> {
 		this.baseDir = (await vacateIsolationSlot(this.baseDir)) ?? this.baseDir;
-		return { dir: this.dir, sidecarOk: true };
+		return { dir: this.dir, baseDir: this.baseDir, sidecarOk: true };
 	}
 
 	/** Remove the checkouts, then their record; a checkout that cannot be removed keeps the record for `omp worktree clear`. */
 	async cleanup(): Promise<void> {
+		// A failed removal throws, so the caller reports the workspace held rather than released.
 		await releaseCheckoutRecord(this.baseDir, this.command, this.checkout);
 	}
 }
@@ -251,7 +253,8 @@ export function ovnfsWorkspace(command: string): OpenWorkspace {
 			// only the new local record goes — removing the checkout would
 			// delete the older run's work.
 			const refusedExisting = err instanceof OvnfsError && err.code === "exists";
-			if (recorded && !refusedExisting) await releaseCheckoutRecord(baseDir, command, checkout);
+			// Best effort: a failed removal is logged and its record kept; the open failure is what to report.
+			if (recorded && !refusedExisting) await releaseCheckoutRecord(baseDir, command, checkout).catch(() => {});
 			else await fs.rm(baseDir, { recursive: true, force: true });
 			throw new Error(
 				`ovnfs isolation failed: ${err instanceof Error ? err.message : String(err)} (set isolation.backend to a native backend to bypass ovnfs)`,

@@ -113,6 +113,8 @@ export interface StructuredSubagentIsolationControls {
 	requested?: boolean;
 	merge?: "patch" | "branch";
 	apply?: boolean;
+	/** Commit-ish the isolated workspace starts from instead of the parent working tree. */
+	baseline?: string;
 }
 
 /** Identity and presentation metadata supplied by the calling surface. */
@@ -613,6 +615,12 @@ export async function resolveEffectiveSubagentPolicy(
 			"Subagent isolated execution requires task.isolation.enabled; it is currently false.",
 		);
 	}
+	if (request.isolation?.baseline !== undefined && !isIsolated) {
+		throw new StructuredSubagentError(
+			"preflight",
+			"Subagent `baseline` requires an isolated spawn (`isolated: true`).",
+		);
+	}
 	return {
 		discovery,
 		agentName,
@@ -1061,6 +1069,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 					buildCommitMessage: makeIsolationCommitMessage(request.session),
 					buildFailureResult: buildFailureResult(request, policy, id, Date.now()),
 					onSubprocessResult,
+					baseline: request.isolation?.baseline,
 				});
 			}
 		} finally {

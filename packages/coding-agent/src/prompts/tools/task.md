@@ -86,6 +86,7 @@ Run one agent synchronously.
 {{else}}
 - `isolated`: worktree; changes retained, not applied.
 {{/if}}
+- `baseline`: commit-ish the isolated worktree starts from exactly (implies `isolated`); use a predecessor's candidate commit for dependent work. Unresolvable fails the spawn.
 {{/if}}
 
 Shared edits need one integration owner; give each task its files{{#unless batchEnabled}} and interfaces{{/unless}}.

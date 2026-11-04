@@ -684,18 +684,20 @@ export async function ensureIsolation(
 /**
  * Tear down a handle returned by {@link ensureIsolation}. When native teardown fails for a mount or
  * subvolume backend, the workspace is kept with a retained-backend sidecar (recursive `rm` would
- * traverse the live mount); `omp worktree clear` retries the teardown later.
+ * traverse the live mount; `omp worktree clear` retries the teardown later) and this throws, so the
+ * caller reports the workspace as retained instead of released.
  */
 export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
 	const baseDir = path.dirname(handle.mergedDir);
 	try {
 		await natives.isoStop(handle.backend, handle.mergedDir);
 	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
 		const retain = needsNativeTeardown(handle.backend);
 		logger.warn("isolation backend stop failed during cleanup", {
 			backend: handle.backend,
 			mergedDir: handle.mergedDir,
-			error: err instanceof Error ? err.message : String(err),
+			error: message,
 			retained: retain,
 		});
 		if (retain) {
@@ -707,7 +709,7 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
 					error: writeErr instanceof Error ? writeErr.message : String(writeErr),
 				});
 			}
-			return;
+			throw new Error(`isolation backend stop failed; workspace left in place: ${message}`);
 		}
 	}
 	await fs.rm(baseDir, { recursive: true, force: true });

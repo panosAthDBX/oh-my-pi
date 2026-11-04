@@ -35,7 +35,7 @@ import { trackLateCleanup } from "../utils/late-cleanup";
 import { withRepoLock } from "../utils/repo-lock";
 import type { ExecutorOptions } from "./executor";
 import { runSubprocess } from "./executor";
-import { needsNativeTeardown, writeRetainedBackend } from "./isolation-ownership";
+import { ISOLATION_OWNER_FILE, needsNativeTeardown, writeRetainedBackend } from "./isolation-ownership";
 import type { NestedRepoPatch, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import {
 	applyNestedPatches,
@@ -47,10 +47,12 @@ import {
 	commitToBranch,
 	type DeltaPatchResult,
 	ensureIsolation,
+	formatIsolationBackend,
 	getRepoRoot,
 	mergeTaskBranches,
 	type WorktreeBaseline,
 } from "./worktree";
+import { getWorkspaceLifecycleService } from "./workspace-lifecycle";
 
 import { cfgTaskIsolationCommits } from "./settings";
 
@@ -219,6 +221,50 @@ export interface IsolatedRunOptions {
 	buildFailureResult: (err: unknown) => SingleResult;
 	/** Observe the real child result before post-run isolation work. */
 	onSubprocessResult?: (result: SingleResult) => void;
+	/** Explicit commit-ish to materialise the workspace at instead of the root working tree. */
+	baseline?: string;
+}
+
+async function git(cwd: string, args: string[]): Promise<{ ok: boolean; out: string }> {
+	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe", windowsHide: true });
+	const [stdout, stderr, code] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	return { ok: code === 0, out: (code === 0 ? stdout : stderr || stdout).trim() };
+}
+
+/** Resolve a task `baseline` commit-ish in the source repo, or throw naming it. */
+async function resolveBaselineCommit(repoRoot: string, baseline: string): Promise<string> {
+	const resolved = baseline.trim()
+		? await git(repoRoot, ["rev-parse", "--verify", "--end-of-options", `${baseline}^{commit}`])
+		: { ok: false, out: "empty baseline" };
+	if (!resolved.ok) {
+		throw new Error(`Task baseline "${baseline}" does not resolve to a commit in ${repoRoot}: ${resolved.out}`);
+	}
+	return resolved.out;
+}
+
+/**
+ * Move a fresh isolation copy onto exactly `commit`: tracked files forced to
+ * the commit, non-ignored untracked files (nested repos included) removed,
+ * ignored files kept, then verified clean so no root working-tree state leaks
+ * into the successor.
+ */
+async function materializeBaselineCommit(dir: string, commit: string, requested: string): Promise<void> {
+	for (const args of [
+		["checkout", "--quiet", "--detach", "--force", commit],
+		["clean", "-ffdq"],
+	]) {
+		const step = await git(dir, args);
+		if (!step.ok) throw new Error(`Task baseline "${requested}" could not be checked out: ${step.out}`);
+	}
+	const head = await git(dir, ["rev-parse", "HEAD"]);
+	const status = await git(dir, ["status", "--porcelain", "-uall"]);
+	if (head.out !== commit || !status.ok || status.out !== "") {
+		throw new Error(`Task baseline "${requested}" did not materialise cleanly at ${commit} (HEAD ${head.out})`);
+	}
 }
 
 /**
@@ -306,11 +352,12 @@ interface RunChanges {
 
 /**
  * Read `workspace`'s changes. A workspace that keeps its own starting state
- * ({@link IsolationWorkspace.start}) needs nothing taken now; any other gets
- * its baseline captured before the run begins.
+ * ({@link IsolationWorkspace.start}) needs nothing taken now, unless `fromStart`
+ * is false (the checkout was moved off that state); any other gets its baseline
+ * captured before the run begins.
  */
-async function trackChanges(workspace: IsolationWorkspace, repoRoot: string): Promise<RunChanges> {
-	const start = workspace.start;
+async function trackChanges(workspace: IsolationWorkspace, repoRoot: string, fromStart: boolean): Promise<RunChanges> {
+	const start = fromStart ? workspace.start : undefined;
 	if (!start) {
 		const baseline = await captureIsolationBaseline(workspace.dir, repoRoot);
 		return {
@@ -354,6 +401,8 @@ async function trackChanges(workspace: IsolationWorkspace, repoRoot: string): Pr
 export interface RetainedWorkspace {
 	/** Workspace path to report (unique sibling on success, original dir when the move fails). */
 	dir: string;
+	/** Ownership record directory when it is separate from the checkout. */
+	baseDir?: string;
 	/**
 	 * False when cleanup metadata is missing that `clear` would need: the
 	 * sidecar could not be written (plausible under the same disk pressure
@@ -427,6 +476,10 @@ export interface IsolationWorkspace {
 	readonly dir: string;
 	/** Set when the workspace keeps the state it opened in; then no baseline is taken at start. */
 	readonly start?: WorkspaceStart;
+	/** Backend label recorded in the workspace lifecycle lease. */
+	readonly backend?: string;
+	/** Ownership record directory when it is separate from the checkout. */
+	readonly baseDir?: string;
 	/** Keep the workspace past the run (its changes could not be captured) and say where it stays. */
 	retain(): Promise<RetainedWorkspace>;
 	/** Tear the workspace down. */
@@ -442,6 +495,7 @@ export function nativeWorkspace(backend: IsoBackendKind | undefined): OpenWorksp
 		const handle = await ensureIsolation(repoRoot, agentId, backend);
 		return {
 			dir: handle.mergedDir,
+			backend: formatIsolationBackend(handle.backend),
 			retain: () => retainIsolationWorkspace(handle.mergedDir, handle.backend),
 			cleanup: () => cleanupIsolation(handle),
 		};
@@ -503,35 +557,81 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 	let releasePromise: Promise<void> | undefined;
 	/** The run's IRC wake hold, released only once the run-end capture is done. */
 	let releaseIrcWakes: (() => void) | undefined;
+	const lifecycle = getWorkspaceLifecycleService();
+	/** Lease generation; set once the workspace is registered with the lifecycle host. */
+	let generation: string | undefined;
 	const releaseBase = (): Promise<void> => {
 		baseReleasePromise ??= opts.baseOptions.onRelease?.() ?? Promise.resolve();
 		return baseReleasePromise;
 	};
+	/** Keep the workspace under a unique `.retained-*` sibling and settle the lease as held. */
+	const retain = async (isolation: IsolationWorkspace, holdReason: string): Promise<RetainedWorkspace> => {
+		retainWorkspace = true;
+		const retained = await isolation.retain();
+		if (generation) {
+			lifecycle.update(opts.agentId, generation, {
+				state: "held",
+				holdReason,
+				workspaceDir: retained.dir,
+				baseDir: retained.baseDir ?? path.dirname(retained.dir),
+				retainedDir: retained.dir,
+			});
+		}
+		return retained;
+	};
+	const remember = (result: SingleResult): SingleResult => {
+		if (generation) {
+			lifecycle.update(opts.agentId, generation, {
+				capture: {
+					patchPath: result.patchPath,
+					branchName: result.branchName,
+					nestedPatchPaths: result.nestedPatchPaths,
+				},
+			});
+		}
+		return rememberAgentArtifacts(result);
+	};
 	const cleanupHandle = (): Promise<void> => {
 		cleanupPromise ??= (async () => {
 			await releaseBase();
-			if (workspace && !retainWorkspace) await workspace.cleanup();
+			if (!workspace || retainWorkspace) return;
+			// Teardown only after every release gate passes; a hold keeps the workspace.
+			const hold = generation ? await lifecycle.runGates(opts.agentId, generation) : undefined;
+			if (hold) {
+				await retain(workspace, hold);
+				return;
+			}
+			try {
+				await workspace.cleanup();
+			} catch (err) {
+				await retain(workspace, err instanceof Error ? err.message : String(err));
+				return;
+			}
+			if (generation) lifecycle.update(opts.agentId, generation, { state: "released" });
 		})();
 		return cleanupPromise;
 	};
 	const releaseIsolation = (): Promise<void> => {
 		if (releasePromise) return releasePromise;
 		releasePromise = (async () => {
+			// Owner jobs/shutdown hooks may still write the workspace; capture after they drain.
+			await deferredCleanup?.catch(() => undefined);
 			if (!workspace || !changes || retainWorkspace) {
 				await cleanupHandle();
 				return;
 			}
+			const isolation = workspace;
 			try {
 				let capture: IsolationPatchCapture;
 				try {
 					capture = await writeIsolationPatch(changes, opts.artifactsDir, opts.agentId);
 				} catch (captureErr) {
-					retainWorkspace = true;
-					const retained = await workspace.retain();
+					const message = captureErr instanceof Error ? captureErr.message : String(captureErr);
+					const retained = await retain(isolation, `capture failed: ${message}`);
 					throw new Error(
 						renderIsolationError({
 							kind: "patch-capture-failed",
-							message: captureErr instanceof Error ? captureErr.message : String(captureErr),
+							message,
 							retainedDir: retained.dir,
 							sidecarMissing: !retained.sidecarOk,
 						}),
@@ -542,22 +642,47 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 					patchPath: patchResult.patchPath,
 					nestedPatchPaths: patchResult.nestedPatchPaths,
 				});
+				if (generation) {
+					lifecycle.update(opts.agentId, generation, {
+						capture: { patchPath: patchResult.patchPath, nestedPatchPaths: patchResult.nestedPatchPaths },
+					});
+				}
 				// Nothing changed since the run-end capture the caller already
 				// merged or applied: a branch now would only duplicate that work.
 				if (capture.fingerprint === handedOff) return;
-				const commitResult = await commitToBranch(
-					workspace.dir,
-					await changes.baseline(),
-					opts.agentId,
-					opts.description,
-					undefined,
-					capture.delta,
-				);
+				let commitResult: CommitToBranchResult | null;
+				try {
+					commitResult = await commitToBranch(
+						isolation.dir,
+						await changes.baseline(),
+						opts.agentId,
+						opts.description,
+						undefined,
+						capture.delta,
+					);
+				} catch (commitErr) {
+					// The patch is on disk, but the workspace still holds the only
+					// copy of any commits; keep it rather than reporting success.
+					await retain(
+						isolation,
+						`branch commit failed: ${commitErr instanceof Error ? commitErr.message : String(commitErr)}`,
+					);
+					throw commitErr;
+				}
 				AgentRegistry.global().setHistory(opts.agentId, {
 					patchPath: patchResult.patchPath,
 					branchName: commitResult?.branchName,
 					nestedPatchPaths: patchResult.nestedPatchPaths,
 				});
+				if (generation) {
+					lifecycle.update(opts.agentId, generation, {
+						capture: {
+							patchPath: patchResult.patchPath,
+							branchName: commitResult?.branchName,
+							nestedPatchPaths: patchResult.nestedPatchPaths,
+						},
+					});
+				}
 			} finally {
 				await cleanupHandle();
 			}
@@ -574,10 +699,45 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		return releasePromise;
 	};
 	try {
+		// Resolve before materialising anything: an unresolvable baseline must
+		// never fall back to a copy of the root working tree.
+		const explicitCommit =
+			opts.baseline === undefined ? undefined : await resolveBaselineCommit(opts.context.repoRoot, opts.baseline);
 		workspace = await opts.openWorkspace(opts.context.repoRoot, opts.agentId);
 		const isolationDir = workspace.dir;
-		const runChanges = await trackChanges(workspace, opts.context.repoRoot);
+		if (explicitCommit) await materializeBaselineCommit(isolationDir, explicitCommit, opts.baseline ?? "");
+		// An explicit baseline moves the checkout off the state it opened in (an
+		// ovnfs capture), so the run's changes are read against a fresh baseline.
+		const runChanges = await trackChanges(workspace, opts.context.repoRoot, explicitCommit === undefined);
 		changes = runChanges;
+		const baseDir = workspace.baseDir ?? path.dirname(isolationDir);
+		const owner = await Bun.file(path.join(baseDir, ISOLATION_OWNER_FILE))
+			.json()
+			.catch(() => undefined);
+		generation = lifecycle.register(
+			{
+				agentId: opts.agentId,
+				keepAlive: opts.baseOptions.keepAlive !== false,
+				repoRoot: opts.context.repoRoot,
+				workspaceDir: isolationDir,
+				baseDir,
+				backend: workspace.backend ?? "custom",
+				baseline: explicitCommit
+					? {
+							commit: explicitCommit,
+							requested: opts.baseline,
+							source: "explicit-commit",
+							nested: "source-working-copy",
+						}
+					: {
+							commit: (await vcs.requireGit(isolationDir).headSha()) ?? "",
+							source: "working-tree",
+							nested: "source-working-copy",
+						},
+			},
+			releaseIsolation,
+			typeof owner?.startToken === "string" ? owner.startToken : undefined,
+		);
 		const result = await runSubprocess({
 			...opts.baseOptions,
 			worktree: isolationDir,
@@ -637,20 +797,20 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 				const msg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
 				try {
 					const capture = await writeIsolationPatch(runChanges, opts.artifactsDir, opts.agentId);
-					return rememberAgentArtifacts({
+					return remember({
 						...result,
 						...capture.artifacts,
 						error: renderIsolationError({ kind: "merge-failed", message: msg, rescueBranch }),
 					});
 				} catch (patchErr) {
-					retainWorkspace = true;
-					const retained = await workspace.retain();
-					return rememberAgentArtifacts({
+					const captureError = patchErr instanceof Error ? patchErr.message : String(patchErr);
+					const retained = await retain(workspace, `capture failed: ${captureError}`);
+					return remember({
 						...result,
 						error: renderIsolationError({
 							kind: "merge-failed",
 							message: msg,
-							captureError: patchErr instanceof Error ? patchErr.message : String(patchErr),
+							captureError,
 							rescueBranch,
 							retainedDir: retained.dir,
 							sidecarMissing: !retained.sidecarOk,
@@ -667,7 +827,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 					opts.agentId,
 					commitResult?.nestedPatches ?? [],
 				);
-				return rememberAgentArtifacts({
+				return remember({
 					...result,
 					branchName: commitResult?.branchName,
 					branchBaseSha: commitResult?.baseSha,
@@ -675,16 +835,16 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 					nestedPatchPaths,
 				});
 			} catch (persistErr) {
-				retainWorkspace = true;
-				const retained = await workspace.retain();
-				return rememberAgentArtifacts({
+				const message = persistErr instanceof Error ? persistErr.message : String(persistErr);
+				const retained = await retain(workspace, `capture failed: ${message}`);
+				return remember({
 					...result,
 					branchName: commitResult?.branchName,
 					branchBaseSha: commitResult?.baseSha,
 					nestedPatches: commitResult?.nestedPatches,
 					error: renderIsolationError({
 						kind: "nested-capture-failed",
-						message: persistErr instanceof Error ? persistErr.message : String(persistErr),
+						message,
 						retainedDir: retained.dir,
 						sidecarMissing: !retained.sidecarOk,
 					}),
@@ -695,25 +855,27 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			try {
 				const capture = await writeIsolationPatch(runChanges, opts.artifactsDir, opts.agentId);
 				handedOff = capture.fingerprint;
-				return rememberAgentArtifacts({ ...result, ...capture.artifacts });
+				return remember({ ...result, ...capture.artifacts });
 			} catch (patchErr) {
-				retainWorkspace = true;
-				const retained = await workspace.retain();
-				return rememberAgentArtifacts({
+				const message = patchErr instanceof Error ? patchErr.message : String(patchErr);
+				const retained = await retain(workspace, `capture failed: ${message}`);
+				return remember({
 					...result,
 					error: renderIsolationError({
 						kind: "patch-capture-failed",
-						message: patchErr instanceof Error ? patchErr.message : String(patchErr),
+						message,
 						retainedDir: retained.dir,
 						sidecarMissing: !retained.sidecarOk,
 					}),
 				});
 			}
 		}
-		return rememberAgentArtifacts(result);
+		return remember(result);
 	} catch (err) {
-		return rememberAgentArtifacts(opts.buildFailureResult(err));
+		return remember(opts.buildFailureResult(err));
 	} finally {
+		// Post-run capture is over: explicit release may now take the workspace.
+		if (generation) lifecycle.runFinished(opts.agentId, generation);
 		if (
 			workspace &&
 			!retainWorkspace &&

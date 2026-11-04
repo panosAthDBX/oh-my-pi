@@ -86,12 +86,15 @@ describe("worktree isolation helpers", () => {
 		const mounted = path.join(root, "overlay");
 		await fs.mkdir(path.join(mounted, "m"), { recursive: true });
 		await fs.mkdir(path.join(mounted, "upper"));
-		await cleanupIsolation({
-			mergedDir: path.join(mounted, "m"),
-			backend: natives.IsoBackendKind.Overlayfs,
-			fellBack: false,
-			fallbackReason: null,
-		});
+		// Throws too, so the isolation runner reports the workspace as retained rather than released.
+		await expect(
+			cleanupIsolation({
+				mergedDir: path.join(mounted, "m"),
+				backend: natives.IsoBackendKind.Overlayfs,
+				fellBack: false,
+				fallbackReason: null,
+			}),
+		).rejects.toThrow(/workspace left in place: fusermount3/);
 		expect((await fs.readdir(mounted)).sort()).toEqual([".omp-retained-backend.json", "m", "upper"]);
 		expect(await readRetainedMountBackend(mounted)).toBe(natives.IsoBackendKind.Overlayfs);
 	});

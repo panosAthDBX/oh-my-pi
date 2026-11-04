@@ -288,7 +288,8 @@ describe("ovnfs checkout recovery", () => {
 		const record = await readRecord(baseDir);
 
 		failRemoval = true;
-		await workspace.cleanup();
+		// A failed removal throws, so the lifecycle reports the workspace held, not released.
+		await expect(workspace.cleanup()).rejects.toThrow("checkout is busy");
 
 		expect(removed).toContain(record.checkout);
 		expect(await readRecord(baseDir)).toEqual(record);
@@ -363,7 +364,7 @@ describe("ovnfs checkout recovery", () => {
 
 		// Closing the workspace removes the start checkout too, and keeps the record while it cannot.
 		removed.length = 0;
-		await workspace.cleanup();
+		await expect(workspace.cleanup()).rejects.toThrow("checkout is busy");
 		expect(removed).toEqual([start]);
 		expect(await readRecord(baseDir)).toEqual({ command: COMMAND, checkout, start });
 

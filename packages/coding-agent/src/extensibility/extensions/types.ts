@@ -93,6 +93,15 @@ import type * as PiCodingAgent from "../../index";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { LoopLimitConfig } from "../../modes/loop-limit";
 import type { MemoryRuntimeContext } from "../../memory-backend";
+import type { WorkspaceLifecycleHost } from "../../task/workspace-lifecycle";
+export type {
+	WorkspaceLease,
+	WorkspaceLeaseState,
+	WorkspaceLifecycleHost,
+	WorkspaceReleaseGate,
+	WorkspaceReleaseResult,
+	WorkspaceReleaseTrigger,
+} from "../../task/workspace-lifecycle";
 import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { NativeToolView } from "@oh-my-pi/pi-tui/tools/renderer";
@@ -805,6 +814,8 @@ export interface ExtensionContext {
 	getContextUsage(): ContextUsage | undefined;
 	/** Get a read-only snapshot of async jobs owned by this session. */
 	getAsyncJobSnapshot(): AsyncJobSnapshot | null;
+	/** Isolated-workspace leases and gated release (host companion, apiVersion 1). Absent on hosts without it. */
+	workspaceLifecycle?: WorkspaceLifecycleHost;
 	/** Compact the session context (interactive mode shows UI). */
 	compact(instructionsOrOptions?: string | CompactOptions): Promise<void>;
 	/** Whether UI is available (false in print/RPC mode) */

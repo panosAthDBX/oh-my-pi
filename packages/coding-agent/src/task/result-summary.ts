@@ -12,6 +12,7 @@ import { ASYNC_INLINE_RESULT_MAX_CHARS } from "../session/async-job-delivery";
 import { escapeHarnessTags } from "../session/harness-tags";
 import { formatBytes, formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import { getWorkspaceLifecycleService } from "./workspace-lifecycle";
 
 /**
  * Largest output inlined whole. A cut output costs the parent a
@@ -24,6 +25,16 @@ import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 export const INLINE_OUTPUT_CHARS = ASYNC_INLINE_RESULT_MAX_CHARS - 500;
 /** Head shown for an output over {@link INLINE_OUTPUT_CHARS}, with a pointer to `agent://<id>`. */
 const PREVIEW_CHARS = 5000;
+
+/**
+ * Whether `write agent://<id>` can still reach the agent: its registry ref is
+ * resumable ({@link isResumable}), and for an isolated run its workspace lease
+ * is also live — a released or held workspace has no lane left to revive into.
+ */
+export function isFollowUpResumable(agentId: string, isolated: boolean): boolean {
+	if (!isResumable(AgentRegistry.global().get(agentId))) return false;
+	return !isolated || getWorkspaceLifecycleService().hasLiveWorkspace(agentId);
+}
 
 /**
  * Preview text for a child result. Falls back to "(no output)" — annotated
@@ -68,9 +79,9 @@ export function formatTaskResultSummary(
 	const error = result.exitCode !== 0 && !result.aborted && result.output.trim().length > 0 ? result.error : undefined;
 	const outputCharCount = result.outputMeta?.charCount ?? output.length;
 	// A stopped agent stays messageable; tell the parent so it can resume via
-	// irc instead of redoing the work. Isolated runs are parked without a
-	// reviver (their worktree is gone), so they must not read as resumable.
-	const resumable = result.aborted && !result.isolated && isResumable(AgentRegistry.global().get(result.id));
+	// irc instead of redoing the work. An isolated run is resumable only while
+	// its workspace lease is live (see isFollowUpResumable).
+	const resumable = result.aborted && isFollowUpResumable(result.id, result.isolated === true);
 	const render = (truncated: boolean): string =>
 		prompt.render(taskSummaryTemplate, {
 			agentName: result.agent,
