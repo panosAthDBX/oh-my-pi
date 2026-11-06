@@ -1899,7 +1899,9 @@ export class ExtensionRunner {
 
 	#workspaceLifecycleFor(extensionPath: string | undefined) {
 		// Unknown or absent path: an unbound host, whose gates always run (never wrongly deduplicated).
-		return getWorkspaceLifecycleHost(this.getLoadedExtensions().find(ext => ext.path === extensionPath)?.resolvedPath);
+		return getWorkspaceLifecycleHost(
+			this.getLoadedExtensions().find(ext => ext.path === extensionPath)?.resolvedPath,
+		);
 	}
 
 	/**
