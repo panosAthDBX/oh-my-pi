@@ -11,7 +11,7 @@ import { workspaceLifecycleThreadService } from "../../src/thread/services/works
 import type { WorkspaceProbe, WorkspaceTestGlobals } from "../fixtures/workspace-lifecycle-worker";
 
 it("main gates and inventories worker-owned leases, refuses stale generations, and holds a dead worker's workspace", async () => {
-	using temp = TempDir.createSync("omp-workspace-thread-");
+	using temp = TempDir.createSync("@omp-workspace-thread-");
 	const worker = new Worker(new URL("../fixtures/workspace-lifecycle-worker.ts", import.meta.url).href, { type: "module" });
 	const channel = new MessageChannel();
 	const counter = new SharedArrayBuffer(4);
