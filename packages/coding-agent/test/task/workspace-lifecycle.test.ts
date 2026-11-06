@@ -610,7 +610,7 @@ function pauseLeaseRename(baseDir: string, synchronous = false): { entered: Prom
 				fsSync.writeFileSync(file, data);
 				return Promise.resolve(Buffer.byteLength(data));
 			}
-			return write(file, data, options);
+			return Reflect.apply(write, undefined, [file, data, options]);
 		});
 	}
 	let paused = false;
