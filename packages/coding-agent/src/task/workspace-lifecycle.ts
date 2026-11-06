@@ -91,6 +91,9 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/** Main-owned service surface; workers install an RPC proxy with the same contract. */
+export type WorkspaceLifecycleServiceApi = Pick<WorkspaceLifecycleService, keyof WorkspaceLifecycleService>;
+
 export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 	readonly apiVersion = 1 as const;
 	readonly hostVersion = VERSION;
@@ -125,6 +128,11 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 		return [...this.#leases.values()]
 			.filter(entry => entry.lease.state === "releasing")
 			.map(entry => ({ agentId: entry.lease.agentId, settled: entry.settled.promise }));
+	}
+
+	/** Keep a worker owner alive until its exact lease's terminal sidecar is durable. */
+	whenSettled(agentId: string, generation: string): Promise<void> {
+		return this.#current(agentId, generation)?.settled.promise ?? Promise.resolve();
 	}
 
 	/**
@@ -225,7 +233,9 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 			runnerBusy: true,
 			settled: Promise.withResolvers<void>(),
 		};
-		this.#leases.get(init.agentId)?.unsubscribe?.();
+		const previous = this.#leases.get(init.agentId);
+		previous?.unsubscribe?.();
+		if (previous) void previous.persisting.then(() => previous.settled.resolve());
 		this.#leases.set(init.agentId, entry);
 		const registry = AgentRegistry.global();
 		entry.unsubscribe = registry.onChange(event => {
@@ -318,10 +328,16 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 	}
 }
 
-let globalService: WorkspaceLifecycleService | undefined;
+let globalService: WorkspaceLifecycleServiceApi | undefined;
 let globalHost: WorkspaceLifecycleHost | undefined;
 
-export function getWorkspaceLifecycleService(): WorkspaceLifecycleService {
+/** Worker bootstrap installs main's service before creating any sessions. */
+export function installWorkspaceLifecycleService(service: WorkspaceLifecycleServiceApi): void {
+	globalService = service;
+	globalHost = undefined;
+}
+
+export function getWorkspaceLifecycleService(): WorkspaceLifecycleServiceApi {
 	globalService ??= new WorkspaceLifecycleService();
 	return globalService;
 }

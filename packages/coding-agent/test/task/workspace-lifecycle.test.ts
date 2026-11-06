@@ -7,7 +7,7 @@ import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
-import { prepareIsolationContext, runIsolatedSubprocess } from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
+import { nativeWorkspace, prepareIsolationContext, runIsolatedSubprocess } from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
 import { getTaskSchema } from "@oh-my-pi/pi-coding-agent/task/types";
 import {
 	getWorkspaceLifecycleHost,
@@ -161,7 +161,7 @@ async function spawn(id: string, opts: SpawnOptions = {}): Promise<SingleResult>
 			keepAlive,
 		},
 		context: await prepareIsolationContext(repo),
-		preferredBackend: undefined,
+		openWorkspace: nativeWorkspace(undefined),
 		agentId: id,
 		mergeMode: "patch",
 		artifactsDir,

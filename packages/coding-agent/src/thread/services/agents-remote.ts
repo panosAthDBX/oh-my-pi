@@ -217,6 +217,10 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		return registry instanceof RemoteAgentRegistry && this.#remote.callSync("manages", registry);
 	}
 
+	isReviving(id: string): boolean {
+		return this.#remote.callSync("isReviving", id);
+	}
+
 	isParking(id: string, expected?: AgentRefExpectation): boolean {
 		return this.#remote.callSync("isParking", id, expected);
 	}

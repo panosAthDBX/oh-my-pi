@@ -170,6 +170,8 @@ export interface AgentLifecycleApi {
 	reclaimDeadCorpse(id: string, expected: AgentRef): Promise<boolean>;
 	/** True when this lifecycle owns `registry` (identity comparison). */
 	manages(registry: AgentRegistryApi): boolean;
+	/** True while an adopted agent is being revived. */
+	isReviving(id: string): boolean;
 	/** True while a park is disposing this agent's session. */
 	isParking(id: string, expected?: AgentRefExpectation): boolean;
 	/** Dispose the live session of an adopted agent and mark it `parked`. */

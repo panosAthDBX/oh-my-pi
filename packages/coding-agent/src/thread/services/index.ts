@@ -17,6 +17,7 @@ import { runtimeThreadService } from "./runtime";
 import { runtimeIdentityThreadService } from "./runtime-identity";
 import { settingsThreadService } from "./settings";
 import { telemetryThreadService } from "./telemetry";
+import { workspaceLifecycleThreadService } from "./workspace-lifecycle";
 
 export const THREAD_SERVICES: readonly ThreadService[] = [
 	identityThreadService,
@@ -26,6 +27,7 @@ export const THREAD_SERVICES: readonly ThreadService[] = [
 	settingsThreadService,
 	authService,
 	agentsThreadService,
+	workspaceLifecycleThreadService,
 	lspThreadService,
 	telemetryThreadService,
 	memoryThreadService,
