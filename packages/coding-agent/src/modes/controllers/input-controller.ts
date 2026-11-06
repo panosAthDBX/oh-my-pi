@@ -3326,7 +3326,7 @@ export class InputController {
 			this.ctx.editor.setCustomKeyHandler(keyId, () => {
 				// Bound once at startup; a live `disabledExtensions` edit may have suspended the owner since.
 				if (!runner.isExtensionActive(shortcut.extensionPath)) return;
-				const ctx = runner.createCommandContext();
+				const ctx = runner.createCommandContext(shortcut.extensionPath);
 				try {
 					runner.runScoped(() => shortcut.handler(ctx));
 				} catch (err) {

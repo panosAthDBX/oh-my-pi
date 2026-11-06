@@ -814,7 +814,11 @@ export interface ExtensionContext {
 	getContextUsage(): ContextUsage | undefined;
 	/** Get a read-only snapshot of async jobs owned by this session. */
 	getAsyncJobSnapshot(): AsyncJobSnapshot | null;
-	/** Isolated-workspace leases and gated release (host companion, apiVersion 1). Absent on hosts without it. */
+	/**
+	 * Isolated-workspace leases and gated release (host companion, apiVersion 1). Absent on hosts without it.
+	 * One object per extension per thread; a gate registered through it runs once per release however many
+	 * threads load this extension.
+	 */
 	workspaceLifecycle?: WorkspaceLifecycleHost;
 	/** Compact the session context (interactive mode shows UI). */
 	compact(instructionsOrOptions?: string | CompactOptions): Promise<void>;
@@ -1846,6 +1850,7 @@ export interface RegisteredCommand {
 	description?: string;
 	getArgumentCompletions?: (argumentPrefix: string) => AutocompleteItem[] | null;
 	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+	extensionPath: string;
 }
 
 // ============================================================================

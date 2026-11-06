@@ -320,16 +320,23 @@ function createHandlerUIContext(
  * Scope `ctx` to a single handler run without spreading it: `{ ...ctx }` would
  * snapshot live accessors (notably the `model` getter), so a handler calling
  * `pi.setModel()` and then reading `ctx.model` would see a stale model.
- * Prototype delegation keeps every getter live while overriding `ui`.
+ * Prototype delegation keeps every getter live while overriding `ui` and
+ * binding `workspaceLifecycle` to the handler's own extension.
  */
 function createHandlerContext(
 	ctx: ExtensionContext,
+	extension: Extension,
 	handlerSignal: AbortSignal,
 	timeoutBudget?: HandlerTimeoutBudget,
 ): ExtensionContext {
 	const scoped: ExtensionContext = Object.create(ctx);
 	Object.defineProperty(scoped, "ui", {
 		value: createHandlerUIContext(ctx.ui, handlerSignal, timeoutBudget),
+		enumerable: true,
+		configurable: true,
+	});
+	Object.defineProperty(scoped, "workspaceLifecycle", {
+		value: getWorkspaceLifecycleHost(extension.resolvedPath),
 		enumerable: true,
 		configurable: true,
 	});
@@ -1155,9 +1162,8 @@ export class ExtensionRunner {
 	 *
 	 * One trampoline per extension per seam, not per handler: the list is walked
 	 * at mutation time so a handler this extension adds later still takes effect,
-	 * and `createContext()` takes no extension argument, so within one invocation
-	 * a single context is all any of this extension's handlers would have
-	 * received anyway.
+	 * and every handler of this one extension can share a single context per
+	 * invocation (it is bound to this extension, see {@link createContext}).
 	 *
 	 * The context is built PER INVOCATION rather than captured here, matching
 	 * every other dispatch site. `createContext()` materializes `cwd` and
@@ -1179,7 +1185,7 @@ export class ExtensionRunner {
 			this.#fileFallbackDisposers.push(
 				addFileWriteFallback(async req => {
 					if (this.#suspendedExtensions.has(ext)) return false;
-					const ctx = this.createContext();
+					const ctx = this.createContext(undefined, undefined, undefined, ext.path);
 					for (const handler of ext.fileWriteFallbackHandlers) {
 						try {
 							if (await handler(req, ctx)) return true;
@@ -1198,7 +1204,7 @@ export class ExtensionRunner {
 			this.#fileFallbackDisposers.push(
 				addFileDeleteFallback(async req => {
 					if (this.#suspendedExtensions.has(ext)) return false;
-					const ctx = this.createContext();
+					const ctx = this.createContext(undefined, undefined, undefined, ext.path);
 					for (const handler of ext.fileDeleteFallbackHandlers) {
 						try {
 							if (await handler(req, ctx)) return true;
@@ -1704,7 +1710,7 @@ export class ExtensionRunner {
 		const handlers = owner.handlers.get("link_activate");
 		if (!handlers || handlers.length === 0) return true;
 		const event: LinkActivateEvent = { type: "link_activate", url, scheme };
-		const base = this.createContext();
+		const base = this.createContext(undefined, undefined, undefined, owner.path);
 		const ctx: ExtensionContext =
 			ui && ui !== this.#uiContext ? Object.create(base, { ui: { value: ui }, hasUI: { value: true } }) : base;
 		for (const handler of handlers) {
@@ -1783,6 +1789,9 @@ export class ExtensionRunner {
 	 *
 	 * `agent` replaces this runner's identity as `ctx.agent` for work done on behalf of another
 	 * agent that shares the runner (the advisor's toolset, see `ExtensionToolWrapper`).
+	 *
+	 * `extensionPath` (an extension's `path`) names the extension the context is handed to, binding
+	 * `ctx.workspaceLifecycle` to it; without one the host is unbound (unkeyed release gates).
 	 */
 	createContext(
 		model?: Model,
@@ -1794,6 +1803,7 @@ export class ExtensionRunner {
 			onUpdate?: AgentToolUpdateCallback;
 		},
 		agent: ExtensionAgentIdentity = this.agent,
+		extensionPath?: string,
 	): ExtensionContext {
 		const getModel = model ? () => model : this.#getModel;
 		const runEphemeralTurn = this.#runEphemeralTurnFn;
@@ -1808,7 +1818,7 @@ export class ExtensionRunner {
 			getContextUsage: () => this.#getContextUsageFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
 			getAsyncJobSnapshot: () => this.#getAsyncJobSnapshotFn(),
-			workspaceLifecycle: getWorkspaceLifecycleHost(),
+			workspaceLifecycle: this.#workspaceLifecycleFor(extensionPath),
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
 			sessionManager: this.sessionManager,
@@ -1887,6 +1897,11 @@ export class ExtensionRunner {
 		};
 	}
 
+	#workspaceLifecycleFor(extensionPath: string | undefined) {
+		// Unknown or absent path: an unbound host, whose gates always run (never wrongly deduplicated).
+		return getWorkspaceLifecycleHost(this.getLoadedExtensions().find(ext => ext.path === extensionPath)?.resolvedPath);
+	}
+
 	/**
 	 * Request a graceful shutdown. Called by extension tools and event handlers.
 	 */
@@ -1914,9 +1929,10 @@ export class ExtensionRunner {
 		for (const dispose of this.#fileFallbackDisposers.splice(0)) dispose();
 	}
 
-	createCommandContext(): ExtensionCommandContext {
+	/** `extensionPath`: the command's or shortcut's extension, see {@link createContext}. */
+	createCommandContext(extensionPath?: string): ExtensionCommandContext {
 		return {
-			...this.createContext(),
+			...this.createContext(undefined, undefined, undefined, extensionPath),
 			getContextUsage: () => this.#getContextUsageFn(),
 			waitForIdle: () => this.#waitForIdleFn(),
 			newSession: options => this.#newSessionHandler(options),
@@ -1967,6 +1983,7 @@ export class ExtensionRunner {
 						try {
 							const handlerContext = createHandlerContext(
 								ctx,
+								ext,
 								handlerSignal,
 								event.type === "tool_call" || SESSION_BEFORE_EVENTS[event.type] === true ? budget : undefined,
 							);

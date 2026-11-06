@@ -652,7 +652,7 @@ export class ExtensionUiController {
 			if (registeredTool.definition.onSession) {
 				try {
 					await registeredTool.definition.onSession(event, {
-						...runner!.createContext(),
+						...runner!.createContext(undefined, undefined, undefined, registeredTool.extensionPath),
 						ui: uiContext,
 						hasUI: true,
 						compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),

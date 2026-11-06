@@ -4,9 +4,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import {
 	nativeWorkspace,
@@ -19,10 +22,12 @@ import {
 	getWorkspaceLifecycleService,
 	WORKSPACE_LEASE_FILE,
 	type WorkspaceLease,
+	type WorkspaceLifecycleHost,
 	WorkspaceLifecycleService,
 	type WorkspaceReleaseGate,
 } from "@oh-my-pi/pi-coding-agent/task/workspace-lifecycle";
 import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import * as natives from "@oh-my-pi/pi-natives";
 import { postmortem, setWorktreesDir } from "@oh-my-pi/pi-utils";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
@@ -184,6 +189,45 @@ describe("workspace lifecycle host companion", () => {
 		expect(getWorkspaceLifecycleHost()).toBe(host);
 		expect(Object.isFrozen(host)).toBe(true);
 		expect("register" in host).toBe(false);
+	});
+
+	it("binds ctx.workspaceLifecycle to each extension, one identity per extension across sessions", async () => {
+		const runtime = new ExtensionRuntime();
+		const seen: Array<{ name: string; host: WorkspaceLifecycleHost | undefined }> = [];
+		const load = (name: string) =>
+			loadExtensionFromFactory(
+				pi => {
+					pi.on("session_start", (_event, ctx) => {
+						seen.push({ name, host: ctx.workspaceLifecycle });
+					});
+					pi.registerCommand(`${name}-cmd`, { handler: async () => {} });
+				},
+				root,
+				new EventBus(),
+				runtime,
+				name,
+			);
+		const first = new ExtensionRunner(
+			[await load("ext-a"), await load("ext-b")],
+			runtime,
+			root,
+			SessionManager.inMemory(root),
+			{} as never,
+		);
+		await first.emit({ type: "session_start" });
+		// A second session in this thread loads its own instance of the same extension.
+		await new ExtensionRunner([await load("ext-a")], runtime, root, SessionManager.inMemory(root), {} as never).emit({
+			type: "session_start",
+		});
+
+		expect(seen.map(entry => entry.name)).toEqual(["ext-a", "ext-b", "ext-a"]);
+		const [a, b, aAgain] = seen.map(entry => entry.host);
+		expect(a?.apiVersion).toBe(1);
+		expect(b).not.toBe(a);
+		expect(aAgain).toBe(a);
+		expect(first.createCommandContext(first.getCommand("ext-a-cmd")?.extensionPath).workspaceLifecycle).toBe(a);
+		expect(first.createContext().workspaceLifecycle).toBe(getWorkspaceLifecycleHost());
+		expect(getWorkspaceLifecycleHost()).not.toBe(a);
 	});
 
 	it("materialises an explicit baseline exactly, without root dirty edits", async () => {

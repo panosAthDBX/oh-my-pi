@@ -98,7 +98,12 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 	readonly apiVersion = 1 as const;
 	readonly hostVersion = VERSION;
 	readonly #leases = new Map<string, LeaseEntry>();
-	readonly #gates = new Set<WorkspaceReleaseGate>();
+	/**
+	 * Registration order. `key` is the registering extension's resolved path and `origin` its
+	 * thread (undefined = main): every thread loads the same extension, so one key's gates
+	 * run only from the earliest origin still registered; unkeyed gates always run.
+	 */
+	readonly #gates: Array<{ gate: WorkspaceReleaseGate; key?: string; origin?: unknown }> = [];
 	readonly #persisting = new Map<string, Promise<void>>();
 
 	list(): WorkspaceLease[] {
@@ -114,7 +119,7 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 	/** A gated release may still run for this lease: gates are registered and the lease is unsettled. */
 	hasGatedRelease(agentId: string): boolean {
 		const lease = this.#leases.get(agentId)?.lease;
-		return this.#gates.size > 0 && lease !== undefined && !isSettled(lease);
+		return this.#gates.length > 0 && lease !== undefined && !isSettled(lease);
 	}
 
 	/**
@@ -125,7 +130,7 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 	 * not listed: shutdown cannot tell how long that run will take.
 	 */
 	inFlightGatedReleases(): Array<{ agentId: string; settled: Promise<void> }> {
-		if (this.#gates.size === 0) return [];
+		if (this.#gates.length === 0) return [];
 		return [...this.#leases.values()]
 			.filter(entry => entry.lease.state === "releasing")
 			.map(entry => ({ agentId: entry.lease.agentId, settled: entry.settled.promise }));
@@ -155,11 +160,29 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 		await entry.persisting;
 	}
 
-	registerReleaseGate(gate: WorkspaceReleaseGate): () => void {
-		this.#gates.add(gate);
-		return () => {
-			this.#gates.delete(gate);
+	registerReleaseGate(gate: WorkspaceReleaseGate, key?: string, origin?: unknown): () => void {
+		// Re-registering the same gate from the same extension and thread is one registration, as before keys.
+		const entry = this.#gates.find(item => item.gate === gate && item.key === key && item.origin === origin) ?? {
+			gate,
+			key,
+			origin,
 		};
+		if (!this.#gates.includes(entry)) this.#gates.push(entry);
+		return () => {
+			const index = this.#gates.indexOf(entry);
+			if (index >= 0) this.#gates.splice(index, 1);
+		};
+	}
+
+	#activeGates(): WorkspaceReleaseGate[] {
+		const owners = new Map<string, unknown>();
+		return this.#gates
+			.filter(({ key, origin }) => {
+				if (key === undefined) return true;
+				if (!owners.has(key)) owners.set(key, origin);
+				return owners.get(key) === origin;
+			})
+			.map(entry => entry.gate);
 	}
 
 	release(agentId: string, opts: { generation: string; reason: string }): Promise<WorkspaceReleaseResult> {
@@ -262,8 +285,8 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 	}
 
 	/**
-	 * Run every registered gate for this lease. Returns the hold reason, or
-	 * undefined when all gates pass (or none are registered). A superseded
+	 * Run every active registered gate (see {@link registerReleaseGate}) for this lease. Returns the hold
+	 * reason, or undefined when all gates pass (or none are registered). A superseded
 	 * generation holds: its workspace is no longer described by any lease.
 	 */
 	async runGates(agentId: string, generation: string): Promise<string | undefined> {
@@ -272,7 +295,7 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 		// Settled before its gates (a shutdown hold during capture): retain, never re-open as `releasing`.
 		if (isSettled(entry.lease)) return entry.lease.holdReason ?? "lease settled before release";
 		this.#setState(entry, { state: "releasing" });
-		for (const gate of this.#gates) {
+		for (const gate of this.#activeGates()) {
 			try {
 				const verdict = await gate(structuredClone(entry.lease), { trigger: entry.trigger, reason: entry.reason });
 				if (this.#current(agentId, generation) !== entry) return "lease superseded";
@@ -343,12 +366,12 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 }
 
 let globalService: WorkspaceLifecycleServiceApi | undefined;
-let globalHost: WorkspaceLifecycleHost | undefined;
+let globalHosts = new Map<string | undefined, WorkspaceLifecycleHost>();
 
 /** Worker bootstrap installs main's service before creating any sessions. */
 export function installWorkspaceLifecycleService(service: WorkspaceLifecycleServiceApi): void {
 	globalService = service;
-	globalHost = undefined;
+	globalHosts = new Map();
 }
 
 export function getWorkspaceLifecycleService(): WorkspaceLifecycleServiceApi {
@@ -356,15 +379,23 @@ export function getWorkspaceLifecycleService(): WorkspaceLifecycleServiceApi {
 	return globalService;
 }
 
-/** Frozen plugin-facing view (`ctx.workspaceLifecycle`): the apiVersion 1 surface only, one identity per process. */
-export function getWorkspaceLifecycleHost(): WorkspaceLifecycleHost {
+/**
+ * Frozen plugin-facing view (`ctx.workspaceLifecycle`): the apiVersion 1 surface only, one identity per
+ * extension (`extension` = its resolved path) per thread. Gates registered through an extension's view
+ * are keyed by it, so other threads loading the same extension do not run it again; without an
+ * extension, gates are unkeyed and always run.
+ */
+export function getWorkspaceLifecycleHost(extension?: string): WorkspaceLifecycleHost {
+	let host = globalHosts.get(extension);
+	if (host) return host;
 	const service = getWorkspaceLifecycleService();
-	globalHost ??= Object.freeze({
+	host = Object.freeze({
 		apiVersion: service.apiVersion,
 		hostVersion: service.hostVersion,
 		list: () => service.list(),
 		release: (agentId: string, opts: { generation: string; reason: string }) => service.release(agentId, opts),
-		registerReleaseGate: (gate: WorkspaceReleaseGate) => service.registerReleaseGate(gate),
+		registerReleaseGate: (gate: WorkspaceReleaseGate) => service.registerReleaseGate(gate, extension),
 	});
-	return globalHost;
+	globalHosts.set(extension, host);
+	return host;
 }

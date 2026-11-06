@@ -3,6 +3,7 @@ import {
 	getWorkspaceLifecycleHost,
 	getWorkspaceLifecycleService,
 	type WorkspaceLease,
+	type WorkspaceReleaseGate,
 } from "../../src/task/workspace-lifecycle";
 import type { WorkerThreadLink } from "../../src/thread/protocol";
 import { type RpcFrame, RpcLink } from "../../src/thread/rpc";
@@ -14,6 +15,11 @@ export interface WorkspaceProbe {
 	): Promise<{ generation: string; threadId: number }>;
 	finish(id: string, generation: string): Promise<void>;
 	list(): Promise<WorkspaceLease[]>;
+	/**
+	 * Register a worker-local gate through extension `extension`'s plugin-facing host, as that
+	 * extension's session_start would in this thread; it delegates to `gate`. Resolves its unsubscribe.
+	 */
+	registerGate(extension: string, gate: WorkspaceReleaseGate): Promise<() => Promise<void>>;
 }
 export interface WorkspaceTestGlobals {
 	ready(probe: WorkspaceProbe): void;
@@ -52,6 +58,10 @@ port.once("message", (init: { sync: MessagePort; counter: SharedArrayBuffer }) =
 			},
 			finish: async (id, generation) => service.runFinished(id, generation),
 			list: async () => getWorkspaceLifecycleHost().list(),
+			registerGate: async (extension, gate) => {
+				const stop = getWorkspaceLifecycleHost(extension).registerReleaseGate((lease, ctx) => gate(lease, ctx));
+				return async () => stop();
+			},
 		});
 	});
 	port.postMessage({ ready: true });

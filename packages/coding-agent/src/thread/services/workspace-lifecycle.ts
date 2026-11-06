@@ -10,6 +10,7 @@ import {
 import { trackLateCleanup } from "../../utils/late-cleanup";
 import type { RemoteObject, RpcMethod, RpcServe } from "../rpc";
 import type { ThreadService, WorkerPeer } from "../services";
+import { trackWorkerSubscription } from "./support";
 
 const KIND = "workspace-lifecycle";
 type LeaseInit = Omit<WorkspaceLease, "generation" | "ownerPid" | "state">;
@@ -22,6 +23,7 @@ type WorkspaceProtocol = {
 	inFlightGatedReleases: RpcMethod<[], Array<{ agentId: string; settled: () => Promise<void> }>>;
 	whenSettled: RpcMethod<[agentId: string, generation: string], void>;
 	holdAtShutdown: RpcMethod<[agentId: string, reason: string], void>;
+	registerReleaseGate: RpcMethod<[gate: WorkspaceReleaseGate, key?: string], () => void>;
 	release: RpcMethod<[agentId: string, opts: ReleaseOptions], WorkspaceReleaseResult>;
 	register: RpcMethod<[init: LeaseInit, release: () => Promise<void>, ownerStartToken?: string], string>;
 	update: RpcMethod<[agentId: string, generation: string, patch: Partial<WorkspaceLease>], void>;
@@ -57,12 +59,8 @@ class RemoteWorkspaceLifecycle implements WorkspaceLifecycleServiceApi {
 	holdAtShutdown(agentId: string, reason: string): Promise<void> {
 		return this.remote.call("holdAtShutdown", agentId, reason);
 	}
-	/**
-	 * Every thread loads the same extensions, so main's instance already registered this gate.
-	 * Forwarding a worker's copy would run each gate (and its preservation) once per live worker.
-	 */
-	registerReleaseGate(_gate: WorkspaceReleaseGate): () => void {
-		return () => {};
+	registerReleaseGate(gate: WorkspaceReleaseGate, key?: string): () => void {
+		return this.remote.callSync("registerReleaseGate", gate, key);
 	}
 	release(agentId: string, opts: ReleaseOptions): Promise<WorkspaceReleaseResult> {
 		return this.remote.call("release", agentId, opts);
@@ -89,13 +87,14 @@ interface OwnedLease {
 }
 interface WorkerOwnership {
 	leases: Map<string, OwnedLease>;
+	gates: Set<() => void>;
 }
 const owners = new Map<WorkerPeer["threadId"], WorkerOwnership>();
 
 export const workspaceLifecycleThreadService: ThreadService = {
 	name: KIND,
 	installMain(peer): void {
-		const owner: WorkerOwnership = { leases: new Map() };
+		const owner: WorkerOwnership = { leases: new Map(), gates: new Set() };
 		owners.set(peer.threadId, owner);
 		const serve: RpcServe<WorkspaceLifecycleService, WorkspaceProtocol> = {
 			hostVersion: service => service.hostVersion,
@@ -109,6 +108,8 @@ export const workspaceLifecycleThreadService: ThreadService = {
 				})),
 			whenSettled: (service, id, generation) => service.whenSettled(id, generation),
 			holdAtShutdown: (service, id, reason) => service.holdAtShutdown(id, reason),
+			registerReleaseGate: (service, gate, key) =>
+				trackWorkerSubscription(owner.gates, service.registerReleaseGate(gate, key, peer.threadId)),
 			release: (service, id, opts) => service.release(id, opts),
 			register: (service, init, release, token) => {
 				const generation = service.register(init, release, token);
@@ -144,6 +145,7 @@ export const workspaceLifecycleThreadService: ThreadService = {
 		const owner = owners.get(peer.threadId);
 		owners.delete(peer.threadId);
 		if (!owner) return;
+		for (const stop of [...owner.gates]) stop();
 		for (const lease of owner.leases.values()) {
 			// A delayed worker exit must not hold a successor that reused its id.
 			const current = lease.service.list().find(item => item.agentId === lease.agentId);
