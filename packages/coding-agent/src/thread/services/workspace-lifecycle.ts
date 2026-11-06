@@ -101,19 +101,24 @@ export const workspaceLifecycleThreadService: ThreadService = {
 			list: service => service.list(),
 			hasLiveWorkspace: (service, id) => service.hasLiveWorkspace(id),
 			hasGatedRelease: (service, id) => service.hasGatedRelease(id),
-			inFlightGatedReleases: service => service.inFlightGatedReleases().map(entry => ({
-				agentId: entry.agentId,
-				settled: () => entry.settled,
-			})),
+			inFlightGatedReleases: service =>
+				service.inFlightGatedReleases().map(entry => ({
+					agentId: entry.agentId,
+					settled: () => entry.settled,
+				})),
 			whenSettled: (service, id, generation) => service.whenSettled(id, generation),
 			holdAtShutdown: (service, id, reason) => service.holdAtShutdown(id, reason),
-			registerReleaseGate: (service, gate) => trackWorkerSubscription(owner.gates, service.registerReleaseGate(gate)),
+			registerReleaseGate: (service, gate) =>
+				trackWorkerSubscription(owner.gates, service.registerReleaseGate(gate)),
 			release: (service, id, opts) => service.release(id, opts),
 			register: (service, init, release, token) => {
 				const generation = service.register(init, release, token);
 				owner.leases.get(init.agentId)?.release();
 				owner.leases.set(init.agentId, {
-					service, agentId: init.agentId, generation, release: peer.retain?.() ?? (() => {}),
+					service,
+					agentId: init.agentId,
+					generation,
+					release: peer.retain?.() ?? (() => {}),
 				});
 				void service.whenSettled(init.agentId, generation).then(() => {
 					const lease = owner.leases.get(init.agentId);
@@ -127,7 +132,11 @@ export const workspaceLifecycleThreadService: ThreadService = {
 			runFinished: (service, id, generation) => service.runFinished(id, generation),
 			runGates: (service, id, generation) => service.runGates(id, generation),
 		};
-		peer.link.exportClass(KIND, (value): value is WorkspaceLifecycleService => value instanceof WorkspaceLifecycleService, serve);
+		peer.link.exportClass(
+			KIND,
+			(value): value is WorkspaceLifecycleService => value instanceof WorkspaceLifecycleService,
+			serve,
+		);
 	},
 	globals(): WorkspaceLifecycleServiceApi {
 		return getWorkspaceLifecycleService();
@@ -141,17 +150,25 @@ export const workspaceLifecycleThreadService: ThreadService = {
 			// A delayed worker exit must not hold a successor that reused its id.
 			const current = lease.service.list().find(item => item.agentId === lease.agentId);
 			if (current?.generation === lease.generation) {
-				trackLateCleanup(lease.service.holdAtShutdown(lease.agentId, `workspace owner worker exited: ${reason}`)
-					.finally(lease.release), { agentId: lease.agentId, resource: "isolation" });
+				trackLateCleanup(
+					lease.service
+						.holdAtShutdown(lease.agentId, `workspace owner worker exited: ${reason}`)
+						.finally(lease.release),
+					{ agentId: lease.agentId, resource: "isolation" },
+				);
 			} else lease.release();
 		}
 		owner.leases.clear();
 	},
 	installWorker(link): void {
-		link.importClass<RemoteWorkspaceLifecycle, WorkspaceProtocol>(KIND, remote => new RemoteWorkspaceLifecycle(remote));
+		link.importClass<RemoteWorkspaceLifecycle, WorkspaceProtocol>(
+			KIND,
+			remote => new RemoteWorkspaceLifecycle(remote),
+		);
 	},
 	boot(globals): void {
-		if (!(globals instanceof RemoteWorkspaceLifecycle)) throw new Error("Malformed workspace lifecycle thread globals");
+		if (!(globals instanceof RemoteWorkspaceLifecycle))
+			throw new Error("Malformed workspace lifecycle thread globals");
 		installWorkspaceLifecycleService(globals);
 	},
 };

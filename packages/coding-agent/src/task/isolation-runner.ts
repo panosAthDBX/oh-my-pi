@@ -438,10 +438,7 @@ export async function retainIsolationWorkspace(
  * sibling and return the sibling, or `undefined` when the move keeps failing
  * (the workspace then stays where it is).
  */
-export async function vacateIsolationSlot(
-	baseDir: string,
-	assertOwnership?: () => void,
-): Promise<string | undefined> {
+export async function vacateIsolationSlot(baseDir: string, assertOwnership?: () => void): Promise<string | undefined> {
 	const retainedBase = `${baseDir}.retained-${Date.now().toString(36)}-${Math.floor(Math.random() * 2 ** 32).toString(16)}`;
 	// A valid move can still fail transiently (Windows AV/indexer locks);
 	// retry briefly before conceding the deterministic slot.
@@ -576,9 +573,9 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		const assertOwnership = (): void => {
 			if (!generation) return;
 			const baseDir = path.resolve(isolation.baseDir ?? path.dirname(isolation.dir));
-			const successor = lifecycle.list().find(
-				lease => lease.generation !== generation && path.resolve(lease.baseDir) === baseDir,
-			);
+			const successor = lifecycle
+				.list()
+				.find(lease => lease.generation !== generation && path.resolve(lease.baseDir) === baseDir);
 			if (successor) {
 				throw new Error(`Workspace slot now belongs to lease ${successor.generation}; left in place: ${baseDir}`);
 			}

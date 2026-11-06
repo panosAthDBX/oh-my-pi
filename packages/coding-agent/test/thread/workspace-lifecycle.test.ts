@@ -12,7 +12,9 @@ import type { WorkspaceProbe, WorkspaceTestGlobals } from "../fixtures/workspace
 
 it("main gates and inventories worker-owned leases, refuses stale generations, and holds a dead worker's workspace", async () => {
 	using temp = TempDir.createSync("@omp-workspace-thread-");
-	const worker = new Worker(new URL("../fixtures/workspace-lifecycle-worker.ts", import.meta.url).href, { type: "module" });
+	const worker = new Worker(new URL("../fixtures/workspace-lifecycle-worker.ts", import.meta.url).href, {
+		type: "module",
+	});
 	const channel = new MessageChannel();
 	const counter = new SharedArrayBuffer(4);
 	const ready = Promise.withResolvers<void>();
@@ -25,16 +27,28 @@ it("main gates and inventories worker-owned leases, refuses stale generations, a
 	worker.addEventListener("message", onReady);
 	worker.postMessage({ sync: channel.port2, counter }, [channel.port2]);
 	await ready.promise;
-	const link: MainThreadLink = new RpcLink({
-		send: frame => worker.postMessage(frame),
-		listen: handler => {
-			const listener = (event: MessageEvent<RpcFrame>): void => handler(event.data);
-			worker.addEventListener("message", listener);
-			return () => worker.removeEventListener("message", listener);
+	const link: MainThreadLink = new RpcLink(
+		{
+			send: frame => worker.postMessage(frame),
+			listen: handler => {
+				const listener = (event: MessageEvent<RpcFrame>): void => handler(event.data);
+				worker.addEventListener("message", listener);
+				return () => worker.removeEventListener("message", listener);
+			},
 		},
-	}, { name: "main-workspace-fixture", syncReplies: { port: channel.port1, counter: new Int32Array(counter) } });
+		{ name: "main-workspace-fixture", syncReplies: { port: channel.port1, counter: new Int32Array(counter) } },
+	);
 	let holds = 0;
-	const peer: WorkerPeer = { threadId: "w1", link, retain: () => { holds++; return () => { holds--; }; } };
+	const peer: WorkerPeer = {
+		threadId: "w1",
+		link,
+		retain: () => {
+			holds++;
+			return () => {
+				holds--;
+			};
+		},
+	};
 	workspaceLifecycleThreadService.installMain?.(peer);
 	link.handle("ping", nonce => nonce);
 	const connected = Promise.withResolvers<WorkspaceProbe>();
@@ -47,25 +61,50 @@ it("main gates and inventories worker-owned leases, refuses stale generations, a
 		return { ok: false, hold: "main plugin preservation hold" };
 	});
 	try {
-		await link.call("boot", { [workspaceLifecycleThreadService.name]: workspaceLifecycleThreadService.globals?.(peer), test });
+		await link.call("boot", {
+			[workspaceLifecycleThreadService.name]: workspaceLifecycleThreadService.globals?.(peer),
+			test,
+		});
 		const probe = await connected.promise;
 		const init = {
-			agentId: id, keepAlive: true, repoRoot: temp.path(), workspaceDir: temp.path(), baseDir: temp.path(), backend: "fixture",
+			agentId: id,
+			keepAlive: true,
+			repoRoot: temp.path(),
+			workspaceDir: temp.path(),
+			baseDir: temp.path(),
+			backend: "fixture",
 			baseline: { commit: "base", source: "working-tree" as const, nested: "source-working-copy" as const },
 		};
 		const first = await probe.register(init);
 		expect(first.threadId).toBeGreaterThan(0);
 		expect(holds).toBe(1);
-		expect((await probe.list()).find(lease => lease.agentId === id)).toEqual(service.list().find(lease => lease.agentId === id));
-		expect(await service.release(id, { generation: first.generation, reason: "busy" })).toMatchObject({ status: "refused", reason: "active-owner: capture in progress" });
+		expect((await probe.list()).find(lease => lease.agentId === id)).toEqual(
+			service.list().find(lease => lease.agentId === id),
+		);
+		expect(await service.release(id, { generation: first.generation, reason: "busy" })).toMatchObject({
+			status: "refused",
+			reason: "active-owner: capture in progress",
+		});
 		await probe.finish(id, first.generation);
-		expect(await service.release(id, { generation: "stale", reason: "stale" })).toMatchObject({ status: "refused", reason: "stale-generation" });
-		expect(await service.release(id, { generation: first.generation, reason: "preserve" })).toMatchObject({ status: "held", reason: "main plugin preservation hold" });
+		expect(await service.release(id, { generation: "stale", reason: "stale" })).toMatchObject({
+			status: "refused",
+			reason: "stale-generation",
+		});
+		expect(await service.release(id, { generation: first.generation, reason: "preserve" })).toMatchObject({
+			status: "held",
+			reason: "main plugin preservation hold",
+		});
 		expect(seen).toEqual([id]);
 		expect(holds).toBe(0);
-		expect(await Bun.file(path.join(temp.path(), WORKSPACE_LEASE_FILE)).json()).toMatchObject({ generation: first.generation, state: "held" });
+		expect(await Bun.file(path.join(temp.path(), WORKSPACE_LEASE_FILE)).json()).toMatchObject({
+			generation: first.generation,
+			state: "held",
+		});
 		const second = await probe.register(init);
-		expect(await service.release(id, { generation: first.generation, reason: "old" })).toMatchObject({ status: "refused", reason: "stale-generation" });
+		expect(await service.release(id, { generation: first.generation, reason: "old" })).toMatchObject({
+			status: "refused",
+			reason: "stale-generation",
+		});
 		const persisted = Promise.withResolvers<void>();
 		const holdAtShutdown = service.holdAtShutdown.bind(service);
 		// Observe the actual atomic sidecar completion, not a timer or filesystem poll.
@@ -78,8 +117,14 @@ it("main gates and inventories worker-owned leases, refuses stale generations, a
 			await worker.terminate();
 			workspaceLifecycleThreadService.onWorkerExit?.(peer, "test crash");
 			await persisted.promise;
-			expect(await Bun.file(path.join(temp.path(), WORKSPACE_LEASE_FILE)).json()).toMatchObject({ generation: second.generation, state: "held", holdReason: "workspace owner worker exited: test crash" });
-		} finally { hold.mockRestore(); }
+			expect(await Bun.file(path.join(temp.path(), WORKSPACE_LEASE_FILE)).json()).toMatchObject({
+				generation: second.generation,
+				state: "held",
+				holdReason: "workspace owner worker exited: test crash",
+			});
+		} finally {
+			hold.mockRestore();
+		}
 	} finally {
 		stop();
 		link.close("done");

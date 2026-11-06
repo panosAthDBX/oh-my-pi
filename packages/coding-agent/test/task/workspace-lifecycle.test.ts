@@ -8,7 +8,11 @@ import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
-import { nativeWorkspace, prepareIsolationContext, runIsolatedSubprocess } from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
+import {
+	nativeWorkspace,
+	prepareIsolationContext,
+	runIsolatedSubprocess,
+} from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
 import { getTaskSchema } from "@oh-my-pi/pi-coding-agent/task/types";
 import {
 	getWorkspaceLifecycleHost,
@@ -321,7 +325,9 @@ describe("workspace lifecycle host companion", () => {
 					const names = await fs.readdir(path.dirname(old.baseDir));
 					const retained = names.find(name => name.startsWith(`${path.basename(old.baseDir)}.retained-`));
 					expect(retained).toBeString();
-					expect(await Bun.file(path.join(path.dirname(old.baseDir), retained ?? "", "m", "work.txt")).text()).toBe(`${id}\n`);
+					expect(
+						await Bun.file(path.join(path.dirname(old.baseDir), retained ?? "", "m", "work.txt")).text(),
+					).toBe(`${id}\n`);
 				}
 			} finally {
 				resume.resolve();
@@ -685,7 +691,8 @@ describe("workspace lease persistence ownership", () => {
 				const independent = service.register(leaseInit(oldId, independentBase), async () => {});
 				await service.holdAtShutdown(oldId, "independent retained");
 				expect(await Bun.file(path.join(independentBase, WORKSPACE_LEASE_FILE)).json()).toMatchObject({
-					generation: independent, state: "held",
+					generation: independent,
+					state: "held",
 				});
 				const nextId = reuseAgentId ? oldId : `${oldId}-other`;
 				const next = service.register(leaseInit(nextId, baseDir), async () => {});
@@ -703,10 +710,14 @@ describe("workspace lease persistence ownership", () => {
 				pause.resume();
 				await Promise.all([oldSettled, replacementHeld]);
 				expect(await Bun.file(path.join(baseDir, WORKSPACE_LEASE_FILE)).json()).toMatchObject({
-					generation: next, agentId: nextId, state: "held", holdReason: "replacement retained",
+					generation: next,
+					agentId: nextId,
+					state: "held",
+					holdReason: "replacement retained",
 				});
 				expect(await Bun.file(path.join(independentBase, WORKSPACE_LEASE_FILE)).json()).toMatchObject({
-					generation: independent, state: "held",
+					generation: independent,
+					state: "held",
 				});
 			} finally {
 				pause.resume();
