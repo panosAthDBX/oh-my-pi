@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,6 +15,7 @@ import {
 	getWorkspaceLifecycleService,
 	WORKSPACE_LEASE_FILE,
 	type WorkspaceLease,
+	WorkspaceLifecycleService,
 	type WorkspaceReleaseGate,
 } from "@oh-my-pi/pi-coding-agent/task/workspace-lifecycle";
 import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
@@ -282,6 +284,52 @@ describe("workspace lifecycle host companion", () => {
 		await fs.rm(path.join(parent, retained ?? ""), { recursive: true, force: true });
 	});
 
+	for (const sameSlot of [false, true]) {
+		it(`preserves source and successor when superseded inside a gate (same slot: ${sameSlot})`, async () => {
+			const id = sameSlot ? "GateReusedSlot" : "GateReplacedLease";
+			await spawn(id);
+			const old = lease(id);
+			const entered = Promise.withResolvers<void>();
+			const resume = Promise.withResolvers<void>();
+			gate(async () => {
+				entered.resolve();
+				await resume.promise;
+				return { ok: true };
+			});
+			const releasing = host.release(id, { generation: old.generation, reason: "retire old" });
+			await entered.promise;
+			const baseDir = sameSlot ? old.baseDir : path.join(root, `${id}-successor`);
+			const workspaceDir = path.join(baseDir, "m");
+			await fs.mkdir(workspaceDir, { recursive: true });
+			await Bun.write(path.join(workspaceDir, "successor.txt"), "successor source\n");
+			const service = getWorkspaceLifecycleService();
+			const next = service.register({ ...old, baseDir, workspaceDir }, async () => {});
+			await service.holdAtShutdown(id, "successor retained");
+			const sidecar = path.join(baseDir, WORKSPACE_LEASE_FILE);
+			const before = await Bun.file(sidecar).text();
+			try {
+				resume.resolve();
+				const result = await releasing;
+				expect(result.status).toBe("held");
+				expect(await Bun.file(path.join(workspaceDir, "successor.txt")).text()).toBe("successor source\n");
+				expect(await Bun.file(sidecar).text()).toBe(before);
+				expect(lease(id).generation).toBe(next);
+				if (sameSlot) {
+					expect(result.reason).toContain("left in place");
+					expect(await Bun.file(path.join(old.workspaceDir, "work.txt")).text()).toBe(`${id}\n`);
+				} else {
+					const names = await fs.readdir(path.dirname(old.baseDir));
+					const retained = names.find(name => name.startsWith(`${path.basename(old.baseDir)}.retained-`));
+					expect(retained).toBeString();
+					expect(await Bun.file(path.join(path.dirname(old.baseDir), retained ?? "", "m", "work.txt")).text()).toBe(`${id}\n`);
+				}
+			} finally {
+				resume.resolve();
+				await releasing;
+			}
+		});
+	}
+
 	it("holds the workspace when a gate holds", async () => {
 		gate(async () => ({ ok: false, hold: "preservation unverified" }));
 		await spawn("GateHold");
@@ -536,6 +584,137 @@ describe("workspace lifecycle at shutdown", () => {
 		const after = await retained;
 		await fs.rm(path.dirname(after.retainedDir ?? ""), { recursive: true, force: true });
 	});
+});
+
+/** Pause the actual first sidecar rename, leaving subsequent writes to the real filesystem. */
+function pauseLeaseRename(baseDir: string, synchronous = false): { entered: Promise<void>; resume: () => void } {
+	const entered = Promise.withResolvers<void>();
+	const resume = Promise.withResolvers<void>();
+	const rename = fs.rename;
+	if (synchronous) {
+		// Real disk writes with deterministic completion: independent persistence is a barrier, not a timer.
+		const write = Bun.write.bind(Bun);
+		vi.spyOn(Bun, "write").mockImplementation((file, data, options) => {
+			if (
+				typeof file === "string" &&
+				file.startsWith(root) &&
+				file.includes(WORKSPACE_LEASE_FILE) &&
+				typeof data === "string"
+			) {
+				fsSync.writeFileSync(file, data);
+				return Promise.resolve(Buffer.byteLength(data));
+			}
+			return write(file, data, options);
+		});
+	}
+	let paused = false;
+	vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+		if (!paused && String(to) === path.join(baseDir, WORKSPACE_LEASE_FILE)) {
+			paused = true;
+			entered.resolve();
+			await resume.promise;
+		}
+		if (synchronous && String(to).startsWith(root) && String(to).endsWith(WORKSPACE_LEASE_FILE)) {
+			fsSync.renameSync(from, to);
+		} else {
+			await rename(from, to);
+		}
+	});
+	return { entered: entered.promise, resume: resume.resolve };
+}
+
+function leaseInit(agentId: string, baseDir: string): Omit<WorkspaceLease, "generation" | "ownerPid" | "state"> {
+	return {
+		agentId,
+		baseDir,
+		workspaceDir: path.join(baseDir, "m"),
+		repoRoot: repo,
+		backend: "fixture",
+		keepAlive: true,
+		baseline: { commit: firstCommit, source: "working-tree", nested: "source-working-copy" },
+	};
+}
+
+describe("workspace lease persistence ownership", () => {
+	for (const action of ["supersede", "shutdown"] as const) {
+		it(`denies teardown when ${action} occurs during the persistence drain`, async () => {
+			const service = new WorkspaceLifecycleService();
+			const baseDir = path.join(root, `drain-${action}`);
+			await fs.mkdir(baseDir);
+			const pause = pauseLeaseRename(baseDir);
+			const generation = service.register(leaseInit(`Drain-${action}`, baseDir), async () => {});
+			const permission = service.runGates(`Drain-${action}`, generation);
+			await pause.entered;
+			let held: Promise<void> | undefined;
+			try {
+				if (action === "supersede") {
+					const nextBase = `${baseDir}-next`;
+					await fs.mkdir(nextBase);
+					service.register(leaseInit(`Drain-${action}`, nextBase), async () => {});
+				}
+				held = service.holdAtShutdown(`Drain-${action}`, "shutdown while persisting");
+				pause.resume();
+				expect(await permission).toBe(action === "supersede" ? "lease superseded" : "shutdown while persisting");
+				await held;
+			} finally {
+				pause.resume();
+				await permission;
+				await held;
+			}
+		});
+	}
+
+	for (const reuseAgentId of [true, false]) {
+		it(`orders reused-slot writes without blocking distinct paths (reuse agent id: ${reuseAgentId})`, async () => {
+			const service = new WorkspaceLifecycleService();
+			const baseDir = path.join(root, `ordered-${reuseAgentId}`);
+			const independentBase = `${baseDir}-independent`;
+			const barrierBase = `${baseDir}-barrier`;
+			await fs.mkdir(baseDir);
+			await fs.mkdir(independentBase);
+			await fs.mkdir(barrierBase);
+			const pause = pauseLeaseRename(baseDir, true);
+			const oldId = `Ordered-${reuseAgentId}`;
+			const old = service.register(leaseInit(oldId, baseDir), async () => {});
+			service.update(oldId, old, { state: "held", holdReason: "old source retained" });
+			const oldSettled = service.whenSettled(oldId, old);
+			await pause.entered;
+			let replacementHeld: Promise<void> | undefined;
+			try {
+				// Reusing an id on a distinct path must neither block that path nor cancel the old held write.
+				const independent = service.register(leaseInit(oldId, independentBase), async () => {});
+				await service.holdAtShutdown(oldId, "independent retained");
+				expect(await Bun.file(path.join(independentBase, WORKSPACE_LEASE_FILE)).json()).toMatchObject({
+					generation: independent, state: "held",
+				});
+				const nextId = reuseAgentId ? oldId : `${oldId}-other`;
+				const next = service.register(leaseInit(nextId, baseDir), async () => {});
+				replacementHeld = service.holdAtShutdown(nextId, "replacement retained");
+				let replacementSettled = false;
+				void replacementHeld.then(() => {
+					replacementSettled = true;
+				});
+				// This independent lease drains the same synchronous I/O steps after the successor.
+				// A settled successor must not still be vulnerable to the paused predecessor's rename.
+				const barrierId = `${oldId}-barrier`;
+				service.register(leaseInit(barrierId, barrierBase), async () => {});
+				await service.holdAtShutdown(barrierId, "barrier retained");
+				expect(replacementSettled).toBe(false);
+				pause.resume();
+				await Promise.all([oldSettled, replacementHeld]);
+				expect(await Bun.file(path.join(baseDir, WORKSPACE_LEASE_FILE)).json()).toMatchObject({
+					generation: next, agentId: nextId, state: "held", holdReason: "replacement retained",
+				});
+				expect(await Bun.file(path.join(independentBase, WORKSPACE_LEASE_FILE)).json()).toMatchObject({
+					generation: independent, state: "held",
+				});
+			} finally {
+				pause.resume();
+				await oldSettled;
+				await replacementHeld;
+			}
+		});
+	}
 });
 
 describe("task schema baseline", () => {

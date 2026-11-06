@@ -237,7 +237,7 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		return this.#remote.call("release", id, expected, options);
 	}
 
-	dispose(_deadlineAt?: number): Promise<void> {
+	dispose(_deadlineAt?: number, _workspaceDeadlineAt?: number): Promise<void> {
 		return Promise.reject(new Error("The agent lifecycle is torn down by the main thread"));
 	}
 }

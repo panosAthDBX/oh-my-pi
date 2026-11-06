@@ -131,6 +131,27 @@ describe("ovnfs checkout recovery", () => {
 		expect(await readRecord(baseDir)).toEqual(current);
 	});
 
+	it("moves an unreadable checkout record aside instead of treating the slot as free", async () => {
+		const ops: string[] = [];
+		mockDaemon(op => {
+			ops.push(op.op);
+			if (op.op === "new" && op.name) return { checkout: { name: op.name, path: `/mnt/ovnfs/${op.name}` } };
+			throw new Error(op.op);
+		});
+		const repo = path.join(root, "malformed");
+		await fs.mkdir(repo);
+		const baseDir = await plant(repo, "Malformed", STALE, await deadPid());
+		await Bun.write(path.join(baseDir, OVNFS_CHECKOUT_FILE), "{unfinished");
+
+		await ovnfsWorkspace(COMMAND)(repo, "Malformed");
+
+		// Nothing names a checkout to remove, but the record may still stand for one: keep it.
+		expect(ops).not.toContain("rm");
+		const [sibling] = await retainedDirs(baseDir);
+		expect(sibling).toBeString();
+		expect(await Bun.file(path.join(sibling, OVNFS_CHECKOUT_FILE)).text()).toBe("{unfinished");
+	});
+
 	it("replaces a slot once its previous checkout is removed", async () => {
 		const removed: string[] = [];
 		mockDaemon(op => {

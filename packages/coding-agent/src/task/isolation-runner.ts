@@ -415,7 +415,9 @@ export interface RetainedWorkspace {
 export async function retainIsolationWorkspace(
 	isolationDir: string,
 	backend?: natives.IsoBackendKind,
+	assertOwnership?: () => void,
 ): Promise<RetainedWorkspace> {
+	assertOwnership?.();
 	const baseDir = path.dirname(isolationDir);
 	const needsSidecar = backend !== undefined && needsNativeTeardown(backend);
 	let sidecarOk = !needsSidecar;
@@ -427,7 +429,7 @@ export async function retainIsolationWorkspace(
 			sidecarOk = false;
 		}
 	}
-	const retainedBase = await vacateIsolationSlot(baseDir);
+	const retainedBase = await vacateIsolationSlot(baseDir, assertOwnership);
 	return { dir: retainedBase ? path.join(retainedBase, path.basename(isolationDir)) : isolationDir, sidecarOk };
 }
 
@@ -436,11 +438,15 @@ export async function retainIsolationWorkspace(
  * sibling and return the sibling, or `undefined` when the move keeps failing
  * (the workspace then stays where it is).
  */
-export async function vacateIsolationSlot(baseDir: string): Promise<string | undefined> {
+export async function vacateIsolationSlot(
+	baseDir: string,
+	assertOwnership?: () => void,
+): Promise<string | undefined> {
 	const retainedBase = `${baseDir}.retained-${Date.now().toString(36)}-${Math.floor(Math.random() * 2 ** 32).toString(16)}`;
 	// A valid move can still fail transiently (Windows AV/indexer locks);
 	// retry briefly before conceding the deterministic slot.
 	for (let attempt = 0; attempt < 3; attempt++) {
+		assertOwnership?.();
 		try {
 			await fs.rename(baseDir, retainedBase);
 			return retainedBase;
@@ -481,7 +487,7 @@ export interface IsolationWorkspace {
 	/** Ownership record directory when it is separate from the checkout. */
 	readonly baseDir?: string;
 	/** Keep the workspace past the run (its changes could not be captured) and say where it stays. */
-	retain(): Promise<RetainedWorkspace>;
+	retain(assertOwnership?: () => void): Promise<RetainedWorkspace>;
 	/** Tear the workspace down. */
 	cleanup(): Promise<void>;
 }
@@ -496,7 +502,7 @@ export function nativeWorkspace(backend: IsoBackendKind | undefined): OpenWorksp
 		return {
 			dir: handle.mergedDir,
 			backend: formatIsolationBackend(handle.backend),
-			retain: () => retainIsolationWorkspace(handle.mergedDir, handle.backend),
+			retain: assertOwnership => retainIsolationWorkspace(handle.mergedDir, handle.backend, assertOwnership),
 			cleanup: () => cleanupIsolation(handle),
 		};
 	};
@@ -567,7 +573,18 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 	/** Keep the workspace under a unique `.retained-*` sibling and settle the lease as held. */
 	const retain = async (isolation: IsolationWorkspace, holdReason: string): Promise<RetainedWorkspace> => {
 		retainWorkspace = true;
-		const retained = await isolation.retain();
+		const assertOwnership = (): void => {
+			if (!generation) return;
+			const baseDir = path.resolve(isolation.baseDir ?? path.dirname(isolation.dir));
+			const successor = lifecycle.list().find(
+				lease => lease.generation !== generation && path.resolve(lease.baseDir) === baseDir,
+			);
+			if (successor) {
+				throw new Error(`Workspace slot now belongs to lease ${successor.generation}; left in place: ${baseDir}`);
+			}
+		};
+		assertOwnership();
+		const retained = await isolation.retain(assertOwnership);
 		if (generation) {
 			lifecycle.update(opts.agentId, generation, {
 				state: "held",

@@ -149,8 +149,8 @@ class OvnfsWorkspace implements IsolationWorkspace {
 	}
 
 	/** The checkout stays where it is; its record leaves the deterministic slot so a later run with this id keeps it. */
-	async retain(): Promise<RetainedWorkspace> {
-		this.baseDir = (await vacateIsolationSlot(this.baseDir)) ?? this.baseDir;
+	async retain(assertOwnership?: () => void): Promise<RetainedWorkspace> {
+		this.baseDir = (await vacateIsolationSlot(this.baseDir, assertOwnership)) ?? this.baseDir;
 		return { dir: this.dir, baseDir: this.baseDir, sidecarOk: true };
 	}
 

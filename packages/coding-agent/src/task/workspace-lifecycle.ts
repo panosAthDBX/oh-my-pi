@@ -99,6 +99,7 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 	readonly hostVersion = VERSION;
 	readonly #leases = new Map<string, LeaseEntry>();
 	readonly #gates = new Set<WorkspaceReleaseGate>();
+	readonly #persisting = new Map<string, Promise<void>>();
 
 	list(): WorkspaceLease[] {
 		return [...this.#leases.values()].map(entry => structuredClone(entry.lease));
@@ -274,16 +275,22 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 		for (const gate of this.#gates) {
 			try {
 				const verdict = await gate(structuredClone(entry.lease), { trigger: entry.trigger, reason: entry.reason });
+				if (this.#current(agentId, generation) !== entry) return "lease superseded";
+				if (isSettled(entry.lease)) return entry.lease.holdReason ?? "lease settled during release";
 				if (!verdict.ok) return verdict.hold || "release gate hold";
 			} catch (error) {
 				return `release gate failed: ${errorMessage(error)}`;
 			}
 		}
-		// Shutdown may have settled the lease while a gate ran; never tear down after that.
-		if (isSettled(entry.lease)) return entry.lease.holdReason ?? "lease settled during release";
+		// Drain every write queued while waiting; permission belongs only to this exact, unsettled lease.
+		let persisting: Promise<void>;
+		do {
+			persisting = entry.persisting;
+			await persisting;
+			if (this.#current(agentId, generation) !== entry) return "lease superseded";
+			if (isSettled(entry.lease)) return entry.lease.holdReason ?? "lease settled during release";
+		} while (persisting !== entry.persisting);
 		entry.tearingDown = true;
-		// Settle pending sidecar writes so none lands in a dir being torn down.
-		await entry.persisting;
 		return undefined;
 	}
 
@@ -303,8 +310,10 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 		}
 	}
 
-	/** Atomic tmp+rename write, serialized per lease. A released workspace has no dir left to write into. */
+	/** Atomic tmp+rename writes, ordered per lease and destination across slot reuse. */
 	#persist(entry: LeaseEntry): void {
+		// An old explicit release may finish after register replaced it; it cannot publish new state.
+		if (this.#leases.get(entry.lease.agentId) !== entry) return;
 		const snapshot = structuredClone(entry.lease);
 		if (snapshot.state === "released") return;
 		const ref = AgentRegistry.global().get(snapshot.agentId);
@@ -314,8 +323,8 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 			parentAgentId: ref?.parentId,
 			ownerStartToken: entry.ownerStartToken,
 		};
-		entry.persisting = entry.persisting.then(async () => {
-			const file = path.join(snapshot.baseDir, WORKSPACE_LEASE_FILE);
+		const file = path.resolve(snapshot.baseDir, WORKSPACE_LEASE_FILE);
+		const persisting = Promise.all([entry.persisting, this.#persisting.get(file)]).then(async () => {
 			const tmp = `${file}.${process.pid}.${Snowflake.next()}.tmp`;
 			try {
 				await Bun.write(tmp, JSON.stringify(record, null, 2), { createPath: false });
@@ -324,6 +333,11 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 				await fs.rm(tmp, { force: true }).catch(() => undefined);
 				logger.warn("workspace lease persist failed", { agentId: snapshot.agentId, error: errorMessage(error) });
 			}
+		});
+		entry.persisting = persisting;
+		this.#persisting.set(file, persisting);
+		void persisting.then(() => {
+			if (this.#persisting.get(file) === persisting) this.#persisting.delete(file);
 		});
 	}
 }

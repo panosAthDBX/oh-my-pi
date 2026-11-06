@@ -180,8 +180,8 @@ export interface AgentLifecycleApi {
 	ensureLive(id: string): Promise<AgentSessionHandle>;
 	/** Dispose if live and drop timers; `tombstone` keeps a terminal `aborted` row. */
 	release(id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions): Promise<boolean>;
-	/** Tear down every adopted agent. */
-	dispose(deadlineAt?: number): Promise<void>;
+	/** Tear down every adopted agent, with a separate bound for gated workspace releases. Main-thread only. */
+	dispose(deadlineAt?: number, workspaceDeadlineAt?: number): Promise<void>;
 }
 
 export class AgentLifecycleManager implements AgentLifecycleApi {
