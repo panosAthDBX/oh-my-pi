@@ -10,6 +10,7 @@ import {
 	type WorkspaceLease,
 	type WorkspaceReleaseGate,
 } from "../../src/task/workspace-lifecycle";
+import type { ThreadId } from "../../src/thread/identity";
 import type { MainThreadLink } from "../../src/thread/protocol";
 import { type RpcFrame, RpcLink } from "../../src/thread/rpc";
 import type { WorkerPeer } from "../../src/thread/services";
@@ -17,7 +18,7 @@ import { workspaceLifecycleThreadService } from "../../src/thread/services/works
 import type { WorkspaceProbe, WorkspaceTestGlobals } from "../fixtures/workspace-lifecycle-worker";
 
 /** A real Bun worker booted with the workspace lifecycle thread service, linked to this (main) thread. */
-async function startWorker(threadId: string) {
+async function startWorker(threadId: ThreadId) {
 	const worker = new Worker(new URL("../fixtures/workspace-lifecycle-worker.ts", import.meta.url).href, {
 		type: "module",
 	});
@@ -179,7 +180,7 @@ it("main gates and inventories worker-owned leases, refuses stale generations, a
 
 it("runs a gate the same extension registered on main and in a worker once per release", async () => {
 	using temp = TempDir.createSync("@omp-workspace-thread-");
-	const fixture = await startWorker("w-same-extension");
+	const fixture = await startWorker("w2");
 	const extension = path.join(temp.path(), "workspace-lifecycle.ts");
 	const runs: string[] = [];
 	const stopMain = getWorkspaceLifecycleHost(extension).registerReleaseGate(recordingGate(runs, "main"));
@@ -197,7 +198,7 @@ it("runs a gate the same extension registered on main and in a worker once per r
 
 it("runs and honors the hold of a gate from an extension only a worker loaded", async () => {
 	using temp = TempDir.createSync("@omp-workspace-thread-");
-	const fixture = await startWorker("w-worker-only");
+	const fixture = await startWorker("w3");
 	const runs: string[] = [];
 	try {
 		await fixture.probe.registerGate(
@@ -220,7 +221,7 @@ it("runs and honors the hold of a gate from an extension only a worker loaded", 
 
 it("hands an extension's gate to the worker once every main registration of it unsubscribed", async () => {
 	using temp = TempDir.createSync("@omp-workspace-thread-");
-	const fixture = await startWorker("w-takeover");
+	const fixture = await startWorker("w4");
 	const extension = path.join(temp.path(), "workspace-lifecycle.ts");
 	const init = leaseInit(temp.path(), `Takeover-${path.basename(temp.path())}`);
 	const runs: string[] = [];
@@ -247,7 +248,7 @@ it("hands an extension's gate to the worker once every main registration of it u
 
 it("hands an extension's gate back to main when the worker running it exits", async () => {
 	using temp = TempDir.createSync("@omp-workspace-thread-");
-	const fixture = await startWorker("w-exit");
+	const fixture = await startWorker("w5");
 	const extension = path.join(temp.path(), "workspace-lifecycle.ts");
 	const init = leaseInit(temp.path(), `WorkerExit-${path.basename(temp.path())}`);
 	const runs: string[] = [];
