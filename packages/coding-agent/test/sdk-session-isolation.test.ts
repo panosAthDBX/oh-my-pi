@@ -375,6 +375,45 @@ describe("createAgentSession session storage isolation", () => {
 		expect(suspend.mock.invocationCallOrder[0]).toBeLessThan(lifecycleDispose.mock.invocationCallOrder[0]);
 	});
 
+	it("bounds gated workspace releases from teardown start, not from lifecycle dispose", async () => {
+		VibeSessionRegistry.resetGlobalForTests();
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-ws-deadline-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		fs.mkdirSync(cwd, { recursive: true });
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: path.join(tempDir, "agent"),
+			modelRegistry: sharedModelRegistry,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+		const vibeRegistry = VibeSessionRegistry.global();
+		const suspendScope = vibeRegistry.suspendScope.bind(vibeRegistry);
+		let suspendedAt = 0;
+		vi.spyOn(vibeRegistry, "suspendScope").mockImplementation((...args) => {
+			// A pre-dispose teardown step that takes time: spin until the clock ticks (no timer).
+			const start = Date.now();
+			while (Date.now() <= start) {}
+			suspendedAt = Date.now();
+			return suspendScope(...args);
+		});
+		const lifecycleDispose = vi.spyOn(AgentLifecycleManager.global(), "dispose");
+		const startedAt = Date.now();
+
+		await session.dispose();
+
+		const workspaceDeadlineAt = lifecycleDispose.mock.calls[0]?.[1];
+		expect(workspaceDeadlineAt).toBeGreaterThanOrEqual(startedAt + 60_000);
+		expect(workspaceDeadlineAt).toBeLessThan(suspendedAt + 60_000);
+	});
+
 	it("wires the discovered TTSR manager into the created session", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-ttsr-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

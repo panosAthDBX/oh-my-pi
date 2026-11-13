@@ -45,8 +45,19 @@ const AGENT_RELEASE_GRACE_MS = 5000;
  * Shutdown bound for an agent whose isolated workspace release runs
  * workspace-lifecycle gates (plugin preserve+verify takes seconds under load).
  * On expiry the lease is persisted as `held`; the workspace is never removed after that.
+ * Session teardown passes its own start + this bound, so earlier teardown steps count against it.
  */
-const WORKSPACE_RELEASE_BOUND_MS = 60_000;
+export const WORKSPACE_RELEASE_BOUND_MS = 60_000;
+/**
+ * Beyond the workspace bound, how long a signal exit stays open for the held
+ * sidecar write. Signal exits are only extended while gated releases are
+ * pending (see {@link AgentLifecycleManager.dispose}); every other signal exit
+ * keeps the stock postmortem deadline. RPC mode registers no signal teardown
+ * (its graceful path is stdin EOF → dispose): a signal there never disposes the
+ * session, so leases keep their last persisted state and the engine classifies
+ * them by owner liveness (orphan).
+ */
+const HELD_WRITE_HEADROOM_MS = 5000;
 const SHUTDOWN_HOLD_REASON = "shutdown deadline: release incomplete";
 
 async function persistAgentTombstone(sessionFile: string): Promise<void> {
@@ -708,7 +719,11 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 
 	/**
 	 * Teardown everything; disposing the global manager makes its next owner a fresh instance.
-	 * Agents with a gated workspace release wait until `workspaceDeadlineAt`, the rest until `deadlineAt`.
+	 * Agents with a gated workspace release wait until `workspaceDeadlineAt`, the rest until
+	 * `deadlineAt`. Gated releases already in flight outside this manager (explicit releases,
+	 * one-shot teardown) are bounded by `workspaceDeadlineAt` too. A gated lease still
+	 * unsettled at its deadline is persisted `held` before dispose returns. While gated
+	 * releases are pending, a signal exit's postmortem pass is held open for them.
 	 */
 	async dispose(
 		deadlineAt: number = Date.now() + AGENT_RELEASE_GRACE_MS,
@@ -723,26 +738,57 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		// teardown, not stopped: its session records a process exit, so
 		// `omp --restore` goes on with it.
 		const cutOff: AgentReleaseOptions = { dispose: { reason: postmortem.Reason.EXIT } };
-		await Promise.all(
-			ids.map(async id => {
-				const gated = workspaces.hasGatedRelease(id);
-				const until = gated ? workspaceDeadlineAt : deadlineAt;
+		// Snapshot before releasing: the releases below move their own leases to `releasing`.
+		const gatedIds = new Set(ids.filter(id => workspaces.hasGatedRelease(id)));
+		const inFlight = workspaces.inFlightGatedReleases().filter(r => !ids.includes(r.agentId));
+		/** Wait for `work` until `until`; on expiry keep an owned release reachable and hold a gated lease. */
+		const bounded = async (id: string, work: Promise<void>, until: number, gated: boolean, owned: boolean) => {
+			// Expiry is the timer firing, never a wall-clock comparison that could miss it by a millisecond.
+			const timeout = AbortSignal.timeout(Math.max(0, until - Date.now()));
+			try {
+				await untilAborted(timeout, () => work);
+			} catch (error) {
+				if (timeout.aborted) {
+					if (owned) trackLateCleanup(work, { id, resource: "adopted-agent" });
+					if (gated) await workspaces.holdAtShutdown(id, SHUTDOWN_HOLD_REASON);
+				}
+				logger.warn("Agent cleanup exceeded its deadline", {
+					id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		};
+		const gatedWork: Promise<void>[] = [];
+		const work = [
+			...ids.map(id => {
+				const gated = gatedIds.has(id);
 				const running = this.#registry.get(id)?.status === "running";
 				const release = this.release(id, undefined, running ? cutOff : undefined).then(() => {});
-				try {
-					await untilAborted(AbortSignal.timeout(Math.max(0, until - Date.now())), () => release);
-				} catch (error) {
-					if (Date.now() >= until) {
-						trackLateCleanup(release, { id, resource: "adopted-agent" });
-						if (gated) await workspaces.holdAtShutdown(id, SHUTDOWN_HOLD_REASON);
-					}
-					logger.warn("Agent cleanup exceeded its deadline", {
-						id,
-						error: error instanceof Error ? error.message : String(error),
-					});
-				}
+				const waited = bounded(id, release, gated ? workspaceDeadlineAt : deadlineAt, gated, true);
+				if (gated) gatedWork.push(waited);
+				return waited;
 			}),
-		);
+			// Their release work is owned by the explicit caller or the one-shot run; only bound and hold.
+			...inFlight.map(r => {
+				const waited = bounded(r.agentId, r.settled, workspaceDeadlineAt, true, false);
+				gatedWork.push(waited);
+				return waited;
+			}),
+		];
+		// A signal exit's postmortem pass ends at its stock deadline; only gated releases hold it open,
+		// until their bound plus the held write. Registered during a running pass, it joins that pass.
+		const cancelSignalHold =
+			gatedWork.length > 0
+				? postmortem.register("workspace-release-gates", () => Promise.all(gatedWork).then(() => {}), {
+						deadlineMs: Math.max(0, workspaceDeadlineAt - Date.now()) + HELD_WRITE_HEADROOM_MS,
+						waitMessage: "Waiting for workspace release gates",
+					})
+				: undefined;
+		try {
+			await Promise.all(work);
+		} finally {
+			cancelSignalHold?.();
+		}
 		this.#revivals.clear();
 		this.#parks.clear();
 		this.#persistedReviverFactory = undefined;

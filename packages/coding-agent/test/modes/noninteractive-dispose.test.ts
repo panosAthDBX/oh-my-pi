@@ -146,9 +146,15 @@ describe("print mode disposes the session before terminating", () => {
 			},
 		} as unknown as AgentSession;
 
+		let registration: postmortem.CleanupRegistrationOptions | undefined;
 		const registerSpy = spyOn(postmortem, "register").mockImplementation(
-			(_id: string, cb: (reason: postmortem.Reason) => void | Promise<void>) => {
+			(
+				_id: string,
+				cb: (reason: postmortem.Reason) => void | Promise<void>,
+				options?: postmortem.CleanupRegistrationOptions,
+			) => {
 				signalCallback = cb;
+				registration = options;
 				return () => {};
 			},
 		);
@@ -162,5 +168,7 @@ describe("print mode disposes the session before terminating", () => {
 		}
 
 		expect(disposeReason).toBe(postmortem.Reason.SIGTERM);
+		// Stock signal deadline: only gated workspace releases extend a signal exit (agent-lifecycle dispose).
+		expect(registration?.deadlineMs).toBeUndefined();
 	});
 });

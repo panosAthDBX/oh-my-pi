@@ -77,6 +77,8 @@ interface LeaseEntry {
 	runnerBusy: boolean;
 	/** Every gate passed and teardown began: a shutdown hold would describe a workspace being removed. */
 	tearingDown?: boolean;
+	/** Resolves once the lease settles (`released` or `held`). */
+	settled: PromiseWithResolvers<void>;
 }
 
 const STATUS_STATES = { running: "active", idle: "idle", parked: "parked" } as const;
@@ -112,8 +114,30 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 	}
 
 	/**
+	 * Gated releases already in flight (`releasing`) and not owned by the agent
+	 * lifecycle: explicit releases, whose agent was already released, and
+	 * one-shot runs tearing down in their own run. `settled` resolves when the
+	 * lease settles. A lease still before its release (active one-shot run) is
+	 * not listed: shutdown cannot tell how long that run will take.
+	 */
+	inFlightGatedReleases(): Array<{ agentId: string; settled: Promise<void> }> {
+		if (this.#gates.size === 0) return [];
+		return [...this.#leases.values()]
+			.filter(entry => entry.lease.state === "releasing")
+			.map(entry => ({ agentId: entry.lease.agentId, settled: entry.settled.promise }));
+	}
+
+	/**
 	 * Process shutdown gave up on this lease's release: settle it as `held` and
-	 * wait for the sidecar write. A late gate pass then holds instead of removing.
+	 * wait for the sidecar write. A late release then holds instead of removing,
+	 * whether it is still before its gates or inside one (see {@link runGates}).
+	 *
+	 * Accepted gaps, left non-terminal for the engine's dead-owner (orphan)
+	 * classification: a lease already tearing down keeps `releasing` (a partly
+	 * removed workspace must not be described as held); a failed sidecar write is
+	 * only logged; an exit between a late retain's rename and its lease update
+	 * leaves the `.retained-*` sidecar with the previous paths. The tmp+rename
+	 * write is atomic for a process exit, not for power loss (no fsync).
 	 */
 	async holdAtShutdown(agentId: string, holdReason: string): Promise<void> {
 		const entry = this.#leases.get(agentId);
@@ -199,6 +223,7 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 			persisting: Promise.resolve(),
 			ownerStartToken,
 			runnerBusy: true,
+			settled: Promise.withResolvers<void>(),
 		};
 		this.#leases.get(init.agentId)?.unsubscribe?.();
 		this.#leases.set(init.agentId, entry);
@@ -233,6 +258,8 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 	async runGates(agentId: string, generation: string): Promise<string | undefined> {
 		const entry = this.#current(agentId, generation);
 		if (!entry) return "lease superseded";
+		// Settled before its gates (a shutdown hold during capture): retain, never re-open as `releasing`.
+		if (isSettled(entry.lease)) return entry.lease.holdReason ?? "lease settled before release";
 		this.#setState(entry, { state: "releasing" });
 		for (const gate of this.#gates) {
 			try {
@@ -257,11 +284,13 @@ export class WorkspaceLifecycleService implements WorkspaceLifecycleHost {
 
 	#setState(entry: LeaseEntry, patch: Partial<WorkspaceLease>): void {
 		Object.assign(entry.lease, patch);
+		this.#persist(entry);
 		if (isSettled(entry.lease)) {
 			entry.unsubscribe?.();
 			entry.unsubscribe = undefined;
+			// After the settled sidecar write, so a shutdown waiting on it never exits first.
+			void entry.persisting.then(() => entry.settled.resolve());
 		}
-		this.#persist(entry);
 	}
 
 	/** Atomic tmp+rename write, serialized per lease. A released workspace has no dir left to write into. */

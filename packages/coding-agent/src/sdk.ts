@@ -188,7 +188,7 @@ import type { MnemopiSessionStateApi } from "./mnemopi/state";
 import autolearnCaptureRefused from "./prompts/system/autolearn-capture-refused.md" with { type: "text" };
 import mcpXdevGuidanceTemplate from "./prompts/system/mcp-xdev-guidance.md" with { type: "text" };
 import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
-import { AgentLifecycleManager } from "./registry/agent-lifecycle";
+import { AgentLifecycleManager, WORKSPACE_RELEASE_BOUND_MS } from "./registry/agent-lifecycle";
 import {
 	type AgentKind,
 	type AgentRef,
@@ -6110,6 +6110,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const originalDispose = session.dispose.bind(session);
 			let tinyClientReleased = false;
 			session.dispose = async (disposeOptions?: AgentSessionDisposeOptions) => {
+				// Gated workspace releases are bounded from teardown start: the steps before
+				// lifecycle dispose count against the bound instead of extending the exit.
+				const workspaceDeadlineAt = Date.now() + WORKSPACE_RELEASE_BOUND_MS;
 				try {
 					// Reject new session work (eval starts) the moment disposal
 					// begins — the lifecycle await below opens an async gap before
@@ -6131,7 +6134,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							getActiveModelString,
 						};
 						await vibeRegistry.suspendScope(vibeRegistry.ownerScope(vibeParentSession), scopedAsyncJobManager);
-						await AgentLifecycleManager.global().dispose();
+						await AgentLifecycleManager.global().dispose(undefined, workspaceDeadlineAt);
 					}
 					await originalDispose(disposeOptions);
 				} finally {

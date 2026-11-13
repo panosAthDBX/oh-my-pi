@@ -18,7 +18,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/task/workspace-lifecycle";
 import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
 import * as natives from "@oh-my-pi/pi-natives";
-import { setWorktreesDir } from "@oh-my-pi/pi-utils";
+import { postmortem, setWorktreesDir } from "@oh-my-pi/pi-utils";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 
 const host = getWorkspaceLifecycleHost();
@@ -99,6 +99,8 @@ interface SpawnOptions {
 	/** Runs inside the fake child while its registry status is `running`. */
 	whileRunning?: (worktree: string) => Promise<void>;
 	onSubprocessResult?: () => void;
+	/** The child session's dispose (the first step of a native release, before capture and gates). */
+	sessionDispose?: () => Promise<void>;
 }
 
 /** Real isolation runner + lifecycle; only the model subprocess is faked. */
@@ -109,7 +111,7 @@ async function spawn(id: string, opts: SpawnOptions = {}): Promise<SingleResult>
 	const session = {
 		prepareForHeadlessAdvisorDrain: () => {},
 		waitForAdvisorCatchup: async () => true,
-		dispose: async () => {},
+		dispose: opts.sessionDispose ?? (async () => {}),
 	} as unknown as AgentSession;
 	const base: SingleResult = {
 		index: 0,
@@ -402,6 +404,20 @@ describe("workspace lifecycle host companion", () => {
 	});
 });
 
+/** Resolves with the lease once the runner retains its workspace (its `update` carrying `retainedDir`). */
+function retainedLease(id: string): Promise<WorkspaceLease> {
+	const service = getWorkspaceLifecycleService();
+	const update = service.update.bind(service);
+	const { promise, resolve } = Promise.withResolvers<WorkspaceLease>();
+	vi.spyOn(service, "update").mockImplementation((agentId, generation, patch) => {
+		update(agentId, generation, patch);
+		if (agentId === id && patch.retainedDir) resolve(lease(id));
+	});
+	return promise;
+}
+
+const SHUTDOWN_HELD = { state: "held", holdReason: "shutdown deadline: release incomplete" };
+
 describe("workspace lifecycle at shutdown", () => {
 	it("waits past the agent grace for a slow gated release, then removes", async () => {
 		// Real time on purpose: dispose bounds releases with AbortSignal.timeout, which fake timers do not drive.
@@ -425,17 +441,99 @@ describe("workspace lifecycle at shutdown", () => {
 		await spawn("StuckGate");
 		const before = lease("StuckGate");
 		await AgentLifecycleManager.global().dispose(Date.now(), Date.now() + 300);
-		const held = { state: "held", holdReason: "shutdown deadline: release incomplete" };
-		expect(lease("StuckGate")).toMatchObject(held);
-		expect(await Bun.file(path.join(before.baseDir, WORKSPACE_LEASE_FILE)).json()).toMatchObject(held);
+		expect(lease("StuckGate")).toMatchObject(SHUTDOWN_HELD);
+		expect(await Bun.file(path.join(before.baseDir, WORKSPACE_LEASE_FILE)).json()).toMatchObject(SHUTDOWN_HELD);
 		expect(await Bun.file(path.join(before.workspaceDir, "work.txt")).text()).toBe("StuckGate\n");
-		// The late gate pass must keep the workspace (retained), not delete it. The late
-		// cleanup is tracked internally with no exposed promise: wait for its retain.
+		// The late gate pass must keep the workspace (retained), not delete it.
+		const retained = retainedLease("StuckGate");
 		finishGate();
-		for (let i = 0; i < 100 && !lease("StuckGate").retainedDir; i++) await Bun.sleep(50);
-		const after = lease("StuckGate");
-		expect(after).toMatchObject(held);
+		const after = await retained;
+		expect(after).toMatchObject(SHUTDOWN_HELD);
 		expect(await Bun.file(path.join(after.retainedDir ?? "", "work.txt")).text()).toBe("StuckGate\n");
+		await fs.rm(path.dirname(after.retainedDir ?? ""), { recursive: true, force: true });
+	});
+
+	it("a hold that lands before the gates start is never overwritten, and the workspace is retained", async () => {
+		const gateCalls: string[] = [];
+		gate(async l => {
+			gateCalls.push(l.agentId);
+			return { ok: true };
+		});
+		const { promise: stall, resolve: unstall } = Promise.withResolvers<void>();
+		await spawn("PreGate", { sessionDispose: () => stall });
+		const before = lease("PreGate");
+		await AgentLifecycleManager.global().dispose(Date.now(), Date.now() + 300);
+		expect(gateCalls).toEqual([]);
+		expect(await Bun.file(path.join(before.baseDir, WORKSPACE_LEASE_FILE)).json()).toMatchObject(SHUTDOWN_HELD);
+		const retained = retainedLease("PreGate");
+		unstall();
+		const after = await retained;
+		expect(after).toMatchObject(SHUTDOWN_HELD);
+		expect(gateCalls).toEqual([]);
+		expect(await Bun.file(path.join(after.retainedDir ?? "", "work.txt")).text()).toBe("PreGate\n");
+		const persisted = await Bun.file(path.join(path.dirname(after.retainedDir ?? ""), WORKSPACE_LEASE_FILE)).json();
+		expect(persisted).toMatchObject(SHUTDOWN_HELD);
+		await fs.rm(path.dirname(after.retainedDir ?? ""), { recursive: true, force: true });
+	});
+
+	it("bounds and holds an explicit release already in flight when shutdown starts", async () => {
+		const { promise: gateDone, resolve: finishGate } = Promise.withResolvers<void>();
+		gate(async () => {
+			await gateDone;
+			return { ok: true };
+		});
+		await spawn("ExplicitStuck");
+		const before = lease("ExplicitStuck");
+		const explicit = host.release("ExplicitStuck", { generation: before.generation, reason: "retire" });
+		await AgentLifecycleManager.global().dispose(Date.now(), Date.now() + 300);
+		expect(lease("ExplicitStuck")).toMatchObject(SHUTDOWN_HELD);
+		expect(await Bun.file(path.join(before.baseDir, WORKSPACE_LEASE_FILE)).json()).toMatchObject(SHUTDOWN_HELD);
+		finishGate();
+		const result = await explicit;
+		expect(result).toMatchObject({ status: "held", reason: SHUTDOWN_HELD.holdReason });
+		expect(await Bun.file(path.join(result.lease?.retainedDir ?? "", "work.txt")).text()).toBe("ExplicitStuck\n");
+		await fs.rm(path.dirname(result.lease?.retainedDir ?? ""), { recursive: true, force: true });
+	});
+
+	it("keeps the short grace for an adopted agent without a lease while gates are registered", async () => {
+		gate(async () => ({ ok: true }));
+		const { promise: never } = Promise.withResolvers<void>();
+		const session = { dispose: () => never } as unknown as AgentSession;
+		AgentRegistry.global().register({ id: "NoLease", displayName: "NoLease", kind: "sub", session, status: "idle" });
+		AgentLifecycleManager.global().adopt("NoLease", { idleTtlMs: 0 });
+		// The workspace bound stays at its 60 s default: waiting on it would exceed this test's 5 s timeout.
+		await AgentLifecycleManager.global().dispose(Date.now() + 100);
+		expect(host.list().some(l => l.agentId === "NoLease")).toBe(false);
+	});
+
+	it("does not extend a signal exit when no release gate is registered", async () => {
+		await spawn("NoGateLease");
+		const before = lease("NoGateLease");
+		const register = vi.spyOn(postmortem, "register");
+		await AgentLifecycleManager.global().dispose();
+		expect(register.mock.calls.some(([id]) => id === "workspace-release-gates")).toBe(false);
+		expect(lease("NoGateLease").state).toBe("released");
+		expect(await exists(before.baseDir)).toBe(false);
+	});
+
+	it("holds a signal exit open for a gated unsettled release, bounded from the given deadline", async () => {
+		const { promise: gateDone, resolve: finishGate } = Promise.withResolvers<void>();
+		gate(async () => {
+			await gateDone;
+			return { ok: true };
+		});
+		await spawn("SignalHold");
+		const register = vi.spyOn(postmortem, "register");
+		await AgentLifecycleManager.global().dispose(Date.now(), Date.now() + 300);
+		const hold = register.mock.calls.find(([id]) => id === "workspace-release-gates");
+		// Remaining workspace bound (≤ 300 ms) plus the held-write headroom, announced to the user.
+		expect(hold?.[2]?.waitMessage).toBe("Waiting for workspace release gates");
+		expect(hold?.[2]?.deadlineMs).toBeGreaterThan(5000);
+		expect(hold?.[2]?.deadlineMs).toBeLessThanOrEqual(5300);
+		expect(lease("SignalHold")).toMatchObject(SHUTDOWN_HELD);
+		const retained = retainedLease("SignalHold");
+		finishGate();
+		const after = await retained;
 		await fs.rm(path.dirname(after.retainedDir ?? ""), { recursive: true, force: true });
 	});
 });
