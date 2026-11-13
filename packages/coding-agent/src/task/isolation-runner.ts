@@ -348,6 +348,8 @@ interface RunChanges {
 	delta(): Promise<DeltaPatchResult>;
 	/** The baseline the workspace opened in, for branch commits. */
 	baseline(): Promise<WorktreeBaseline>;
+	/** HEAD of the baseline taken at start; absent when the workspace keeps its own starting state. */
+	headCommit?: string;
 }
 
 /**
@@ -363,6 +365,7 @@ async function trackChanges(workspace: IsolationWorkspace, repoRoot: string, fro
 		return {
 			delta: () => captureDeltaPatch(workspace.dir, baseline),
 			baseline: async () => baseline,
+			headCommit: baseline.root.headCommit,
 		};
 	}
 	let pending: Promise<WorktreeBaseline> | undefined;
@@ -384,6 +387,19 @@ async function trackChanges(workspace: IsolationWorkspace, repoRoot: string, fro
 		},
 		baseline,
 	};
+}
+
+/**
+ * The lease's baseline commit for a workspace that took no baseline at start (an ovnfs
+ * capture): its checkout's HEAD when it reads as a repository, else "" — lease metadata
+ * must never fail the run.
+ */
+async function checkoutHead(dir: string): Promise<string> {
+	try {
+		return (await vcs.git(dir)?.headSha()) ?? "";
+	} catch {
+		return "";
+	}
 }
 
 /**
@@ -744,7 +760,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 							nested: "source-working-copy",
 						}
 					: {
-							commit: (await vcs.requireGit(isolationDir).headSha()) ?? "",
+							commit: runChanges.headCommit ?? (await checkoutHead(isolationDir)),
 							source: "working-tree",
 							nested: "source-working-copy",
 						},
