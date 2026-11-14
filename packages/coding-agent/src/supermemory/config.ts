@@ -16,6 +16,7 @@ import {
 	cfgSupermemoryAutoRecall,
 	cfgSupermemoryAutoRetain,
 	cfgSupermemoryRecallLimit,
+	cfgSupermemoryRecallTimeoutMs,
 	cfgSupermemoryRetainEveryNTurns,
 	cfgSupermemoryScoping,
 	cfgSupermemorySearchMode,
@@ -40,6 +41,8 @@ export interface SupermemoryConfig {
 	recallLimit: number;
 	threshold: number;
 	searchMode: SupermemorySearchMode;
+	/** Per-request bound (ms) on automatic first-turn and compaction recall. */
+	recallTimeoutMs: number;
 }
 
 export type ConfiguredSupermemoryConfig = SupermemoryConfig & {
@@ -83,6 +86,7 @@ export function loadSupermemoryConfig(settings: Settings): SupermemoryConfig {
 		recallLimit: Math.floor(clamp(cfgSupermemoryRecallLimit.get(settings), 1, 50)),
 		threshold: clamp(cfgSupermemoryThreshold.get(settings), 0, 1),
 		searchMode: cfgSupermemorySearchMode.get(settings),
+		recallTimeoutMs: Math.floor(clamp(cfgSupermemoryRecallTimeoutMs.get(settings), 500, 60_000)),
 	};
 }
 

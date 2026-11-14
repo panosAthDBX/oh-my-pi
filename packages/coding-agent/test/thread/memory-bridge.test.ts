@@ -246,6 +246,7 @@ describe("memory thread service", () => {
 				recallLimit: 5,
 				threshold: 0.5,
 				searchMode: "hybrid",
+				recallTimeoutMs: 4_000,
 			},
 			namespace: "omp-global",
 			automatic: true,

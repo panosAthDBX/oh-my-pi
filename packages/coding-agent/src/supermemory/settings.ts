@@ -79,3 +79,13 @@ export const cfgSupermemorySearchMode = register({
 	values: ["hybrid", "memories"] as const,
 	default: "hybrid",
 });
+
+/**
+ * Per-request bound (ms) on automatic first-turn and compaction recall, clamped to 500..60000 by
+ * `loadSupermemoryConfig`; the recall/retain/memory_edit tools keep the client's 15 s timeout.
+ */
+export const cfgSupermemoryRecallTimeoutMs = register({
+	id: "supermemory.recallTimeoutMs",
+	type: "number",
+	default: 4_000,
+});

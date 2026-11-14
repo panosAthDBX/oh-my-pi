@@ -17,7 +17,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 
 const CONFIGURED = { "memory.backend": "supermemory" };
 
-/** Per-test agent dir: the backend drains `<agentDir>/supermemory-outbox` on start and dispose. */
+/** Per-test agent dir: the backend drains `<agentDir>/supermemory-outbox` on start. */
 let temp: TempDir;
 
 function makeSession(options: { settings?: Record<string, unknown>; cwd?: string } = {}) {
@@ -333,6 +333,14 @@ describe("supermemoryBackend", () => {
 		expect(session.getSupermemorySessionState()?.lastRecallSnippet).toBeUndefined();
 		expect(fresh?.commit()).toBe(true);
 		expect(session.getSupermemorySessionState()?.lastRecallSnippet).toBe(fresh?.context);
+		// The committed recall is what a rebuilt system prompt replays.
+		const instructions = await supermemoryBackend.buildDeveloperInstructions(
+			"/tmp",
+			"/tmp",
+			session.settings,
+			session as never,
+		);
+		expect(instructions).toContain(fresh?.context ?? "missing");
 		expect(await supermemoryBackend.beforeAgentStartPrompt!(session as never, "second", undefined)).toBeUndefined();
 		expect(profile).toHaveBeenCalledTimes(2);
 	});
@@ -512,6 +520,52 @@ describe("supermemoryBackend", () => {
 		reply.resolve({ matches: ["m1"], errors: [] });
 		await Promise.all([flushing, forgetting]);
 		expect(flushed).toBe(true);
+	});
+
+	it("dispose with no write in flight sends nothing; a retain left on disk is delivered at the next start", async () => {
+		const create = vi
+			.spyOn(SupermemoryClient.prototype, "addDocument")
+			.mockRejectedValueOnce(new Error("Supermemory request failed with HTTP 503."))
+			.mockResolvedValue({ id: "d", status: "queued" });
+		const session = makeSession();
+		await start(session);
+		const state = session.getSupermemorySessionState();
+		await state?.enqueueRetain("call-1", [{ content: "queued fact", source: "t" }]);
+		await state?.flush();
+		expect(create).toHaveBeenCalledTimes(1);
+
+		// Shutdown starts no delivery: work begun after the event loop drained can end the process mid-dispose.
+		await state?.dispose();
+		expect(create).toHaveBeenCalledTimes(1);
+
+		await start(session);
+		await session.getSupermemorySessionState()?.flush();
+		expect(create).toHaveBeenCalledTimes(2);
+		expect(create.mock.calls[1]?.[1]?.content).toBe("queued fact");
+	});
+
+	it("dispose waits for a retain upload that is still running", async () => {
+		const reply = Promise.withResolvers<{ id: string; status: string }>();
+		const sent = Promise.withResolvers<void>();
+		vi.spyOn(SupermemoryClient.prototype, "addDocument").mockImplementation(() => {
+			sent.resolve();
+			return reply.promise;
+		});
+		const session = makeSession();
+		await start(session);
+		const state = session.getSupermemorySessionState();
+		await state?.enqueueRetain("call-1", [{ content: "queued fact", source: "t" }]);
+		await sent.promise;
+		let disposed = false;
+		const disposing = state?.dispose().then(() => {
+			disposed = true;
+		});
+		// One macrotask turn lets an unblocked dispose settle while the upload above is still pending.
+		await Bun.sleep(0);
+		expect(disposed).toBe(false);
+		reply.resolve({ id: "d", status: "queued" });
+		await disposing;
+		expect(disposed).toBe(true);
 	});
 
 	it("re-sends the last window when a manual continuation adds an answer without a new user turn", async () => {
@@ -1377,5 +1431,45 @@ describe("supermemoryBackend", () => {
 			"Supermemory memories have no importance",
 		);
 		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+
+	it("bounds automatic recall by supermemory.recallTimeoutMs against a hanging server; a manual search keeps the request timeout", async () => {
+		const server = Bun.serve({ port: 0, fetch: () => Promise.withResolvers<Response>().promise });
+		try {
+			Bun.env.SUPERMEMORY_BASE_URL = server.url.origin;
+			// Well under the 4 s default, so the elapsed time shows the setting was read.
+			const session = makeSession({ settings: { "supermemory.recallTimeoutMs": 1_000 } });
+			await start(session);
+			const state = session.getSupermemorySessionState();
+			const manual = new AbortController();
+			let manualSettled = false;
+			const manualSearch = state?.search("q", undefined, manual.signal).finally(() => {
+				manualSettled = true;
+			});
+			const started = Date.now();
+			const [firstTurn, compaction] = await Promise.all([
+				supermemoryBackend.beforeAgentStartPrompt!(session as never, "first", undefined),
+				supermemoryBackend.preCompactionContext!(
+					[{ role: "user", content: "how do we build?" }] as never,
+					session.settings,
+					session as never,
+				),
+			]);
+			const elapsed = Date.now() - started;
+			expect(firstTurn).toBeUndefined();
+			expect(compaction).toBeUndefined();
+			expect(elapsed).toBeGreaterThanOrEqual(900);
+			expect(elapsed).toBeLessThan(3_500);
+			expect(session.notices).toEqual(["Memory recall failed: Supermemory request timed out."]);
+			// The failed recall did not commit, so the next turn tries again.
+			expect(state?.hasRecalledForFirstTurn).toBe(false);
+
+			await Bun.sleep(500);
+			expect(manualSettled).toBe(false);
+			manual.abort();
+			await expect(manualSearch).rejects.toThrow("cancelled");
+		} finally {
+			server.stop(true);
+		}
 	});
 });
