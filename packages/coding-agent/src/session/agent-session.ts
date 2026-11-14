@@ -10062,7 +10062,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// maintenance, while the live deltas are consumed only after maintenance:
 			// promotion/summary can rebuild the base prompt and clear a roster delta
 			// it subsumes, avoiding a contradictory materialized notice.
-			const xdevMountNoticeIndex = messages.length;
+			let xdevMountNoticeIndex = messages.length;
 			messages.push(message);
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this.#pendingNextTurnMessages) {
@@ -10162,7 +10162,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					const eager = messages.findIndex(
 						candidate => candidate.role === "custom" && candidate.customType === EAGER_TODO_PRELUDE_MESSAGE_TYPE,
 					);
-					if (eager >= 0) messages.splice(eager, 1);
+					if (eager >= 0) {
+						messages.splice(eager, 1);
+						// The reminder is a prepended prelude: keep the reserved notice slot ahead of the user message.
+						if (eager < xdevMountNoticeIndex) xdevMountNoticeIndex--;
+					}
 				}
 			}
 			// Consume the xd:// notice only when its previewed revision still holds.

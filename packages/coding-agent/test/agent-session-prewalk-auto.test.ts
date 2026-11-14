@@ -13,6 +13,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionTools } from "@oh-my-pi/pi-coding-agent/session/session-tools";
 import { cfgPrewalkAuto } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { EAGER_TODO_PRELUDE_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/todo-tracker";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
@@ -312,6 +313,33 @@ describe("AgentSession auto-prewalk", () => {
 
 			expect(f.customs[0]?.includes(EAGER_TODO_PRELUDE_MESSAGE_TYPE)).toBe(keeps);
 			expect(f.nudges[0]?.includes("prewalk-plan")).toBe(!keeps);
+		});
+
+		it("an arm that drops the eager todo reminder keeps a pending tool-roster notice ahead of the task", async () => {
+			stubJudge([PREWALK]);
+			vi.spyOn(SessionTools.prototype, "takePendingToolRosterNotice").mockReturnValueOnce({
+				role: "custom",
+				customType: "tool-roster-notice",
+				content: "Tools added: write",
+				details: { added: ["write"], removed: [] },
+				attribution: "agent",
+				display: false,
+				timestamp: Date.now(),
+			});
+			const f = createFixture(cycle(), { auto: "on", todoEager: "preferred" });
+
+			await f.session.prompt(TASK);
+
+			expect(f.customs[0]).not.toContain(EAGER_TODO_PRELUDE_MESSAGE_TYPE);
+			const messages = f.session.agent.state.messages;
+			const noticeIndex = messages.findIndex(
+				message => message.role === "custom" && message.customType === "tool-roster-notice",
+			);
+			const taskIndex = messages.findIndex(
+				message => message.role === "user" && JSON.stringify(message.content).includes(TASK),
+			);
+			expect(noticeIndex).toBeGreaterThanOrEqual(0);
+			expect(noticeIndex).toBeLessThan(taskIndex);
 		});
 
 		it("on stays quiet when the active model already is the target", async () => {
