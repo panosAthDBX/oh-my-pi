@@ -388,6 +388,13 @@
 - Language servers now recognize edits made shortly after a file is created, including on macOS.
 - Bash commands displayed in the Pseudo shell view now remain accurate while streaming through heredocs, substitutions, loops, continuations, arithmetic expressions, and background execution.
 - Resuming a session or reviving a subagent after a retry fallback with a thinking suffix (e.g. `:xhigh`) now restores the primary model's own thinking level instead of keeping the fallback's ([#19273](https://github.com/can1357/oh-my-pi/issues/19273)).
+## Local custom build (not an upstream release): Supermemory v5 and workspace-lifecycle
+
+These entries describe local customisations carried on top of upstream 18.20.0; they are not part of any upstream version below.
+
+### Added
+
+- Added the `supermemory` memory backend on the Supermemory v5 namespace API: first-turn recall (profile facts with editable ids, inferred facts marked `[inferred]`), recall in compaction summaries, periodic retention (retried after resume), `recall`/`retain`/`learn`/`memory_edit` (including a dry-run `preview_forget` by meaning), `read memory://<id>` with version history and source document, writes that survive outages, subagents that share the parent's memory, and a `SUPERMEMORY_NAMESPACE` override ([#18755](https://github.com/can1357/oh-my-pi/pull/18755) by [@panosAthDBX](https://github.com/panosAthDBX))
 
 ## [18.20.0] - 2026-11-12
 
