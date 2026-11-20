@@ -334,7 +334,7 @@ export class SupermemorySessionState implements SupermemorySessionStateApi {
 		if (!this.automatic) return;
 		this.#unsubscribe = this.session.subscribe(event => {
 			if (
-				(event.type === "agent_start" || event.type === "agent_end") &&
+				(event.type === "agent_start" || event.type === "agent_pause" || event.type === "agent_end") &&
 				this.#config.autoRetain &&
 				!this.#hasCursor
 			) {
@@ -342,10 +342,14 @@ export class SupermemorySessionState implements SupermemorySessionStateApi {
 				// pre-cursor on resume, which skips every turn it already holds.
 				this.#appendCursor(this.lastRetainedTurn, this.#retainedMessages, this.#windowStart);
 			}
+			if (event.type === "agent_pause") {
+				// A pause is followed by the agent's own continuation; closing the window now would leave
+				// that continuation's answer out of every window. Outbox delivery may still make progress.
+				void this.drainOutbox();
+				return;
+			}
 			if (event.type !== "agent_end") return;
-			// A non-terminal settle is followed by the agent's own continuation; closing the window now
-			// would leave that continuation's answer out of every window.
-			if (this.#config.autoRetain && event.isTerminal !== false) {
+			if (this.#config.autoRetain) {
 				// Snapshot the settled history now: a job queued behind a slow upload must not read a
 				// turn that started afterwards and close its window before the answer exists.
 				// Every terminal settle: a manual continuation can extend the last window without a user turn.

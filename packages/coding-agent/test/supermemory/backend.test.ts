@@ -78,9 +78,16 @@ function makeSession(options: { settings?: Record<string, unknown>; cwd?: string
 			} as never);
 		},
 		/** Dispatches `agent_end` without waiting for the retention it starts. */
-		emitEnd(isTerminal?: boolean) {
+		emitEnd() {
 			// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
-			for (const listener of [...listeners]) listener({ type: "agent_end", messages: [], isTerminal } as never);
+			for (const listener of [...listeners]) listener({ type: "agent_end", messages: [] } as never);
+		},
+		/** Dispatches a non-terminal loop pause without waiting for any outbox delivery it starts. */
+		emitPause() {
+			// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
+			for (const listener of [...listeners]) {
+				listener({ type: "agent_pause", messages: [], yielded: true, awaiting: true } as never);
+			}
 		},
 		async endTurn() {
 			session.emitEnd();
@@ -1075,7 +1082,7 @@ describe("supermemoryBackend", () => {
 		const session = makeSession({ settings: { "supermemory.retainEveryNTurns": 1 } });
 		await start(session);
 		session.addTurn("one");
-		session.emitEnd(false);
+		session.emitPause();
 		await session.getSupermemorySessionState()?.flush();
 		expect(create).not.toHaveBeenCalled();
 		// The continuation adds its answer, then the terminal settle closes the window.

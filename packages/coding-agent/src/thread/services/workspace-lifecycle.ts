@@ -145,7 +145,7 @@ export const workspaceLifecycleThreadService: ThreadService = {
 		const owner = owners.get(peer.threadId);
 		owners.delete(peer.threadId);
 		if (!owner) return;
-		for (const stop of [...owner.gates]) stop();
+		for (const stop of Array.from(owner.gates)) stop();
 		for (const lease of owner.leases.values()) {
 			// A delayed worker exit must not hold a successor that reused its id.
 			const current = lease.service.list().find(item => item.agentId === lease.agentId);

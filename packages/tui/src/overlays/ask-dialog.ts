@@ -210,15 +210,6 @@ interface PreviewSegment {
 
 type PreviewRenderCache = Map<string, Map<number, readonly string[]>>;
 
-/** Full tab label; the ANSI tab strip and review list clip it to a chip. */
-function questionTabName(question: ExtensionAskDialogQuestion, index: number): string {
-	return replaceTabs(question.header?.trim() || sanitizeCarriageReturns(question.id) || `Q${index + 1}`);
-}
-
-function questionTabLabel(question: ExtensionAskDialogQuestion, index: number): string {
-	return truncateToWidth(questionTabName(question, index), MAX_HEADER_CHIP_WIDTH, Ellipsis.Unicode);
-}
-
 function wrapQuestionTitle(question: ExtensionAskDialogQuestion, width: number): string[] {
 	return renderPreviewContent(sanitizeCarriageReturns(question.question), Math.max(1, width), "text");
 }
