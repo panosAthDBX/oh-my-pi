@@ -1052,9 +1052,10 @@ describe("MemoryProtocolHandler — Supermemory memory ids", () => {
 			}),
 		);
 		const resource = await InternalUrlRouter.instance().resolve("memory://mem-evil", { sessionId: "sm-caller" });
-		const lines = resource.content.split("\n");
+		const content = typeof resource.content === "string" ? resource.content : resource.content.toString("utf8");
+		const lines = content.split("\n");
 
-		expect(resource.content).not.toMatch(/[\x07\x1b]/);
+		expect(content).not.toMatch(/[\x07\x1b]/);
 		expect(lines.filter(line => line.startsWith("isForgotten:"))).toEqual(["isForgotten: false"]);
 		expect(lines.filter(line => line.startsWith("createdAt:"))).toHaveLength(1);
 		expect(lines).toContain("uses bun");
