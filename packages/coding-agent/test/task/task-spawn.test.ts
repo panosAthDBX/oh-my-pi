@@ -341,7 +341,8 @@ describe("task spawn routing", () => {
 
 			const delivered = `${job!.resultText ?? ""}${job!.errorText ?? ""}`;
 			expect(delivered).toContain("Sandboxed ran isolated and cannot be resumed or messaged");
-			expect(delivered).toContain("history://Sandboxed");
+			expect(delivered).toContain("transcript unavailable");
+			expect(delivered).not.toContain("history://Sandboxed");
 			expect(delivered).not.toContain("is now idle");
 			expect(delivered).not.toContain("message it via");
 			expect(delivered).not.toContain("removed");
@@ -370,6 +371,8 @@ describe("task spawn routing", () => {
 			vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/repo-root" });
 			vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts => {
 				const service = getWorkspaceLifecycleService();
+				const sessionFile = path.join(baseDir, "s.jsonl");
+				await fs.writeFile(sessionFile, '{"type":"session","version":3,"id":"fixture"}\n');
 				const generation = service.register(
 					{
 						agentId: opts.agentId,
@@ -388,7 +391,7 @@ describe("task spawn routing", () => {
 					displayName: opts.agentId,
 					kind: "sub",
 					session: null,
-					sessionFile: path.join(baseDir, "s.jsonl"),
+					sessionFile,
 					status: "parked",
 				});
 				return { ...makeResult(opts.agentId), isolated: true };
