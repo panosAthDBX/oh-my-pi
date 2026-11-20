@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## Local custom build (not an upstream release): Supermemory v5 and workspace-lifecycle
+
+These entries describe local customisations carried on top of upstream 19.0.1; they are not part of any upstream release. The Supermemory backend is the change from [#18755](https://github.com/can1357/oh-my-pi/pull/18755) (head `49a878cd52`) and replaces this build's earlier Supermemory v3/v4 backend.
+
+### Added
+
+- Added the `supermemory` memory backend on the Supermemory v5 namespace API: first-turn recall (profile facts with editable ids, inferred facts marked `[inferred]`) and recall in compaction summaries, both bounded by `supermemory.recallTimeoutMs` so a hung server cannot hold a turn for long, periodic retention (retried after resume), `recall`/`retain`/`learn`/`memory_edit` (including a dry-run `preview_forget` by meaning), `read memory://<id>` with version history and source document, writes that survive outages, subagents that share the parent's memory, and a `SUPERMEMORY_NAMESPACE` override ([#18755](https://github.com/can1357/oh-my-pi/pull/18755) by [@panosAthDBX](https://github.com/panosAthDBX))
+- Under `supermemory`, `/memory clear` is local-only: it waits for pending Supermemory writes and drops the cached recall; server-side memories are untouched
+- Added the plugin host companion `ctx.workspaceLifecycle` (apiVersion 1): isolated-workspace leases, explicit gated release and release gates. A gate hold, a failed capture or a failed teardown keeps (holds) the workspace instead of removing it, and a stale generation or a reused slot holds rather than deletes
+- Added the task `baseline` field (flat or per `tasks[]` item): the commit-ish an isolated spawn starts from exactly (implies `isolated`); an unresolvable baseline fails the spawn instead of copying the working tree, and an ovnfs checkout moved to an explicit baseline is diffed against a fresh baseline rather than its capture
+
+### Changed
+
+- A finished isolated subagent can be messaged only while its workspace lease is live, and an aborted isolated subagent is never offered as resumable; `/restart` and `omp --restore` never revive isolated subagents
+
+### Fixed
+
+- Session teardown waits up to 60 seconds (from teardown start) for an agent whose isolated workspace release runs plugin gates, and holds a signal exit open only for those; a lease still unsettled at that bound is persisted `held` and never removed afterwards. Ungated isolated releases keep upstream's signal-exit cleanup ([#18519](https://github.com/can1357/oh-my-pi/issues/18519))
+- Workspace-lifecycle plugin gates and lease inventory now include nested worker-owned isolated tasks; a dead worker holds its workspace rather than silently losing ownership. Each extension's `ctx.workspaceLifecycle` is bound to that extension, so a gate the same extension registers on main and in worker threads runs once per release; a gate from an extension only a worker loaded still runs, and another thread's registration takes over when the running one unsubscribes or its worker exits
+- Isolated workspaces remain protected when their lease changes during release gates or persistence, and reused workspace slots keep the newest ownership record
+- ovnfs lifecycle leases retain the separate ownership record path and report failed checkout cleanup as a hold; an ovnfs checkout record that exists but cannot be read is kept (moved aside with the slot, or left for `omp worktree clear`) instead of being treated as absent
+- Fixed an auto-prewalk arm that drops the eager todo reminder delivering pending tool-roster, `xd://`, eval-prelude, session-agent and skill notices after the user's task instead of before it
+
 ## [19.0.1] - 2026-11-19
 
 ### Added
@@ -388,31 +411,6 @@
 - Language servers now recognize edits made shortly after a file is created, including on macOS.
 - Bash commands displayed in the Pseudo shell view now remain accurate while streaming through heredocs, substitutions, loops, continuations, arithmetic expressions, and background execution.
 - Resuming a session or reviving a subagent after a retry fallback with a thinking suffix (e.g. `:xhigh`) now restores the primary model's own thinking level instead of keeping the fallback's ([#19273](https://github.com/can1357/oh-my-pi/issues/19273)).
-## Local custom build (not an upstream release): Supermemory v5 and workspace-lifecycle
-
-These entries describe local customisations carried on top of upstream 18.20.0; they are not part of any upstream version below.
-
-### Added
-
-- Added the `supermemory` memory backend on the Supermemory v5 namespace API: first-turn recall (profile facts with editable ids, inferred facts marked `[inferred]`), recall in compaction summaries, periodic retention (retried after resume), `recall`/`retain`/`learn`/`memory_edit` (including a dry-run `preview_forget` by meaning), `read memory://<id>` with version history and source document, writes that survive outages, subagents that share the parent's memory, and a `SUPERMEMORY_NAMESPACE` override ([#18755](https://github.com/can1357/oh-my-pi/pull/18755) by [@panosAthDBX](https://github.com/panosAthDBX))
-- Added the `supermemory` memory backend on the Supermemory v5 namespace API: first-turn recall (profile facts with editable ids, inferred facts marked `[inferred]`) and recall in compaction summaries, both bounded by `supermemory.recallTimeoutMs` so a hung server cannot hold a turn for long, periodic retention (retried after resume), `recall`/`retain`/`learn`/`memory_edit` (including a dry-run `preview_forget` by meaning), `read memory://<id>` with version history and source document, writes that survive outages, subagents that share the parent's memory, and a `SUPERMEMORY_NAMESPACE` override ([#18755](https://github.com/can1357/oh-my-pi/pull/18755) by [@panosAthDBX](https://github.com/panosAthDBX))
-- Under `supermemory`, `/memory clear` is local-only: it waits for pending Supermemory writes and drops the cached recall; server-side memories are untouched
-- Added the plugin host companion `ctx.workspaceLifecycle` (apiVersion 1): isolated-workspace leases, explicit gated release and release gates. A gate hold, a failed capture or a failed teardown keeps (holds) the workspace instead of removing it, and a stale generation or a reused slot holds rather than deletes
-- Added the task `baseline` field (flat or per `tasks[]` item): the commit-ish an isolated spawn starts from exactly (implies `isolated`); an unresolvable baseline fails the spawn instead of copying the working tree, and an ovnfs checkout moved to an explicit baseline is diffed against a fresh baseline rather than its capture
-
-### Changed
-
-- A finished isolated subagent can be messaged only while its workspace lease is live, and an aborted isolated subagent is never offered as resumable; `/restart` and `omp --restore` never revive isolated subagents
-- Builds install yargs 18.2.0 from the vendored local package `vendor/yargs-18.2.0.tgz` (root `overrides.yargs`, pinned in `bun.lock`) because the corporate npm proxy refuses the published tarball
-
-### Fixed
-
-- Session teardown waits up to 60 seconds (from teardown start) for an agent whose isolated workspace release runs plugin gates, and holds a signal exit open only for those; a lease still unsettled at that bound is persisted `held` and never removed afterwards. Ungated isolated releases keep upstream's signal-exit cleanup ([#18519](https://github.com/can1357/oh-my-pi/issues/18519))
-- Workspace-lifecycle plugin gates and lease inventory now include nested worker-owned isolated tasks; a dead worker holds its workspace rather than silently losing ownership. Each extension's `ctx.workspaceLifecycle` is bound to that extension, so a gate the same extension registers on main and in worker threads runs once per release; a gate from an extension only a worker loaded still runs, and another thread's registration takes over when the running one unsubscribes or its worker exits
-- Isolated workspaces remain protected when their lease changes during release gates or persistence, and reused workspace slots keep the newest ownership record
-- ovnfs lifecycle leases retain the separate ownership record path and report failed checkout cleanup as a hold; an ovnfs checkout record that exists but cannot be read is kept (moved aside with the slot, or left for `omp worktree clear`) instead of being treated as absent
-- Fixed an auto-prewalk arm that drops the eager todo reminder delivering pending tool-roster, `xd://`, eval-prelude, session-agent and skill notices after the user's task instead of before it
-
 ## [18.20.0] - 2026-11-12
 
 - With the Spotlight experiment on, a `read` with `:raw` returns the selected bytes instead of an outlined, compacted, collapsed or cut rendering ([#18713](https://github.com/can1357/oh-my-pi/pull/18713) by [@eggpeat](https://github.com/eggpeat))
