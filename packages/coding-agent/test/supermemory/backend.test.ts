@@ -82,12 +82,10 @@ function makeSession(options: { settings?: Record<string, unknown>; cwd?: string
 			// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
 			for (const listener of [...listeners]) listener({ type: "agent_end", messages: [] } as never);
 		},
-		/** Dispatches a non-terminal loop pause without waiting for any outbox delivery it starts. */
-		emitPause() {
+		/** Dispatches `agent_pause` (the run stays open), yielded or not. */
+		emitPause(yielded: boolean) {
 			// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
-			for (const listener of [...listeners]) {
-				listener({ type: "agent_pause", messages: [], yielded: true, awaiting: true } as never);
-			}
+			for (const listener of [...listeners]) listener({ type: "agent_pause", messages: [], yielded } as never);
 		},
 		async endTurn() {
 			session.emitEnd();
@@ -1075,27 +1073,25 @@ describe("supermemoryBackend", () => {
 		}
 	});
 
-	it("keeps a window open across a non-terminal settle so the continuation's answer is retained", async () => {
+	it("retains on a yielded pause while background work keeps the run open, not on a non-yielded one", async () => {
 		const create = vi
 			.spyOn(SupermemoryClient.prototype, "addDocument")
 			.mockResolvedValue({ id: "d", status: "queued" });
 		const session = makeSession({ settings: { "supermemory.retainEveryNTurns": 1 } });
 		await start(session);
 		session.addTurn("one");
-		session.emitPause();
+		// A retry or compaction continues the model's own work: the window stays open.
+		session.emitPause(false);
 		await session.getSupermemorySessionState()?.flush();
 		expect(create).not.toHaveBeenCalled();
-		// The continuation adds its answer, then the terminal settle closes the window.
-		session.sessionManager.getEntries().push({
-			type: "message",
-			id: "cont",
-			parentId: null,
-			timestamp: new Date(0).toISOString(),
-			message: { role: "assistant", content: [{ type: "text", text: "continuation answer" }], timestamp: 0 },
-		} as never);
+		// The model finished its turn; agent_end waits for background jobs, but the window closes now.
+		session.emitPause(true);
+		await session.getSupermemorySessionState()?.flush();
+		expect(create).toHaveBeenCalledTimes(1);
+		expect(create.mock.calls[0]?.[1]?.content).toContain("reply to one");
+		// The run's later agent_end finds nothing new to send.
 		await session.endTurn();
 		expect(create).toHaveBeenCalledTimes(1);
-		expect(create.mock.calls[0]?.[1]?.content).toContain("continuation answer");
 	});
 
 	it("a job queued behind a slow upload retains only turns settled when it was queued", async () => {

@@ -334,7 +334,7 @@ export class SupermemorySessionState implements SupermemorySessionStateApi {
 		if (!this.automatic) return;
 		this.#unsubscribe = this.session.subscribe(event => {
 			if (
-				(event.type === "agent_start" || event.type === "agent_pause" || event.type === "agent_end") &&
+				(event.type === "agent_start" || event.type === "agent_end") &&
 				this.#config.autoRetain &&
 				!this.#hasCursor
 			) {
@@ -342,17 +342,14 @@ export class SupermemorySessionState implements SupermemorySessionStateApi {
 				// pre-cursor on resume, which skips every turn it already holds.
 				this.#appendCursor(this.lastRetainedTurn, this.#retainedMessages, this.#windowStart);
 			}
-			if (event.type === "agent_pause") {
-				// A pause is followed by the agent's own continuation; closing the window now would leave
-				// that continuation's answer out of every window. Outbox delivery may still make progress.
-				void this.drainOutbox();
-				return;
-			}
-			if (event.type !== "agent_end") return;
+			// The run's agent_end waits until no job, child agent or peer can resume it; a yielded pause is
+			// the model finishing its turn while such work keeps the run open (as for Hindsight and
+			// Mnemopi). Non-yielded pauses continue the model's own work, so the window stays open.
+			if (event.type !== "agent_end" && !(event.type === "agent_pause" && event.yielded)) return;
 			if (this.#config.autoRetain) {
 				// Snapshot the settled history now: a job queued behind a slow upload must not read a
 				// turn that started afterwards and close its window before the answer exists.
-				// Every terminal settle: a manual continuation can extend the last window without a user turn.
+				// Every turn end: a manual continuation can extend the last window without a user turn.
 				const settled = this.#settledHistory();
 				void this.#enqueueRetention(() => this.#retainDue(settled));
 			}
